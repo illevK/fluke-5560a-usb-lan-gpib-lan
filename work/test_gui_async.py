@@ -1,5 +1,6 @@
 """GUI integration tests with local TCP peers only; never connect real hardware."""
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -95,6 +96,35 @@ class AsyncGuiTests(unittest.TestCase):
             self.assertFalse(self.app.conn_mgr.info.connected)
             self.assertEqual(server.commands[-1],'STBY')
             self.assertEqual(server.commands.count('OUT 1 V, 0 HZ; OPER'),1)
+
+    def test_standby_button_preserves_pending_automatic_standby_confirmation(self):
+        standby_waiting = threading.Event()
+        reply_allowed = threading.Event()
+        with peers.SlowOutputTests().peer() as server:
+            respond = server.handler
+
+            def hold_standby_reply(conn, command):
+                if command == '*OPC?' and server.commands[-2:-1] == ['STBY']:
+                    standby_waiting.set()
+                    reply_allowed.wait(5)
+                respond(conn, command)
+
+            server.handler = hold_standby_reply
+            try:
+                self.connect(server)
+                self.app.var_operation_timeout.set('5')
+                self.app.seq_running = True
+                self.app._run_next_auto_step(0, 0, 200)
+                self.pump_until(standby_waiting.is_set)
+                self.app._on_stby_clicked()
+                self.assertFalse(self.app.conn_mgr.cancel_event.is_set())
+            finally:
+                reply_allowed.set()
+            self.pump_until(lambda: not self.app._io_busy)
+            self.assertEqual(server.commands.count('STBY'), 1)
+            self.assertFalse(self.app.is_operating)
+            self.assertTrue(self.app.conn_mgr.info.connected)
+            self.assertIn('STBY 확인 완료', self.app.var_active_row_banner.get())
 
     def test_device_error_stops_rows_but_keeps_confirmed_standby(self):
         with peers.SlowOutputTests().peer(error='4103,"Output settling timed out"') as server:

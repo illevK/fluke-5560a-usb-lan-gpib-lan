@@ -30,7 +30,8 @@ def enhance_dut_sequence(source, root):
         "            self._seq_dut_pending = None\n"
         "            self._seq_dut_reading = False\n"
         "            self._seq_dut_resume_required = False\n"
-        "            self._seq_close_standby = False\n")
+        "            self._seq_close_standby = False\n"
+        "            self._standby_in_progress = False\n")
     patch_method("_build_sequence_tab", "            self.var_seq_auto_oper = tk.BooleanVar(value=True)\n",
         "            self.var_seq_auto_oper = tk.BooleanVar(value=True)\n"
         "            self.var_seq_dut_capture = tk.BooleanVar(value=True)\n")
@@ -132,8 +133,13 @@ def enhance_dut_sequence(source, root):
         "                self.after(200, self._on_close)\n"
         "                return\n")
     patch_method("_on_close", "                self.conn_mgr.request_abort()\n",
-        "                if not self._seq_close_standby:\n"
+        "                if not (self._seq_close_standby or self._standby_in_progress):\n"
         "                    self.conn_mgr.request_abort()\n")
+    patch_method("_on_stby_clicked", "            if self._io_busy:\n",
+        "            if self._standby_in_progress:\n"
+        '                self._log("STBY가 이미 전송되었으며 완료 응답을 기다리고 있습니다.")\n'
+        "                return\n"
+        "            if self._io_busy:\n")
 
     # Existing STBY/disconnect handlers release the reservation before I/O.
     io_guard = (
@@ -142,10 +148,16 @@ def enhance_dut_sequence(source, root):
         "                return False\n"
     )
     patch_method("_start_io", "on_error=None, stop_sequence=True):\n",
-        "on_error=None, stop_sequence=True, allow_closing=False):\n")
+        "on_error=None, stop_sequence=True, *, standby=False):\n")
     add_guard("_start_io",
-        "            if (self._seq_close_standby or self._dut_closing) and not allow_closing:\n"
+        "            if (self._seq_close_standby or self._dut_closing) and not standby:\n"
         "                return False\n" + io_guard)
+    patch_method("_start_io", "            self._io_busy = True\n",
+        "            self._io_busy = True\n"
+        "            self._standby_in_progress = standby\n")
+    patch_method("_poll_io_result", "                self._io_busy = False\n",
+        "                self._io_busy = False\n"
+        "                self._standby_in_progress = False\n")
     add_guard("_send_and_log",
         '            standby = cmd == "STBY" and not auto_oper\n'
         '            if (self._seq_close_standby or self._dut_closing) and not standby:\n'
@@ -167,7 +179,7 @@ def enhance_dut_sequence(source, root):
     patch_method("_send_and_log",
         "                                  operation, done, on_error=on_error, stop_sequence=stop_sequence)\n",
         "                                  operation, done, on_error=on_error, stop_sequence=stop_sequence,\n"
-        "                                  allow_closing=standby)\n")
+        "                                  standby=standby)\n")
 
     # The DUT worker can wait for a fresh measurement independently of the
     # calibrator I/O worker. STBY can run immediately while the DUT is waiting.

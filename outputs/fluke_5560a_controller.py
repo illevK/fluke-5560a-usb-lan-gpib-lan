@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fluke 5560A / 5522A / 5520A / 5080A Controller v6.8.0
+Fluke 5560A / 5522A / 5520A / 5080A Controller v6.8.1
 LAN: verified physical adapter, source-IP binding, Telnet stream framing,
 strict *IDN? validation, read-only diagnosis, background connection tasks.
 USB/GPIB: PyVISA with backend diagnostics and correct interface handling.
@@ -3481,11 +3481,11 @@ if HAS_TKINTER:
 # =====================================================================
 if HAS_TKINTER:
     class Fluke5560AControllerApp(tk.Tk):
-        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.8.0"""
+        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.8.1"""
 
         def __init__(self) -> None:
             super().__init__()
-            self.title("Fluke 교정기 통합 제어 프로그램 v6.8.0 (USB / LAN / RS232 / GPIB)")
+            self.title("Fluke 교정기 통합 제어 프로그램 v6.8.1 (USB / LAN / RS232 / GPIB)")
             self.geometry("1280x930")
             self.minsize(1140, 840)
             self.configure(bg="#F4F6F9")
@@ -3503,6 +3503,7 @@ if HAS_TKINTER:
             self._seq_dut_reading = False
             self._seq_dut_resume_required = False
             self._seq_close_standby = False
+            self._standby_in_progress = False
             self.adapters = AutoNetworkAligner.list_ethernet_interfaces()
 
             self._setup_styles()
@@ -4013,7 +4014,7 @@ if HAS_TKINTER:
             header.pack(fill="x")
             tk.Label(header, text="Fluke Controller", bg="#F5F7FA", fg="#0F172A",
                      font=("Segoe UI", 18, "bold")).pack(side="left")
-            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.8.0", bg="#F5F7FA",
+            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.8.1", bg="#F5F7FA",
                      fg="#64748B", font=("Segoe UI", 9)).pack(side="left", padx=16)
             self.lbl_conn_badge = tk.Label(header, text="연결 안 됨", bg="#E2E8F0", fg="#64748B", padx=12, pady=5)
             self.lbl_conn_badge.pack(side="right")
@@ -4167,8 +4168,8 @@ if HAS_TKINTER:
                 raise ValueError("출력 완료 대기는 1~300초 사이여야 합니다.")
             return value
 
-        def _start_io(self, label, operation, complete, on_error=None, stop_sequence=True, allow_closing=False):
-            if (self._seq_close_standby or self._dut_closing) and not allow_closing:
+        def _start_io(self, label, operation, complete, on_error=None, stop_sequence=True, *, standby=False):
+            if (self._seq_close_standby or self._dut_closing) and not standby:
                 return False
             if stop_sequence and self._sequence_dut_reserved():
                 self._log('DUT 기록을 중단한 뒤 다른 교정기 명령을 실행하세요.')
@@ -4178,6 +4179,7 @@ if HAS_TKINTER:
             if stop_sequence:
                 self._on_seq_stop_auto(silent=True)
             self._io_busy = True
+            self._standby_in_progress = standby
             self._refresh_connection_controls()
             self.conn_mgr.cancel_event.clear()
             self.conn_mgr.last_error = ""
@@ -4208,6 +4210,7 @@ if HAS_TKINTER:
                 pass
             else:
                 self._io_busy = False
+                self._standby_in_progress = False
                 for button in self._connection_buttons:
                     button.configure(state="normal")
                 if error:
@@ -4289,7 +4292,7 @@ if HAS_TKINTER:
                 self.after(200, self._on_close)
                 return
             if self._io_busy:
-                if not self._seq_close_standby:
+                if not (self._seq_close_standby or self._standby_in_progress):
                     self.conn_mgr.request_abort()
                 self.after(200, self._on_close)
                 return
@@ -5690,7 +5693,7 @@ if HAS_TKINTER:
                     on_done(state)
             return self._start_io(f"TX >> {full_cmd} | 완료 대기 최대 {self.conn_mgr.operation_timeout:g}초",
                                   operation, done, on_error=on_error, stop_sequence=stop_sequence,
-                                  allow_closing=standby)
+                                  standby=standby)
 
         def _apply_voltage(self, auto_oper: bool) -> None:
             try:
@@ -5770,6 +5773,9 @@ if HAS_TKINTER:
 
         def _on_stby_clicked(self):
             self._on_seq_stop_auto(silent=True)
+            if self._standby_in_progress:
+                self._log("STBY가 이미 전송되었으며 완료 응답을 기다리고 있습니다.")
+                return
             if self._io_busy:
                 self._pending_standby = True
                 self.conn_mgr.request_abort()
@@ -6189,7 +6195,7 @@ if HAS_TKINTER:
 def run_cli_interactive(model="5560A") -> None:
     mgr = Fluke5560AConnectionManager()
     print("=" * 88)
-    print(" Fluke 5560A Multi-Product Calibrator Controller v6.8.0 (CLI Mode)")
+    print(" Fluke 5560A Multi-Product Calibrator Controller v6.8.1 (CLI Mode)")
     print("=" * 88)
     print(f"현재 PC 로컬 IPv4: {mgr.get_local_pc_ipv4_list()}")
     print(f"감지된 이더넷 어댑터: {AutoNetworkAligner.list_ethernet_interfaces()}")
