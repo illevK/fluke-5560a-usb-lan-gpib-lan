@@ -1,0 +1,12 @@
+{
+  "version": "v6.10.1",
+  "exe_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "4CDF22A3F884461831FD18D453A4CAD31D1B70C4737B459046B1ADCF924F6229",
+  "source_sha256": "C96131CF2335065F181B0FC817AF1990886AEDDEDEDECC91EF4AAA3F580EB7C6",
+  "desktop_copied": [
+    "C:\\Users\\HCT-2714\\Desktop\\Fluke 교정기.exe"
+  ],
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\AppData\\Local\\Temp\\fluke-v6.10.1-build-20261109145227595\\desktop-v6.10.0.exe",
+  "focused_tests_passed": 8,
+  "verified_hardware": "5560A TCP and read-only IDN, same-adapter fallback, reconnect after 2s and 12s, packaged diagnostic"
+}

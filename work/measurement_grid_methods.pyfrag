@@ -41,7 +41,24 @@
         def _measurement_changed(self, row):
             if self._rendering_measurements or not 0 <= row < len(self._steps):
                 return
-            self._steps[row].measured_raw = self._row_widgets[row]["measurement_var"].get()
+            step = self._steps[row]
+            measured = self._row_widgets[row]["measurement_var"].get()
+            step.measured_raw = SIUnits.with_nominal_unit(measured, step.nominal_raw)
+
+        def _refresh_measurement_value(self, row, *, preserve_entry=False):
+            step = self._steps[row]
+            widgets = self._row_widgets[row]
+            measured = widgets["measurement_var"]
+            if (preserve_entry and self.focus_get() is widgets["entries"][9]
+                    and SIUnits.with_nominal_unit(measured.get(), step.nominal_raw) == step.measured_raw):
+                return
+            display = SIUnits.format_measurement(step.measured_raw, step.nominal_raw)
+            if measured.get() != display:
+                self._rendering_measurements = True
+                try:
+                    measured.set(display)
+                finally:
+                    self._rendering_measurements = False
 
         def _init_measurement_selection(self):
             self._measurement_anchor = self._measurement_end = None
@@ -213,7 +230,10 @@
                 return None
             lo, hi = bounds
             # Include empty rows and a final record separator, including a trailing empty cell.
-            return "\r\n".join(step.measured_raw for step in self._steps[lo:hi + 1]) + "\r\n"
+            return "\r\n".join(
+                SIUnits.format_measurement(step.measured_raw, step.nominal_raw)
+                for step in self._steps[lo:hi + 1]
+            ) + "\r\n"
 
         def _copy_measurements(self, row=None, force_cells=False):
             bounds = self._measurement_bounds()
@@ -255,6 +275,7 @@
                 if not 0 <= row < len(self._row_widgets):
                     break
                 self._row_widgets[row]["measurement_var"].set(value)
+                self._refresh_measurement_value(row)
             return True
 
 

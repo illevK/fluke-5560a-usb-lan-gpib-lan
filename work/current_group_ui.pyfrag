@@ -177,10 +177,13 @@
             self._log(f"[그룹 순차 시작] {self._current_group_label()} | 표의 실행 행: {', '.join(str(i + 1) for i in plan)} | 유지 {dwell:g}초")
             self._run_next_auto_step(start_idx, stop_idx, int(dwell * 1000))
 
-        def _on_seq_start_from_selected_or_range(self):
+        def _on_seq_start_from_selected_or_range(self, *, all_rows=False):
             if not self.seq_steps:
                 self._log("먼저 시트에 측정값을 넣으세요.")
                 return
+            if all_rows:
+                self.var_seq_start_row.set("1")
+                self.var_seq_stop_row.set(str(len(self.seq_steps)))
             self._start_filtered_sequence(*self._get_start_and_stop_indices())
 
         def _on_seq_resume_from_paused(self):

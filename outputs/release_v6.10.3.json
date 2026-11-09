@@ -1,0 +1,10 @@
+{
+  "version": "v6.10.3",
+  "exe_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "B5DF2D29B23D41BE3FE5E0EFB6DF2E9AA96E50AA1D687F87475039C6DB3D48E5",
+  "source_sha256": "EEC2D289068611063C28BE8CF4A2DA09A0E08431E6B74E572A58964C66ED9221",
+  "desktop_copied": [],
+  "previous_project_executable_backup": "C:\\Users\\HCT-2714\\AppData\\Local\\Temp\\fluke-v6.10.3-build-20261109162502860\\project-v6.10.2.exe",
+  "focused_tests_passed": 18,
+  "packaged_conversion_check_passed": true
+}

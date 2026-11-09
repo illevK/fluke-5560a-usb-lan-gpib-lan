@@ -1,13 +1,13 @@
     @classmethod
     def parse_dc_power_row(cls, line):
-        """A complete V/A pair without a frequency is a DC power point.
-
-        Match the whole row so a following nominal value, frequency, or
-        resolution stays available to the existing table-specific parsers.
-        """
+        """A complete V/A pair alone represents a DC power point."""
         text = SIUnits.clean(line).strip()
         match = cls.VI_SLASH_PATTERN.fullmatch(text)
         if match is None:
+            if text.count("/") == 1:
+                left, right = (part.strip() for part in text.split("/"))
+                if cls.TOKEN_FINDER.fullmatch(left) and cls.TOKEN_FINDER.fullmatch(right):
+                    raise ValueError("전력 조건은 전압 / 전류 순서로 입력하세요. 예: 120 V / 1 A")
             return None
         volts = SIUnits.to_base(SIUnits.number(match[1]), match[2], "V")
         amps = SIUnits.to_base(SIUnits.number(match[3]), match[4], "A")
@@ -39,6 +39,70 @@
         if value == 1:
             direction = "LEAD"
         return value, direction, f"{value:g} {direction}"
+
+    @classmethod
+    def parse_tabular_row(cls, line):
+        *conditions, nominal = (cell.strip() for cell in line.split("\t"))
+        pair = None
+        quantities = {}
+        settings = []
+        for cell in conditions:
+            if not cell:
+                continue
+            vi = cls.VI_SLASH_PATTERN.fullmatch(cell)
+            if vi:
+                pair = vi
+                continue
+            quantity = cls.parse_value_and_unit(cell)
+            if quantity:
+                quantities[SIUnits.split(quantity[1])[0]] = cell
+            else:
+                settings.append(cell)
+
+        quantity = cls.parse_value_and_unit(nominal)
+        unit = SIUnits.split(quantity[1])[0] if quantity else None
+        voltage, current = quantities.get("V"), quantities.get("A")
+        frequency = quantities.get("HZ")
+        freq_condition = frequency or next(
+            (cell for cell in settings if cell.upper() in {"DC", "WIRE2", "WIRE4", "2W", "4W"}), "DC"
+        )
+        if pair:
+            if unit == "W" and voltage is not None:
+                paired_voltage = SIUnits.to_base(SIUnits.number(pair[1]), pair[2], "V")
+                if not math.isclose(SIUnits.to_base(*cls.parse_value_and_unit(voltage), "V"), paired_voltage):
+                    raise ValueError("전력 조건의 전압과 별도 전압 열이 서로 다릅니다.")
+            voltage = f"{pair[1]} {pair[2]}" if unit == "W" or not voltage else voltage
+            current = f"{pair[3]} {pair[4]}" if unit == "W" or not current else current
+        vi_condition = f"{voltage} / {current}" if voltage and current else voltage or "-"
+        if unit == "W":
+            # Search from the measurements toward the left so reference columns
+            # preceding the test conditions do not supply a phase setting.
+            pf = "1"
+            for cell in reversed(settings):
+                try:
+                    _, _, pf = cls.parse_power_factor(cell)
+                except ValueError:
+                    continue
+                break
+            return vi_condition, freq_condition, pf, nominal
+        if unit in {"V", "A", "OHM"}:
+            if pair:
+                raise ValueError("전압 / 전류 조건의 마지막 열에는 전력(W 계열) 또는 역률을 입력하세요.")
+            return "-", freq_condition, "-", nominal
+        if voltage and current:
+            if not frequency:
+                raise ValueError("역률 출력에는 AC 주파수가 필요합니다. 예: 60 Hz")
+            directions = set(re.findall(r"(?<![A-Za-z])(LEAD|LAG)(?![A-Za-z])",
+                                        " ".join([*settings, nominal]).upper()))
+            if len(directions) > 1:
+                raise ValueError("한 역률 행에 Lead와 Lag를 동시에 지정할 수 없습니다.")
+            if nominal and directions and not re.search(r"LEAD|LAG", nominal, re.I):
+                nominal += " " + next(iter(directions))
+            _, _, display = cls.parse_power_factor(nominal)
+            return vi_condition, frequency, display, display
+        if quantities:
+            raise ValueError("마지막 열에 단위가 있는 명목값을 입력하세요.")
+        return None
 
     @classmethod
     def parse_power_factor_row(cls, line):

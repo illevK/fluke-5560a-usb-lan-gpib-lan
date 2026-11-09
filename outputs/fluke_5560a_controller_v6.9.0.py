@@ -1376,21 +1376,20 @@ class AutoNetworkAligner:
     def select_source_ip(cls, adapter_idx: str, target_ip: str) -> str:
         target = ipaddress.IPv4Address(cls.normalize_ipv4(target_ip))
         if not adapter_idx:
-            # [PATCH v6.9.0] '자동' 선택 시 Wi-Fi로 빠지지 않도록 Up 상태인 유선 랜카드를 우선 선택
-            interfaces = cls.list_ethernet_interfaces(refresh=True)
-            for adapter in interfaces:
-                if adapter.get("state") != "Up":
-                    continue
-                for item in adapter.get("addresses") or []:
+            if not target.is_link_local:
+                return ""
+            # Link-local instrument traffic belongs on the attached cable.
+            wired = [adapter for adapter in cls.list_ethernet_interfaces()
+                     if adapter.get("wired") and adapter["state"] == "Up" and adapter.get("addresses")]
+            for adapter in wired:
+                for item in adapter["addresses"]:
                     network = ipaddress.IPv4Interface(f"{item['ip']}/{item['prefix']}").network
-                    if target in network and str(target) != item["ip"]:
+                    if target in network and str(target) != item["ip"] and target not in (
+                            network.network_address, network.broadcast_address):
                         return item["ip"]
-            for adapter in interfaces:
-                if adapter.get("wired") and adapter.get("state") == "Up":
-                    addrs = adapter.get("addresses") or []
-                    if addrs:
-                        return addrs[0]["ip"]
-            return "" 
+            if len(wired) == 1:
+                return wired[0]["addresses"][0]["ip"]
+            return ""
         for adapter in cls.list_ethernet_interfaces(refresh=True):
             if adapter["idx"] != str(adapter_idx):
                 continue
@@ -1840,6 +1839,7 @@ class DUTSession:
         self.transport = self.profile = self.sample = None
         self.identity = ""
         self.simulated = False
+        self.input_channels = ()
 
     @property
     def connected(self):
@@ -1848,6 +1848,78 @@ class DUTSession:
     @property
     def supports_fresh_capture(self):
         return self.connected and self.profile.family in ("WT", "PPA")
+
+    @staticmethod
+    def _wt_reply_value(reply):
+        # Preserve whitespace in the payload, even when a response header is present.
+        return re.sub(r"^:\S+\s+", "", reply.strip()).upper()
+
+    def _set_wt_default(self, command, value, *accepted):
+        self.transport.write(f"{command} {value}")
+        raw = self.transport.query(f"{command}?")
+        reply = self._wt_reply_value(raw)
+        if reply not in (accepted or (value,)):
+            raise ValueError(f"{command} {value} 설정 확인 실패: {raw[:100]}")
+
+    def apply_measurement_defaults(self):
+        """Apply only after the UI has verified the connected DUT's identity."""
+        if self.transport is None:
+            return ""
+        t, profile = self.transport, self.profile
+        if profile.family == "PPA":
+            # CONFIG indices are the common voltage/current autorange controls.
+            # This preserves the configured minimum ranges and input scaling.
+            t.write("SPEED,FAST")
+            t.write("FQREF,VOLTAGE")
+            t.write("COUPLI,PHASE1,AC+DC")
+            for index in (28, 29):
+                t.write(f"CONFIG,{index},0")
+            ref_index = 40 if profile.model.startswith(("PPA25", "PPA26")) else 38
+            checks = (("CONFIG,13?", "3"), ("CONFIG,28?", "0"), ("CONFIG,29?", "0"),
+                      (f"CONFIG,{ref_index}?", "0"), ("COUPLI,PHASE1?", "0"))
+            for query, expected in checks:
+                raw = t.query(query)
+                if raw.strip() != expected:
+                    raise ValueError(f"PPA 기본 설정 확인 실패: {query} / {raw[:100]}")
+            return "FAST · 전압 기준 · V/I 자동 범위"
+
+        self._set_wt_default(":COMMUNICATE:HEADER", "OFF", "0", "OFF")
+        compact_wt = profile.model.startswith(("WT310", "WT332", "WT333"))
+        channels = tuple(range(1, profile.channels + 1))
+        rate_command, rate_ms = ":RATE", 500
+        if compact_wt or profile.wt3000_numeric:
+            rate_ms = 100 if compact_wt else 250
+        if profile.model == "WT5000":
+            self._set_wt_default(":UPDATE:MODE", "CONSTANT", "CONS", "CONSTANT")
+            self._set_wt_default(":UPDATE:METHOD", "SSPERIOD", "SSP", "SSPERIOD")
+            rate_command = ":UPDATE:RATE"
+            channels = tuple(ch for ch in channels if self._wt_reply_value(
+                t.query(f":SYSTEM:ELEMENT{ch}:MODEL?")).strip('"') != "NONE")
+            if not channels:
+                raise ValueError("WT5000에 장착된 입력 모듈을 찾을 수 없습니다.")
+        t.write(f"{rate_command} {rate_ms}MS")
+        raw = t.query(f"{rate_command}?")
+        try:
+            actual_rate = float(self._wt_reply_value(raw))
+        except ValueError:
+            actual_rate = None
+        if actual_rate is None or not math.isclose(actual_rate, rate_ms / 1000):
+            raise ValueError(f"갱신 주기 {rate_ms} ms 설정 확인 실패: {raw[:100]}")
+        if compact_wt:
+            self._set_wt_default(":INPUT:MODE", "RMS")
+            self._set_wt_default(":INPUT:SYNCHRONIZE", "VOLTAGE", "VOLT", "VOLTAGE")
+            for quantity in ("VOLTAGE", "CURRENT"):
+                self._set_wt_default(f":INPUT:{quantity}:AUTO", "ON", "1", "ON")
+        else:
+            for channel in channels:
+                element = f"ELEMENT{channel}"
+                for quantity in ("VOLTAGE", "CURRENT"):
+                    if profile.wt3000_numeric:
+                        self._set_wt_default(f":INPUT:{quantity}:MODE:{element}", "RMS")
+                    self._set_wt_default(f":INPUT:{quantity}:AUTO:{element}", "ON", "1", "ON")
+                self._set_wt_default(f":INPUT:SYNCHRONIZE:{element}", f"U{channel}")
+        self.input_channels = channels
+        return f"{rate_ms} ms · RMS · 전압 동기 · V/I 자동 범위"
 
     def connect(self, settings):
         settings.validate()
@@ -1903,15 +1975,18 @@ class DUTSession:
             return dut_numbers(self.transport.query(command), count)
         t = self.transport
         self._require_wt_live_reading()
-        original_filter = t.query(":STATUS:FILTER1?").strip().upper()
+        raw_filter = t.query(":STATUS:FILTER1?")
+        original_filter = self._wt_reply_value(raw_filter)
+        if original_filter in {"NEV", "NEVE"}:
+            original_filter = "NEVER"
         if original_filter not in {"RISE", "FALL", "BOTH", "NEVER"}:
-            raise ValueError("WT 데이터 갱신 이벤트 설정을 확인할 수 없습니다.")
+            raise ValueError(f"WT 데이터 갱신 이벤트 설정을 확인할 수 없습니다: {raw_filter[:80]}")
         changed_filter = original_filter != "FALL"
         failed = True
         try:
             if changed_filter:
                 t.write(":STATUS:FILTER1 FALL")
-                if t.query(":STATUS:FILTER1?").strip().upper() != "FALL":
+                if self._wt_reply_value(t.query(":STATUS:FILTER1?")) != "FALL":
                     raise ValueError("WT 데이터 갱신 이벤트 설정이 적용되지 않았습니다.")
             # EESR is cleared on read. Discard events before the stabilized
             # output, then wait through a complete post-output update interval.
@@ -1944,8 +2019,9 @@ class DUTSession:
         if self.cancel.is_set():
             self.disconnect()
             raise InterruptedError("DUT 조회를 중지했습니다.")
-        if not 1 <= channel <= self.profile.channels:
-            raise ValueError(f"{self.profile.model}: 입력 채널은 1~{self.profile.channels} 중 선택하세요.")
+        channels = self.input_channels or range(1, self.profile.channels + 1)
+        if channel not in channels:
+            raise ValueError(f"{self.profile.model}: 사용 가능한 입력 채널은 {', '.join(map(str, channels))}입니다.")
         try:
             vi_modes = None
             if self.simulated:
@@ -2019,8 +2095,8 @@ class DUTSession:
                 # Readback prevents unsupported firmware from returning older,
                 # differently ordered values after silently rejecting a setting.
                 for index, item in enumerate(items, 1):
-                    raw_reply = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
-                    reply = raw_reply.split()[-1].replace(' ', '') if raw_reply else ""
+                    query = f":NUMERIC:NORMAL:ITEM{index}?"
+                    reply = self._wt_reply_value(self.transport.query(query)).replace(" ", "")
                     if reply.startswith("LAMB,"):
                         reply = reply.replace("LAMB,", "LAMBDA,", 1)
                     if reply.endswith(",TOT"):
@@ -2028,22 +2104,13 @@ class DUTSession:
                     if reply != item and self.profile.model.startswith(("WT310", "WT332", "WT333")):
                         fallback = item.replace("URMS,", "U,", 1).replace("IRMS,", "I,", 1)
                         if fallback != item:
-                            self.transport.write(":INPUT:MODE RMS")
+                            self._set_wt_default(":INPUT:MODE", "RMS")
                             self.transport.write(f":NUMERIC:NORMAL:ITEM{index} {fallback}")
-                            raw_reply2 = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
-                            reply2 = raw_reply2.split()[-1].replace(' ', '') if raw_reply2 else ""
-                            if reply2 == fallback:
-                                items[index - 1] = fallback
-                                reply = fallback
-                    if reply != items[index - 1]:
-                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {items[index - 1]} / {reply[:100]}")
-                if self.profile.model.startswith(("WT310", "WT332", "WT333", "WT500")) and self.profile.model != "WT5000":
-                    if type(self.transport) is DUTTransport:
-                        self.transport.write(":HOLD OFF")
-                    else:
-                        self.transport.write(":NUMERIC:HOLD OFF")
-                else:
-                    self.transport.write(":NUMERIC:HOLD OFF")
+                            reply = self._wt_reply_value(self.transport.query(query)).replace(" ", "")
+                            item = fallback
+                    if reply != item:
+                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {item} / {reply[:100]}")
+                self.transport.write(":NUMERIC:HOLD OFF")
                 numbers = self._read_wt_numbers(count, fresh)
                 values = dict(zip((m[0] for m in DUT_METRICS), numbers))
                 if count == 9:
@@ -2073,6 +2140,7 @@ class DUTSession:
         self.transport = self.profile = self.sample = None
         self.identity = ""
         self.simulated = False
+        self.input_channels = ()
 
 import select
 import struct
@@ -2429,7 +2497,7 @@ class Fluke5560AConnectionManager:
         if "LAN" in profile.interfaces and mode in ("AUTO", "LAN", "LAN (SOCKET)", "LAN (VISA)") and lan_ip.strip():
             ip = AutoNetworkAligner.normalize_ipv4(lan_ip)
             port = self._validate_port(lan_port)
-            if adapter_idx:
+            if adapter_idx or not source_ip:
                 source_ip = AutoNetworkAligner.select_source_ip(adapter_idx, ip)
             elif source_ip:
                 source_ip = AutoNetworkAligner.normalize_ipv4(source_ip)
@@ -2614,8 +2682,8 @@ class Fluke5560AConnectionManager:
             raise ValueError("통신 제한 시간은 0.2~60초 사이여야 합니다.")
         ip = AutoNetworkAligner.normalize_ipv4(ip)
         port = self._validate_port(port)
-        self.source_ip = AutoNetworkAligner.select_source_ip(adapter_idx, ip) if adapter_idx else (
-            AutoNetworkAligner.normalize_ipv4(source_ip) if source_ip else "")
+        self.source_ip = (AutoNetworkAligner.select_source_ip(adapter_idx, ip)
+                          if adapter_idx or not source_ip else AutoNetworkAligner.normalize_ipv4(source_ip))
         stage = "TCP 연결"
         sock = None
         try:
@@ -3863,10 +3931,16 @@ if HAS_TKINTER:
                 result, error = None, None
                 try:
                     if operation == "connect":
-                        result = self.dut_session.connect(settings)
-                        if selected is not None and result != selected.identity:
+                        identity = self.dut_session.connect(settings)
+                        if selected is not None and identity != selected.identity:
                             self.dut_session.disconnect()
                             raise ConnectionError("검색 때 확인한 장비와 다릅니다. 다시 자동 검색하세요.")
+                        try:
+                            defaults = self.dut_session.apply_measurement_defaults()
+                        except Exception as exc:
+                            self.dut_session.disconnect()
+                            raise ConnectionError(f"DUT 기본 설정 적용 중 오류: {exc}") from exc
+                        result = identity, defaults
                     elif operation == "discover":
                         result = discover_duts(self.dut_session.cancel, excluded_resource=info.resource_name,
                                                excluded_ip=excluded_ip)
@@ -3987,12 +4061,17 @@ if HAS_TKINTER:
                     self.var_dut_status.set(f"DUT 오류: {error}")
                     self._log(f"[DUT {operation}] {error}")
                 elif operation == "connect":
-                    self.var_dut_identity.set(result)
+                    identity, defaults = result
+                    self.var_dut_identity.set(identity)
                     self.var_dut_status.set("DUT 연결됨 · 측정표에서 DUT 자동 기록을 사용할 수 있습니다." if not self.dut_session.simulated
                                             else "가상 DUT 연결됨 · 화면에서 예제 값을 조회할 수 있습니다.")
-                    self.combo_dut_channel.configure(values=tuple(range(1, self.dut_session.profile.channels + 1)))
-                    self.var_dut_channel.set("1")
-                    self._log(f"[DUT 연결] {result}")
+                    channels = self.dut_session.input_channels or tuple(range(1, self.dut_session.profile.channels + 1))
+                    self.combo_dut_channel.configure(values=channels)
+                    self.var_dut_channel.set(str(channels[0]))
+                    self._log(f"[DUT 연결] {identity}")
+                    if defaults:
+                        self.var_dut_note.set(f"연결 시 기본값 적용 · {defaults}")
+                        self._log(f"[DUT 기본 설정] {defaults}")
                 elif operation in ("read", "sequence_read"):
                     self._dut_show_sample(result)
                 elif operation == "discover":

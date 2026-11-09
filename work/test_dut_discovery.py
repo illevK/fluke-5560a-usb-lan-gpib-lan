@@ -124,7 +124,8 @@ class DiscoveryUiTests(unittest.TestCase):
     def test_multiple_devices_require_selection_then_recheck_identity(self):
         app = self.app
         with (patch.object(f, 'discover_duts', return_value=([self.usb, self.lan], [])),
-              patch.object(app.dut_session, 'connect', side_effect=self.connect_result) as connect):
+              patch.object(app.dut_session, 'connect', side_effect=self.connect_result) as connect,
+              patch.object(app.dut_session, 'apply_measurement_defaults', return_value='100 ms') as defaults):
             app._dut_scan()
             self.wait(lambda: not app._dut_busy)
             self.assertEqual(len(app._dut_candidates), 2)
@@ -138,11 +139,13 @@ class DiscoveryUiTests(unittest.TestCase):
             self.wait(lambda: not app._dut_busy)
             self.assertFalse(app.dut_session.connected)
             self.assertIn('검색 때 확인한 장비와 다릅니다', app.var_dut_status.get())
+            defaults.assert_not_called()
             connect.side_effect = self.connect_result
             app._dut_connect()
             self.wait(lambda: not app._dut_busy)
             self.assertEqual(connect.call_args.args[0].address, WT_LAN)
             self.assertEqual(app.var_dut_identity.get(), WT_LAN_ID)
+            defaults.assert_called_once()
 
 
 if __name__ == '__main__':

@@ -35,7 +35,7 @@ def check_bundle(report_path):
         assert Path(app.conn_mgr.log_path).is_file()
         report['log_path'] = app.conn_mgr.log_path
         rows = controller.SmartClipboardSequenceParser.build_sequence_steps(
-            'Lead\t308001\t\t60 Hz\t120 V\t10 A\t0.5\n1 kV')
+            '120 V / 10 A\tLead\t\t60 Hz\t120 V\t10 A\t0.5\n1 kV')
         assert rows[0].nominal_raw == '0.5 LEAD' and 'DPF 0.5, LEAD' in rows[0].scpi_cmd
         assert rows[1].scpi_cmd == 'OUT 1000 V, 0 HZ'
         app.seq_steps = rows
@@ -61,25 +61,24 @@ def check_bundle(report_path):
         assert [s.nominal_raw for s in app.seq_steps] == ['120 W','600 W','1200 W','240 W','1200 W','2400 W']
         assert all(s.func_type == 'DCP' for s in app.seq_steps)
         app.excel_grid.render_steps(app.seq_steps)
-        assert app.excel_grid._paste_resolutions('0.01 W\n0.01 W\n0.0001 kW\n0.01 W\n0.0001 kW\n0.0001 kW', 0)
         app.excel_grid._row_widgets[2]['measurement_var'].set('1234.56 W')
         app.excel_grid._commit_cell(2, 9)
         assert app.seq_steps[2].measured_raw == '1234.56 W'
-        assert app.excel_grid._row_widgets[2]['measurement_var'].get() == '1.2346 kW'
+        assert app.excel_grid._row_widgets[2]['measurement_var'].get() == '1234.56 W'
         app.excel_grid._set_measurement_selection(2, 2)
         app.excel_grid._copy_measurements(2, force_cells=True)
-        assert copied[-1] == '1.2346 kW\r\n'
-        report['dc_power_resolution'] = True
+        assert copied[-1] == '1234.56 W\r\n'
+        report['dc_power'] = True
+        assert all(col[0] != '분해능' for col in app.excel_grid.COL_SPECS)
         report['raw_measurements_retained'] = True
         app._load_sample_into_sheet('1 A\n2 A\n3 A\n0.5 A', silent=True)
-        assert app.excel_grid._paste_resolutions('0.001 A', 2)
         app.excel_grid._row_widgets[2]['measurement_var'].set('3.001 A')
         app.btn_group_sort.invoke()
         assert [step.nominal_raw for step in app.seq_steps] == ['1 A', '2 A', '0.5 A', '3 A']
         assert app.seq_steps[3].measured_raw == '3.001 A'
         app.btn_group_restore.invoke()
         assert [step.nominal_raw for step in app.seq_steps] == ['1 A', '2 A', '3 A', '0.5 A']
-        assert app.seq_steps[2].measured_raw == '3.001 A' and app.seq_steps[2].resolution_raw == '0.001 A'
+        assert app.seq_steps[2].measured_raw == '3.001 A'
         report['current_group_order_restore'] = True
         assert controller.identify_dut('NEWTONS4TH,550,123,1.0').family == 'PPA'
         assert controller.identify_dut('YOKOGAWA,WT310E,123,1.0').family == 'WT'

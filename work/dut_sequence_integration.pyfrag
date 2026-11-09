@@ -64,7 +64,6 @@
                         if not .2 <= dwell <= 86_400:
                             raise ValueError("유지시간은 0.2~86400초 사이여야 합니다.")
                         dwell_ms = int(dwell * 1000)
-                    MeasurementResolution.validate(step.resolution_raw, step.nominal_raw, step.func_type)
                 except (ValueError, ConnectionError, RuntimeError, OverflowError) as exc:
                     self._sequence_dut_failure(index, step, exc)
                     return False
@@ -129,7 +128,8 @@
                               else "DUT 입력 범위와 배선을 확인하세요.")
                     failed(f"유효한 DUT 측정값이 없습니다. {detail}")
                     return
-                raw = f"{value:.16g}{' ' + unit if unit else ''}"
+                number = (sample.raw_values or {}).get(metric, f"{value:.16g}")
+                raw = f"{number} {unit}" if unit else number
 
                 def record(state):
                     if not current_capture():
@@ -142,18 +142,13 @@
                     if not self.is_operating or self.conn_mgr.info is not calibrator:
                         failed("교정기의 OPER 상태를 확인하세요.")
                         return
-                    try:
-                        MeasurementResolution.format_value(raw, step.resolution_raw, step.nominal_raw, step.func_type)
-                    except ValueError as exc:
-                        failed(exc)
-                        return
                     step.measured_raw = raw
-                    self.excel_grid._refresh_resolution_value(index, force=True)
                     step.status = "✓ 완료 · DUT"
                     self.excel_grid._update_single_row_visual(index, step, is_active=True)
                     publish_progress()
-                    self.var_active_row_banner.set(f"#{step.step_no}행 DUT 자동 기록 · CH{channel} · {raw}")
-                    self._log(f"[#{step.step_no}행 DUT 자동 기록] CH{channel} {raw}")
+                    result = SIUnits.format_measurement(raw, step.nominal_raw)
+                    self.var_active_row_banner.set(f"#{step.step_no}행 DUT 자동 기록 · CH{channel} · {result}")
+                    self._log(f"[#{step.step_no}행 DUT 자동 기록] CH{channel} {result}")
                     self._seq_dut_pending = None
                     self._seq_dut_resume_required = False
                     self._dut_sync_controls()
@@ -207,7 +202,9 @@
 
             try:
                 started = self._send_and_log(step.scpi_cmd, auto_oper=self.var_seq_auto_oper.get(),
-                                             on_done=done, on_error=failed, stop_sequence=False)
+                                             on_done=done, on_error=failed, stop_sequence=False,
+                                             verify_setpoint=(step.func_type == "ACV"
+                                                              and self.conn_mgr.profile.model == "5560A"))
                 if linked and not started:
                     failed("교정기 출력 요청을 시작할 수 없습니다.")
                 return started

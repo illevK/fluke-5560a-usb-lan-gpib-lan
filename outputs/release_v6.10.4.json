@@ -1,0 +1,13 @@
+{
+  "version": "v6.10.4",
+  "exe_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "62531DAA631F0CB0BDC024EFF4D10DF79E727903D659A6A4327F181EF090A67F",
+  "source_sha256": "EC529B050E1FF3084B961A0361B118C5CCE0BC9C55D0278FDD490C8D48BDD0EF",
+  "desktop_copied": [
+    "C:\\Users\\HCT-2714\\Desktop\\Fluke 교정기.exe"
+  ],
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\AppData\\Local\\Temp\\fluke-v6.10.4-build-20261109165737163\\previous-desktop.exe",
+  "focused_tests_passed": 9,
+  "packaged_code_checks_passed": 2,
+  "verified_hardware": "Physical 5560A LAN in STBY: checked disconnect with 0 error before and after LOCAL, without a redundant STBY command"
+}

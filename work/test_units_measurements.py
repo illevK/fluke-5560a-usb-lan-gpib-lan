@@ -12,6 +12,22 @@ class UnitTests(unittest.TestCase):
     def step(self, nominal, freq='DC', vi='-', model='5560A', **kwargs):
         return f.SmartClipboardSequenceParser.build_Single_step_from_fields(1, vi, freq, '1', nominal, model=model, **kwargs)
 
+    def test_measurement_uses_exact_nominal_units_without_rounding(self):
+        cases = (
+            ("599.8 W", "0.6 kW", "0.5998 kW"),
+            ("1.234567890123456789012345678901234E+00 A", "2 mA",
+             "1234.567890123456789012345678901234 mA"),
+            ("9.999E-10 V", "1 nV", "0.9999 nV"),
+            ("1,200,000 Ω", "1 MΩ", "1.200000 MΩ"),
+            ("1 MΩ", "1 mΩ", "1000000000 mΩ"),
+            ("0.5", "0.5 LEAD", "0.5"),
+            ("", "1 V", ""),
+            ("1 A", "1 V", "1 A"),
+        )
+        for raw, nominal, expected in cases:
+            with self.subTest(raw=raw, nominal=nominal):
+                self.assertEqual(f.SIUnits.format_measurement(raw, nominal), expected)
+
     def test_all_prefixes_and_dimensions(self):
         factors = [('p', 1e-12), ('n', 1e-9), ('u', 1e-6), ('m', .001), ('', 1), ('k', 1000), ('M', 1e6), ('G', 1e9), ('T', 1e12)]
         for base in ('V', 'A', 'W', 'OHM', 'HZ'):
@@ -97,7 +113,7 @@ class MeasurementTests(unittest.TestCase):
             self.grid.render_steps(self.app.seq_steps, active_idx=1)
             self.assertEqual(bool(self.grid._row_widgets[0]['frames'][9].winfo_manager()), visibility)
         self.app._recalculate_all_grid_steps()
-        self.assertEqual([s.measured_raw for s in self.app.seq_steps], ['0.9998 V', '1.9997', ''])
+        self.assertEqual([s.measured_raw for s in self.app.seq_steps], ['0.9998 V', '1.9997 V', ''])
         self.assertEqual([s.scpi_cmd for s in self.app.seq_steps], commands)
         self.app.conn_mgr.send_command.assert_not_called()
 
@@ -108,7 +124,7 @@ class MeasurementTests(unittest.TestCase):
             self.assertEqual(self.grid._commit_and_move(0, 9, 1, 0), 'break')
             focus.assert_called_once()
             edit.assert_not_called()
-        self.assertEqual(self.app.seq_steps[0].measured_raw, '0.9999')
+        self.assertEqual(self.app.seq_steps[0].measured_raw, '0.9999 V')
         self.assertTrue(entry.bind('<Return>'))
         self.assertEqual(self.grid._commit_and_move(2, 9, 1, 0), 'break')
         self.assertEqual(len(self.app.seq_steps), 3)
@@ -120,9 +136,10 @@ class MeasurementTests(unittest.TestCase):
         try:
             self.enter(0, '0.9')
             self.grid._update_single_row_visual(0, self.app.seq_steps[0], True)
-            self.assertEqual(self.app.seq_steps[0].measured_raw, '0.9')
+            self.assertEqual(self.app.seq_steps[0].measured_raw, '0.9 V')
             self.app._handle_excel_paste_at_cell('1 kV\n\n3.0\n', 0, 9)
-            self.assertEqual([s.measured_raw for s in self.app.seq_steps], ['1 kV', '', '3.0'])
+            self.assertEqual([s.measured_raw for s in self.app.seq_steps], ['1 kV', '', '3.0 V'])
+            self.assertEqual(self.grid._row_widgets[0]['measurement_var'].get(), '1000 V')
             self.assertEqual([s.scpi_cmd for s in self.app.seq_steps], commands)
             self.assertFalse(self.grid._paste_measurements('1\t2', 0))
             self.assertEqual(self.app.seq_steps[0].measured_raw, '1 kV')
@@ -134,12 +151,13 @@ class MeasurementTests(unittest.TestCase):
         self.app._handle_excel_cell_edited(0, '-', 'DC', '-', '1 kV')
         self.assertEqual(self.app.seq_steps[0].scpi_cmd, 'OUT 1000 V, 0 HZ')
         self.app._handle_excel_cell_edited(0, '-', 'DC', '-', '1 MV')
-        self.assertEqual(self.app.seq_steps[0].measured_raw, '0.999')
+        self.assertEqual(self.app.seq_steps[0].measured_raw, '0.999 V')
         self.assertEqual(self.app.seq_steps[0].scpi_cmd, '')
         self.assertEqual(self.app.seq_steps[0].func_type, 'ERROR')
         self.app._handle_excel_cell_edited(0, '-', 'DC', '-', '1 mV')
         self.assertEqual(self.app.seq_steps[0].scpi_cmd, 'OUT 0.001 V, 0 HZ')
-        self.assertEqual(self.app.seq_steps[0].measured_raw, '0.999')
+        self.assertEqual(self.grid._row_widgets[0]['measurement_var'].get(), '999 mV')
+        self.assertEqual(self.app.seq_steps[0].measured_raw, '0.999 V')
 
     def test_pf_table_paste_then_edit_direction_and_result(self):
         self.app._handle_excel_paste_at_cell(PowerFactorTests.SAMPLE, 0, 2)
@@ -152,8 +170,7 @@ class MeasurementTests(unittest.TestCase):
         self.app._handle_excel_cell_edited(1, '120 V / 10 A', '60 Hz', '0.5 LAG', '1')
         self.assertEqual(self.app.seq_steps[1].pf_cond_raw, '1 LEAD')
         self.assertIn('DPF 1, LEAD', self.app.seq_steps[1].scpi_cmd)
-        self.assertEqual(int(self.grid._row_widgets[1]['frames'][10].grid_info()['column']), 6)
-        self.assertEqual(int(self.grid._row_widgets[1]['frames'][9].grid_info()['column']), 7)
+        self.assertEqual(int(self.grid._row_widgets[1]['frames'][9].grid_info()['column']), 6)
         self.app.conn_mgr.send_command.assert_not_called()
 
 

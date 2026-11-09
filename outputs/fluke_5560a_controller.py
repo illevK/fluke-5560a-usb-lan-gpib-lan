@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fluke 5560A / 5522A / 5520A / 5080A Controller v6.9.0
+Fluke 5560A / 5522A / 5520A / 5080A Controller v6.10.4
 LAN: verified physical adapter, source-IP binding, Telnet stream framing,
 strict *IDN? validation, read-only diagnosis, background connection tasks.
 USB/GPIB: PyVISA with backend diagnostics and correct interface handling.
@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import math
 import re
+from decimal import Decimal, DecimalException
 import sys
 import time
 import socket
@@ -215,23 +216,23 @@ SAMPLE_POWER_TABLE = """120 V / 500 mA\t\t\t\t\t50 Hz\t1 \t120 V\t60 W
 115 V / 43.478 mA\t\t\t\t\t60 Hz\t1 \t115 V\t5 W"""
 
 # 샘플 2: 사용자 제공 DC 전압 표
-SAMPLE_DCV_TABLE = """Spec\tRange\t조건1\t명목값\t측정 1
-99\t600 mV\t\t100.0 mV\t99.8
--101\t600 mV\t\t-100.0 mV\t-99.8
-0.99\t6 V\t\t1.000 V\t1.000
--1.01\t6 V\t\t-1.000 V\t-1.000
-54.45\t60 V\t\t55.00 V\t54.99
--55.55\t60 V\t\t-55.00 V\t-54.98
-39.6\t60 V\t\t40.00 V\t39.99
--40.4\t60 V\t\t-40.00 V\t-39.99
-29.7\t60 V\t\t30.00 V\t30.00
--30.3\t60 V\t\t-30.00 V\t-29.99
-19.8\t60 V\t\t20.00 V\t20.00
--20.2\t60 V\t\t-20.00 V\t-20.00
-9.9\t60 V\t\t10.00 V\t10.00
--10.1\t60 V\t\t-10.00 V\t-10
-594\t600 V\t\t600.0 V\t599.7
--606\t600 V\t\t-600.0 V\t-599.7"""
+SAMPLE_DCV_TABLE = """Spec\tRange\t조건1\t명목값
+99\t600 mV\t\t100.0 mV
+-101\t600 mV\t\t-100.0 mV
+0.99\t6 V\t\t1.000 V
+-1.01\t6 V\t\t-1.000 V
+54.45\t60 V\t\t55.00 V
+-55.55\t60 V\t\t-55.00 V
+39.6\t60 V\t\t40.00 V
+-40.4\t60 V\t\t-40.00 V
+29.7\t60 V\t\t30.00 V
+-30.3\t60 V\t\t-30.00 V
+19.8\t60 V\t\t20.00 V
+-20.2\t60 V\t\t-20.00 V
+9.9\t60 V\t\t10.00 V
+-10.1\t60 V\t\t-10.00 V
+594\t600 V\t\t600.0 V
+-606\t600 V\t\t-600.0 V"""
 
 # 샘플 3: 사용자 제공 주파수 조건 포함 AC 전압
 SAMPLE_ACV_TABLE = """100 Hz\t\t\t100 mV
@@ -287,7 +288,6 @@ class SequenceStep:
     status: str = "대기"
     breakpoint: bool = False
     measured_raw: str = ""
-    resolution_raw: str = ""
 
 
 # =====================================================================
@@ -360,6 +360,45 @@ class SIUnits:
         if not re.fullmatch(cls.NUMBER, cleaned):
             raise ValueError(f"수치 또는 단위가 붙은 값을 입력하세요: {text}")
         return cls.number(cleaned)
+
+    @classmethod
+    def with_nominal_unit(cls, measured, nominal):
+        """Keep the unit of a number typed without a suffix at the time of entry."""
+        target = cls.VALUE.fullmatch(nominal.replace("−", "-"))
+        if target and re.fullmatch(cls.NUMBER, cls.clean(measured).strip()):
+            try:
+                cls.normalize(target[2])
+            except ValueError:
+                return measured
+            return f"{measured.strip()} {target[2]}"
+        return measured
+
+    @classmethod
+    def format_measurement(cls, measured, nominal):
+        target = cls.VALUE.fullmatch(nominal.replace("−", "-"))
+        if not target or not measured.strip():
+            return measured
+        source = cls.VALUE.fullmatch(cls.clean(cls.with_nominal_unit(measured, nominal)))
+        if not source:
+            return measured
+        try:
+            target_base, target_scale = cls.split(target[2])
+            source_base, source_scale = cls.split(source[2])
+            if source_base != target_base:
+                return measured
+            if source_scale == target_scale and "e" not in source[1].lower():
+                return f"{source[1]} {target[2]}"
+            value = Decimal(source[1].replace(",", ""))
+            # All SI prefixes here are powers of ten. Shift the decimal exponent
+            # directly to avoid rounding the meter's original digit sequence.
+            shift = Decimal(str(source_scale)).adjusted() - Decimal(str(target_scale)).adjusted()
+            sign, digits, exponent = value.as_tuple()
+            value = Decimal((sign, digits, exponent + shift))
+            notation = "f" if -12 <= value.adjusted() <= 15 else "E"
+            display = format(value, notation)
+            return f"{display} {target[2]}"
+        except (ValueError, DecimalException):
+            return measured
 
 
 class Fluke5560ACommandBuilder:
@@ -583,115 +622,6 @@ class Fluke5560ACommandBuilder:
 # =====================================================================
 # 3. 엑셀/성적서 복사·붙여넣기 스마트 파서 (띄어쓰기 / 다중 탭 완벽 호환)
 # =====================================================================
-from decimal import Decimal, InvalidOperation, localcontext, ROUND_HALF_UP
-
-
-class MeasurementResolution:
-    """Convert and round a reading without changing the original entry.
-
-    validate() returns (increment, canonical_unit, dimension, SI_scale), or None
-    for an empty resolution. Bare readings use the resolution's unit. Physical
-    resolutions require a unit; power-factor resolutions are unitless.
-    """
-    FUNCTION_BASES = {"DCV": "V", "ACV": "V", "DCI": "A", "ACI": "A",
-                      "DCA": "A", "ACA": "A", "DCP": "W", "ACP": "W",
-                      "OHM": "OHM", "FREQ": "HZ", "HZ": "HZ"}
-
-    @staticmethod
-    def _number(text):
-        value = Decimal(str(text).replace(',', ''))
-        # Also bound scientific exponents so a malformed paste cannot request
-        # an enormous fixed-point string in the measurement table.
-        if not value.is_finite() or (value and abs(value.adjusted()) > 300):
-            raise ValueError("유한한 범위의 수치를 입력하세요.")
-        return value
-
-    @classmethod
-    def validate(cls, resolution_raw, nominal_raw="", func_type=""):
-        text = SIUnits.clean(resolution_raw).strip()
-        if not text:
-            return None
-        quantity = SIUnits.VALUE.fullmatch(text)
-        number = re.fullmatch(SIUnits.NUMBER, text)
-        if quantity:
-            increment = cls._number(quantity[1])
-            if quantity[2].upper() == "PF":
-                unit, base, scale = "", None, Decimal(1)
-            else:
-                unit = SIUnits.normalize(quantity[2])
-                base, factor = SIUnits.split(unit)
-                scale = Decimal(str(factor))
-        elif number:
-            increment = cls._number(text)
-            unit, base, scale = "", None, Decimal(1)
-        else:
-            raise ValueError("분해능은 양수와 단위로 입력하세요. 예: 0.01 W, 0.0001 kW")
-        if increment <= 0:
-            raise ValueError("분해능은 0보다 큰 값이어야 합니다.")
-
-        function = str(func_type).upper()
-        expected = cls.FUNCTION_BASES.get(function)
-        nominal = SIUnits.VALUE.fullmatch(SIUnits.clean(nominal_raw).strip())
-        if nominal:
-            try:
-                expected = SIUnits.split(nominal[2])[0]
-            except ValueError:
-                pass  # A PF target such as "0.5 LEAD" has no physical unit.
-        if function == "PF":
-            if base is not None:
-                raise ValueError("역률 분해능은 단위 없이 입력하세요. 예: 0.001")
-        elif expected is not None and base != expected:
-            if base is None:
-                raise ValueError("분해능에 목표값과 같은 계열의 단위를 함께 입력하세요.")
-            raise ValueError("분해능과 목표값의 단위 계열이 다릅니다.")
-        return increment, unit, base, scale
-
-    @classmethod
-    def format_value(cls, raw, resolution_raw, nominal_raw="", func_type=""):
-        original = str(raw)
-        if not str(resolution_raw).strip():
-            return original
-        text = SIUnits.clean(original).strip()
-        if not text:
-            return ""
-        specification = cls.validate(resolution_raw, nominal_raw, func_type)
-        increment, unit, base, scale = specification
-        quantity = SIUnits.VALUE.fullmatch(text)
-        bare = re.fullmatch(SIUnits.NUMBER, text)
-        if quantity:
-            value = cls._number(quantity[1])
-            if quantity[2].upper() == "PF":
-                input_base, input_scale = None, Decimal(1)
-            else:
-                input_base, factor = SIUnits.split(quantity[2])
-                input_scale = Decimal(str(factor))
-            if input_base != base:
-                raise ValueError("측정값과 분해능의 단위 계열이 다릅니다.")
-        elif bare:
-            value = cls._number(text)
-            input_scale = scale
-        else:
-            if (re.match(r"^[+-]?(?:\d|\.)", text) or
-                    re.fullmatch(r"[+-]?(?:NAN|INF(?:INITY)?)(?:\s+\S+)?", text, re.I)):
-                raise ValueError("측정값은 숫자 또는 단위가 포함된 값으로 입력하세요.")
-            return original  # Keep operator notes such as OL / 재측정.
-
-        try:
-            with localcontext() as context:
-                context.prec = max(60, len(value.as_tuple().digits) +
-                                   abs(value.as_tuple().exponent) +
-                                   abs(increment.as_tuple().exponent) + 40)
-                converted = value * input_scale / scale
-                rounded = (converted / increment).quantize(Decimal(1), rounding=ROUND_HALF_UP) * increment
-                if rounded == 0:
-                    rounded = abs(rounded)
-                places = max(0, -increment.normalize().as_tuple().exponent)
-                result = f"{rounded:.{places}f}"
-        except (InvalidOperation, OverflowError) as exc:
-            raise ValueError("분해능에 맞춰 측정값을 표시할 수 없습니다.") from exc
-        return f"{result} {unit}" if unit else result
-
-
 class SmartClipboardSequenceParser:
     """
     엑셀이나 성적서에서 복사한 텍스트(탭 또는 띄어쓰기 구분)를 행/열 단위로 자동 분류합니다.
@@ -718,14 +648,14 @@ class SmartClipboardSequenceParser:
 
     @classmethod
     def parse_dc_power_row(cls, line):
-        """A complete V/A pair without a frequency is a DC power point.
-
-        Match the whole row so a following nominal value, frequency, or
-        resolution stays available to the existing table-specific parsers.
-        """
+        """A complete V/A pair alone represents a DC power point."""
         text = SIUnits.clean(line).strip()
         match = cls.VI_SLASH_PATTERN.fullmatch(text)
         if match is None:
+            if text.count("/") == 1:
+                left, right = (part.strip() for part in text.split("/"))
+                if cls.TOKEN_FINDER.fullmatch(left) and cls.TOKEN_FINDER.fullmatch(right):
+                    raise ValueError("전력 조건은 전압 / 전류 순서로 입력하세요. 예: 120 V / 1 A")
             return None
         volts = SIUnits.to_base(SIUnits.number(match[1]), match[2], "V")
         amps = SIUnits.to_base(SIUnits.number(match[3]), match[4], "A")
@@ -757,6 +687,70 @@ class SmartClipboardSequenceParser:
         if value == 1:
             direction = "LEAD"
         return value, direction, f"{value:g} {direction}"
+
+    @classmethod
+    def parse_tabular_row(cls, line):
+        *conditions, nominal = (cell.strip() for cell in line.split("\t"))
+        pair = None
+        quantities = {}
+        settings = []
+        for cell in conditions:
+            if not cell:
+                continue
+            vi = cls.VI_SLASH_PATTERN.fullmatch(cell)
+            if vi:
+                pair = vi
+                continue
+            quantity = cls.parse_value_and_unit(cell)
+            if quantity:
+                quantities[SIUnits.split(quantity[1])[0]] = cell
+            else:
+                settings.append(cell)
+
+        quantity = cls.parse_value_and_unit(nominal)
+        unit = SIUnits.split(quantity[1])[0] if quantity else None
+        voltage, current = quantities.get("V"), quantities.get("A")
+        frequency = quantities.get("HZ")
+        freq_condition = frequency or next(
+            (cell for cell in settings if cell.upper() in {"DC", "WIRE2", "WIRE4", "2W", "4W"}), "DC"
+        )
+        if pair:
+            if unit == "W" and voltage is not None:
+                paired_voltage = SIUnits.to_base(SIUnits.number(pair[1]), pair[2], "V")
+                if not math.isclose(SIUnits.to_base(*cls.parse_value_and_unit(voltage), "V"), paired_voltage):
+                    raise ValueError("전력 조건의 전압과 별도 전압 열이 서로 다릅니다.")
+            voltage = f"{pair[1]} {pair[2]}" if unit == "W" or not voltage else voltage
+            current = f"{pair[3]} {pair[4]}" if unit == "W" or not current else current
+        vi_condition = f"{voltage} / {current}" if voltage and current else voltage or "-"
+        if unit == "W":
+            # Search from the measurements toward the left so reference columns
+            # preceding the test conditions do not supply a phase setting.
+            pf = "1"
+            for cell in reversed(settings):
+                try:
+                    _, _, pf = cls.parse_power_factor(cell)
+                except ValueError:
+                    continue
+                break
+            return vi_condition, freq_condition, pf, nominal
+        if unit in {"V", "A", "OHM"}:
+            if pair:
+                raise ValueError("전압 / 전류 조건의 마지막 열에는 전력(W 계열) 또는 역률을 입력하세요.")
+            return "-", freq_condition, "-", nominal
+        if voltage and current:
+            if not frequency:
+                raise ValueError("역률 출력에는 AC 주파수가 필요합니다. 예: 60 Hz")
+            directions = set(re.findall(r"(?<![A-Za-z])(LEAD|LAG)(?![A-Za-z])",
+                                        " ".join([*settings, nominal]).upper()))
+            if len(directions) > 1:
+                raise ValueError("한 역률 행에 Lead와 Lag를 동시에 지정할 수 없습니다.")
+            if nominal and directions and not re.search(r"LEAD|LAG", nominal, re.I):
+                nominal += " " + next(iter(directions))
+            _, _, display = cls.parse_power_factor(nominal)
+            return vi_condition, frequency, display, display
+        if quantities:
+            raise ValueError("마지막 열에 단위가 있는 명목값을 입력하세요.")
+        return None
 
     @classmethod
     def parse_power_factor_row(cls, line):
@@ -894,11 +888,18 @@ class SmartClipboardSequenceParser:
             dpf_val, dpf_lead_lag, pf_display = cls.parse_power_factor(pf_cond_raw if pf_cond_raw.strip() not in ("", "-") else "1")
 
             target_power_w = nom_val * Fluke5560ACommandBuilder.unit_multiplier(nom_unit)
-            calc_current_a = target_power_w / (voltage_v * dpf_val)
-            if cond_current_a is not None and abs(cond_current_a - calc_current_a) <= max(1e-4, 0.02 * cond_current_a):
-                target_current_a = cond_current_a
+            if voltage_v == 0:
+                raise ValueError("전력 조건의 전압은 0이 아닌 값으로 입력하세요.")
+            factor = dpf_val if has_freq else 1.0
+            if cond_current_a is None:
+                target_current_a = target_power_w / (voltage_v * factor)
             else:
-                target_current_a = calc_current_a
+                expected_power = voltage_v * cond_current_a * factor
+                if not math.isclose(expected_power, target_power_w, rel_tol=0.02):
+                    detail = f"조건 계산값 {expected_power:.9g} W / 명목값 {nominal_raw.strip()}"
+                    return SequenceStep(step_no, vi_display, freq_display, pf_display, nominal_raw.strip(),
+                                        "ERROR", "", detail, "⚠ 전력 불일치", breakpoint)
+                target_current_a = cond_current_a
 
             mode = "ACP" if has_freq else "DCP"
             res = CalibratorCommandBuilder(model).build_power_cmd(
@@ -1012,6 +1013,8 @@ class SmartClipboardSequenceParser:
         if not line or cls._is_header_line(line):
             return None
 
+        if "\t" in raw_line:
+            return cls.parse_tabular_row(SIUnits.clean(raw_line))
         dc_row = cls.parse_dc_power_row(line)
         if dc_row is not None:
             return dc_row
@@ -1054,6 +1057,12 @@ class SmartClipboardSequenceParser:
 
             if power_nom_str:
                 return (vi_cond_str, freq_str, pf_str, power_nom_str)
+            if pf_match and any(
+                    SIUnits.split(token[2])[0] == "HZ" for token in cls.TOKEN_FINDER.finditer(rest)):
+                _, _, display = cls.parse_power_factor(pf_str)
+                return vi_cond_str, freq_str, display, display
+            dc = cls.parse_dc_power_row(vi_cond_str)
+            return vi_cond_str, freq_str, "1", dc[3]
 
         freq_tokens: List[str] = []
         output_tokens: List[Tuple[str, float, str]] = []
@@ -1086,35 +1095,40 @@ class SmartClipboardSequenceParser:
         return ("-", freq_cond, "-", nominal_raw)
 
     @classmethod
-    def parse_input_row(cls, raw_line):
-        # An explicit two-column target/resolution paste is unambiguous when
-        # both units describe the same quantity. Hz + V legacy rows stay intact.
-        cells = [value.strip() for value in raw_line.strip().split('\t')]
-        if len(cells) == 2 and all(cells):
-            fields = cls.parse_line_to_fields(cells[0])
-            if fields:
-                nominal = cls.parse_value_and_unit(fields[3])
-                resolution = cls.parse_value_and_unit(cells[1])
-                if nominal and resolution and SIUnits.split(nominal[1])[0] == SIUnits.split(resolution[1])[0]:
-                    MeasurementResolution.validate(cells[1], fields[3])
-                    return fields, cells[1]
-        return cls.parse_line_to_fields(raw_line), ""
+    def build_sequence_steps(
+        cls,
+        raw_text: str,
+        use_coil: bool = False,
+        coil_turns: float = 1.0,
+        default_zcomp: str = "WIRE4",
+        current_post: str = "AUTO",
+        model: str = "5560A",
+    ) -> List[SequenceStep]:
+        steps: List[SequenceStep] = []
+        step_counter = 0
 
-    @classmethod
-    def build_sequence_steps(cls, raw_text, use_coil=False, coil_turns=1.0,
-                             default_zcomp="WIRE4", current_post="AUTO", model="5560A"):
-        steps = []
         for raw_line in raw_text.splitlines():
-            fields, resolution = cls.parse_input_row(raw_line)
-            if fields is None:
+            parsed_fields = cls.parse_line_to_fields(raw_line)
+            if parsed_fields is None:
                 continue
-            vi, freq, pf, nominal = fields
-            step = cls.build_Single_step_from_fields(len(steps) + 1, vi, freq, pf, nominal,
-                use_coil=use_coil, coil_turns=coil_turns, default_zcomp=default_zcomp,
-                current_post=current_post, model=model)
-            step.resolution_raw = resolution
-            steps.append(step)
+            vi_c, fq_c, pf_c, nom_c = parsed_fields
+            step_counter += 1
+            steps.append(
+                cls.build_Single_step_from_fields(
+                    model=model,
+                    step_no=step_counter,
+                    vi_cond_raw=vi_c,
+                    freq_cond_raw=fq_c,
+                    pf_cond_raw=pf_c,
+                    nominal_raw=nom_c,
+                    use_coil=use_coil,
+                    coil_turns=coil_turns,
+                    default_zcomp=default_zcomp,
+                    current_post=current_post,
+                )
+            )
         return steps
+
 
 # =====================================================================
 # 4. 실제 랜카드 조회 및 USB/GPIB/LAN 통신 엔진
@@ -1376,21 +1390,20 @@ class AutoNetworkAligner:
     def select_source_ip(cls, adapter_idx: str, target_ip: str) -> str:
         target = ipaddress.IPv4Address(cls.normalize_ipv4(target_ip))
         if not adapter_idx:
-            # [PATCH v6.9.0] '자동' 선택 시 Wi-Fi로 빠지지 않도록 Up 상태인 유선 랜카드를 우선 선택
-            interfaces = cls.list_ethernet_interfaces(refresh=True)
-            for adapter in interfaces:
-                if adapter.get("state") != "Up":
-                    continue
-                for item in adapter.get("addresses") or []:
+            if not target.is_link_local:
+                return ""
+            # Link-local instrument traffic belongs on the attached cable.
+            wired = [adapter for adapter in cls.list_ethernet_interfaces()
+                     if adapter.get("wired") and adapter["state"] == "Up" and adapter.get("addresses")]
+            for adapter in wired:
+                for item in adapter["addresses"]:
                     network = ipaddress.IPv4Interface(f"{item['ip']}/{item['prefix']}").network
-                    if target in network and str(target) != item["ip"]:
+                    if target in network and str(target) != item["ip"] and target not in (
+                            network.network_address, network.broadcast_address):
                         return item["ip"]
-            for adapter in interfaces:
-                if adapter.get("wired") and adapter.get("state") == "Up":
-                    addrs = adapter.get("addresses") or []
-                    if addrs:
-                        return addrs[0]["ip"]
-            return "" 
+            if len(wired) == 1:
+                return wired[0]["addresses"][0]["ip"]
+            return ""
         for adapter in cls.list_ethernet_interfaces(refresh=True):
             if adapter["idx"] != str(adapter_idx):
                 continue
@@ -1408,6 +1421,23 @@ class AutoNetworkAligner:
             # Routed networks are legitimate. Report the mismatch, but do not force /24.
             return addresses[0]["ip"]
         raise ConnectionError("선택한 실제 랜카드를 찾을 수 없습니다. 랜카드 새로고침을 눌러주세요.")
+
+    @classmethod
+    def link_local_source_ips(cls, source_ip, target_ip, adapter_idx):
+        """Offer alternate addresses only on the adapter selected for link-local LAN."""
+        if not source_ip or not ipaddress.IPv4Address(target_ip).is_link_local:
+            return (source_ip,)
+        for adapter in cls.list_ethernet_interfaces():
+            if adapter["state"] != "Up":
+                continue
+            if adapter_idx and adapter["idx"] != str(adapter_idx):
+                continue
+            if not adapter_idx and not adapter.get("wired"):
+                continue
+            ips = [item["ip"] for item in adapter.get("addresses", ())]
+            if source_ip in ips:
+                return (source_ip, *(ip for ip in ips if ip not in (source_ip, target_ip)))
+        return (source_ip,)
 
     @classmethod
     def describe(cls, target_ip="", source_ip=""):
@@ -1606,8 +1636,8 @@ class SerialLineTransport(TelnetLineTransport):
 # Command references and supported families: outputs/DUT_연결_안내.md.
 DUT_METRICS = (
     ("voltage", "전압 · RMS", "V"), ("current", "전류 · RMS", "A"),
-    ("power", "유효전력", "W"), ("apparent", "피상전력", "VA"),
-    ("reactive", "무효전력", "var"), ("pf", "역률", ""),
+    ("power", "유효전력", "W"), ("pf", "역률", ""),
+    ("apparent", "피상전력", "VA"), ("reactive", "무효전력", "var"),
     ("frequency", "주파수", "Hz"),
 )
 
@@ -1656,23 +1686,27 @@ def identify_dut(identity):
                      "다른 모델은 해당 통신 명령 확인 후 추가할 수 있습니다.")
 
 
-def dut_numbers(reply, count):
+def dut_number_fields(reply, count):
     # A bad response must never be silently shifted into another measurement.
     tokens = reply.strip().split(',')
     if len(tokens) != count:
         raise ValueError(f"DUT 응답 항목 수가 다릅니다 (예상 {count}, 수신 {len(tokens)}): {reply[:160]}")
     values = []
     for token in tokens:
-        token = token.strip().upper()
-        if token in ("NAN", "INF", "+INF", "-INF", "OVLD", "OVER", "OVERLOAD", "---", "----"):
-            values.append(None)
+        token = token.strip()
+        if token.upper() in ("NAN", "INF", "+INF", "-INF", "OVLD", "OVER", "OVERLOAD", "---", "----"):
+            values.append((None, token))
             continue
         try:
             value = float(token)
         except ValueError as exc:
             raise ValueError(f"DUT의 숫자 응답을 해석할 수 없습니다: {token[:80]}") from exc
-        values.append(value if math.isfinite(value) and abs(value) < 9e36 else None)
+        values.append((value if math.isfinite(value) and abs(value) < 9e36 else None, token))
     return values
+
+
+def dut_numbers(reply, count):
+    return [value for value, _ in dut_number_fields(reply, count)]
 
 
 @dataclass(frozen=True)
@@ -1684,6 +1718,7 @@ class DUTSample:
     note: str
     simulated: bool = False
     vi_modes: tuple[str, str] | None = None
+    raw_values: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1840,6 +1875,7 @@ class DUTSession:
         self.transport = self.profile = self.sample = None
         self.identity = ""
         self.simulated = False
+        self.input_channels = ()
 
     @property
     def connected(self):
@@ -1848,6 +1884,108 @@ class DUTSession:
     @property
     def supports_fresh_capture(self):
         return self.connected and self.profile.family in ("WT", "PPA")
+
+    @staticmethod
+    def _wt_reply_value(reply):
+        # Preserve whitespace in the payload, even when a response header is present.
+        return re.sub(r"^:\S+\s+", "", reply.strip()).upper()
+
+    def _set_wt_default(self, command, value, *accepted):
+        self.transport.write(f"{command} {value}")
+        raw = self.transport.query(f"{command}?")
+        reply = self._wt_reply_value(raw)
+        if reply not in (accepted or (value,)):
+            raise ValueError(f"{command} {value} 설정 확인 실패: {raw[:100]}")
+
+    def _set_wt_display(self, compact, channel):
+        profile = self.profile
+        if compact:
+            prefix = ":DISPLAY:NORMAL"
+        else:
+            panel = ":DISPLAY:NUMERIC1" if profile.model == "WT5000" else ":DISPLAY:NUMERIC"
+            prefix = panel + ":NORMAL:VAL4"
+        functions = ("U", "I", "P", "LAMBDA") if compact or profile.wt3000_numeric else (
+            "URMS", "IRMS", "P", "LAMBDA")
+        for index, function in enumerate(functions, 1):
+            command = f"{prefix}:ITEM{index}"
+            item = f"{function},{channel}"
+            short = item.replace("LAMBDA,", "LAMB,")
+            self._set_wt_default(command, item, item, short, item + ",TOTAL", short + ",TOT",
+                                 short + ",TOTAL", item + ",TOT")
+        if not compact:
+            self._set_wt_default(f"{panel}:NORMAL:FORMAT", "VAL4")
+            self._set_wt_default(f"{prefix}:PAGE", "1")
+            if profile.model == "WT5000":
+                self._set_wt_default(":DISPLAY:CUSTOM:MODE", "OFF", "OFF", "0")
+                mode_command = ":DISPLAY:CONFIG"
+            else:
+                mode_command = ":DISPLAY:MODE"
+            self._set_wt_default(mode_command, "NUMERIC", "NUM", "NUME", "NUMERIC")
+
+    def apply_measurement_defaults(self):
+        """Apply only after the UI has verified the connected DUT's identity."""
+        if self.transport is None:
+            return ""
+        t, profile = self.transport, self.profile
+        if profile.family == "PPA":
+            # CONFIG indices are the common voltage/current autorange controls.
+            # This preserves the configured minimum ranges and input scaling.
+            t.write("SPEED,FAST")
+            t.write("FQREF,VOLTAGE")
+            t.write("COUPLI,PHASE1,AC+DC")
+            for index in (28, 29):
+                t.write(f"CONFIG,{index},0")
+            ref_index = 40 if profile.model.startswith(("PPA25", "PPA26")) else 38
+            checks = (("CONFIG,13?", "3"), ("CONFIG,28?", "0"), ("CONFIG,29?", "0"),
+                      (f"CONFIG,{ref_index}?", "0"), ("COUPLI,PHASE1?", "0"))
+            for query, expected in checks:
+                raw = t.query(query)
+                if raw.strip() != expected:
+                    raise ValueError(f"PPA 기본 설정 확인 실패: {query} / {raw[:100]}")
+            return "FAST · 전압 기준 · V/I 자동 범위"
+
+        self._set_wt_default(":COMMUNICATE:HEADER", "OFF", "0", "OFF")
+        compact_wt = profile.model.startswith(("WT310", "WT332", "WT333"))
+        channels = tuple(range(1, profile.channels + 1))
+        rate_command, rate_ms = ":RATE", 500
+        if compact_wt or profile.wt3000_numeric:
+            rate_ms = 100 if compact_wt else 250
+        if profile.model == "WT5000":
+            self._set_wt_default(":UPDATE:MODE", "CONSTANT", "CONS", "CONSTANT")
+            self._set_wt_default(":UPDATE:METHOD", "SSPERIOD", "SSP", "SSPERIOD")
+            rate_command = ":UPDATE:RATE"
+            channels = tuple(ch for ch in channels if self._wt_reply_value(
+                t.query(f":SYSTEM:ELEMENT{ch}:MODEL?")).strip('"') != "NONE")
+            if not channels:
+                raise ValueError("WT5000에 장착된 입력 모듈을 찾을 수 없습니다.")
+        t.write(f"{rate_command} {rate_ms}MS")
+        raw = t.query(f"{rate_command}?")
+        try:
+            actual_rate = float(self._wt_reply_value(raw))
+        except ValueError:
+            actual_rate = None
+        if actual_rate is None or not math.isclose(actual_rate, rate_ms / 1000):
+            raise ValueError(f"갱신 주기 {rate_ms} ms 설정 확인 실패: {raw[:100]}")
+        if compact_wt:
+            self._set_wt_default(":INPUT:MODE", "RMS")
+            self._set_wt_default(":INPUT:SYNCHRONIZE", "VOLTAGE", "VOLT", "VOLTAGE")
+            for quantity in ("VOLTAGE", "CURRENT"):
+                self._set_wt_default(f":INPUT:{quantity}:AUTO", "ON", "1", "ON")
+        else:
+            for channel in channels:
+                element = f"ELEMENT{channel}"
+                for quantity in ("VOLTAGE", "CURRENT"):
+                    if profile.wt3000_numeric:
+                        self._set_wt_default(f":INPUT:{quantity}:MODE:{element}", "RMS")
+                    self._set_wt_default(f":INPUT:{quantity}:AUTO:{element}", "ON", "1", "ON")
+                self._set_wt_default(f":INPUT:SYNCHRONIZE:{element}", f"U{channel}")
+        self.input_channels = channels
+        defaults = f"{rate_ms} ms · RMS · 전압 동기 · V/I 자동 범위"
+        try:
+            self._set_wt_display(compact_wt, channels[0])
+        except ValueError as exc:
+            return f"{defaults} · 본체 표시 확인 실패 ({exc})"
+        return f"{defaults} · 본체 전압/전류/전력/역률"
 
     def connect(self, settings):
         settings.validate()
@@ -1897,21 +2035,24 @@ class DUTSession:
             if t.query(":MEASURE:MHOLD?").strip().upper() not in ("0", "OFF"):
                 raise ValueError("WT 본체의 MAX HOLD를 해제한 뒤 다시 실행하세요.")
 
-    def _read_wt_numbers(self, count, fresh):
+    def _read_wt_fields(self, count, fresh):
         command = ":NUMERIC:NORMAL:VALUE?"
         if not fresh:
-            return dut_numbers(self.transport.query(command), count)
+            return dut_number_fields(self.transport.query(command), count)
         t = self.transport
         self._require_wt_live_reading()
-        original_filter = t.query(":STATUS:FILTER1?").strip().upper()
+        raw_filter = t.query(":STATUS:FILTER1?")
+        original_filter = self._wt_reply_value(raw_filter)
+        if original_filter in {"NEV", "NEVE"}:
+            original_filter = "NEVER"
         if original_filter not in {"RISE", "FALL", "BOTH", "NEVER"}:
-            raise ValueError("WT 데이터 갱신 이벤트 설정을 확인할 수 없습니다.")
+            raise ValueError(f"WT 데이터 갱신 이벤트 설정을 확인할 수 없습니다: {raw_filter[:80]}")
         changed_filter = original_filter != "FALL"
         failed = True
         try:
             if changed_filter:
                 t.write(":STATUS:FILTER1 FALL")
-                if t.query(":STATUS:FILTER1?").strip().upper() != "FALL":
+                if self._wt_reply_value(t.query(":STATUS:FILTER1?")) != "FALL":
                     raise ValueError("WT 데이터 갱신 이벤트 설정이 적용되지 않았습니다.")
             # EESR is cleared on read. Discard events before the stabilized
             # output, then wait through a complete post-output update interval.
@@ -1920,9 +2061,9 @@ class DUTSession:
                 self._wait_data_flag(":STATUS:EESR?", 1,
                     "WT 새 측정값 대기 시간 초과: 본체 HOLD·갱신 주기와 DUT 응답 대기 시간을 확인하세요.")
             self._require_wt_live_reading()
-            values = dut_numbers(t.query(command), count)
+            fields = dut_number_fields(t.query(command), count)
             failed = False
-            return values
+            return fields
         finally:
             if changed_filter and not self.cancel.is_set():
                 try:
@@ -1944,14 +2085,17 @@ class DUTSession:
         if self.cancel.is_set():
             self.disconnect()
             raise InterruptedError("DUT 조회를 중지했습니다.")
-        if not 1 <= channel <= self.profile.channels:
-            raise ValueError(f"{self.profile.model}: 입력 채널은 1~{self.profile.channels} 중 선택하세요.")
+        channels = self.input_channels or range(1, self.profile.channels + 1)
+        if channel not in channels:
+            raise ValueError(f"{self.profile.model}: 사용 가능한 입력 채널은 {', '.join(map(str, channels))}입니다.")
         try:
             vi_modes = None
+            # Instrument record positions are independent of the app's display order.
+            metrics = ("voltage", "current", "power", "apparent", "reactive", "pf", "frequency")
             if self.simulated:
                 if fresh:
                     raise ValueError("미리보기 값을 실제 측정표에 자동 기록할 수 없습니다.")
-                values = dict(zip((m[0] for m in DUT_METRICS), (120., 1., 60., 120., 103.923048, .5, 60.)))
+                fields = {key: (value, "") for key, value in zip(metrics, (120., 1., 60., 120., 103.923048, .5, 60.))}
                 note = "미리보기 · 실제 측정값이 아닙니다."
             elif self.profile.family == "PPA":
                 # A POWER result read clears DAV bit 0. Discard the current
@@ -1970,12 +2114,12 @@ class DUTSession:
                             "PPA 새 측정값 대기 시간 초과: 본체 측정 상태·갱신 주기와 DUT 응답 대기 시간을 확인하세요.")
                         if index == 0:
                             dut_numbers(self.transport.query(rms_command), 5)
-                rms = dut_numbers(self.transport.query(rms_command), 5)
-                power = dut_numbers(self.transport.query(f"POWER,PHASE{channel},WATTS?"), 11)
-                values = dict(zip((m[0] for m in DUT_METRICS),
+                rms = dut_number_fields(self.transport.query(rms_command), 5)
+                power = dut_number_fields(self.transport.query(f"POWER,PHASE{channel},WATTS?"), 11)
+                fields = dict(zip(metrics,
                     (rms[1], rms[3], power[1], power[3], power[5], power[7], power[0])))
                 if include_dc:
-                    values.update(dc_voltage=rms[2], dc_current=rms[4])
+                    fields.update(dc_voltage=rms[2], dc_current=rms[4])
                 if fresh and channel <= 3:
                     voltage_over = self._ppa_range_overloaded(2 * channel - 1)
                     current_over = self._ppa_range_overloaded(2 * channel)
@@ -1983,10 +2127,10 @@ class DUTSession:
                                              (current_over, ("current", "dc_current"))):
                         if overloaded:
                             for key in keys:
-                                if key in values:
-                                    values[key] = None
+                                if key in fields:
+                                    fields[key] = (None, "")
                     if voltage_over or current_over:
-                        values.update(power=None, apparent=None, reactive=None, pf=None)
+                        fields.update(dict.fromkeys(("power", "apparent", "reactive", "pf"), (None, "")))
                 note = ("PPA 새 데이터 갱신 확인 · RMS·전력 순차 조회" if fresh
                         else "PPA RMS·전력 순차 조회 (동시 샘플 아님) · 역률 부호는 본체 설정 기준")
             else:
@@ -2019,8 +2163,8 @@ class DUTSession:
                 # Readback prevents unsupported firmware from returning older,
                 # differently ordered values after silently rejecting a setting.
                 for index, item in enumerate(items, 1):
-                    raw_reply = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
-                    reply = raw_reply.split()[-1].replace(' ', '') if raw_reply else ""
+                    query = f":NUMERIC:NORMAL:ITEM{index}?"
+                    reply = self._wt_reply_value(self.transport.query(query)).replace(" ", "")
                     if reply.startswith("LAMB,"):
                         reply = reply.replace("LAMB,", "LAMBDA,", 1)
                     if reply.endswith(",TOT"):
@@ -2028,39 +2172,33 @@ class DUTSession:
                     if reply != item and self.profile.model.startswith(("WT310", "WT332", "WT333")):
                         fallback = item.replace("URMS,", "U,", 1).replace("IRMS,", "I,", 1)
                         if fallback != item:
-                            self.transport.write(":INPUT:MODE RMS")
+                            self._set_wt_default(":INPUT:MODE", "RMS")
                             self.transport.write(f":NUMERIC:NORMAL:ITEM{index} {fallback}")
-                            raw_reply2 = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
-                            reply2 = raw_reply2.split()[-1].replace(' ', '') if raw_reply2 else ""
-                            if reply2 == fallback:
-                                items[index - 1] = fallback
-                                reply = fallback
-                    if reply != items[index - 1]:
-                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {items[index - 1]} / {reply[:100]}")
-                if self.profile.model.startswith(("WT310", "WT332", "WT333", "WT500")) and self.profile.model != "WT5000":
-                    if type(self.transport) is DUTTransport:
-                        self.transport.write(":HOLD OFF")
-                    else:
-                        self.transport.write(":NUMERIC:HOLD OFF")
-                else:
-                    self.transport.write(":NUMERIC:HOLD OFF")
-                numbers = self._read_wt_numbers(count, fresh)
-                values = dict(zip((m[0] for m in DUT_METRICS), numbers))
+                            reply = self._wt_reply_value(self.transport.query(query)).replace(" ", "")
+                            item = fallback
+                    if reply != item:
+                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {item} / {reply[:100]}")
+                self.transport.write(":NUMERIC:HOLD OFF")
+                readings = self._read_wt_fields(count, fresh)
+                fields = dict(zip(metrics, readings))
                 if count == 9:
-                    values.update(dc_voltage=numbers[7], dc_current=numbers[8])
+                    fields.update(dc_voltage=readings[7], dc_current=readings[8])
                 elif include_dc and vi_modes:
                     if vi_modes[0] == "DC":
-                        values["dc_voltage"] = numbers[0]
+                        fields["dc_voltage"] = readings[0]
                     if vi_modes[1] == "DC":
-                        values["dc_current"] = numbers[1]
+                        fields["dc_current"] = readings[1]
                 note = ("WT 새 데이터 갱신 확인 · 본체 배율 적용값" if fresh
                         else "WT 통신 출력 7항목 · 주파수는 전압 기준 · 본체 배율 적용값")
             if self.cancel.is_set():
                 raise InterruptedError("DUT 조회를 중지했습니다.")
-            if values["pf"] is not None and abs(values["pf"]) > 1.000001:
-                values["pf"] = None
+            pf, _ = fields["pf"]
+            if pf is not None and abs(pf) > 1.000001:
+                fields["pf"] = (None, "")
+            values = {key: value for key, (value, _) in fields.items()}
+            raw_values = {key: token for key, (value, token) in fields.items() if value is not None and token}
             self.sample = DUTSample(self.identity, channel, datetime.datetime.now().isoformat(timespec='seconds'),
-                                    values, note, self.simulated, vi_modes)
+                                    values, note, self.simulated, vi_modes, raw_values)
             return self.sample
         except Exception:
             # A late response cannot become the next query's result.
@@ -2073,6 +2211,7 @@ class DUTSession:
         self.transport = self.profile = self.sample = None
         self.identity = ""
         self.simulated = False
+        self.input_channels = ()
 
 import select
 import struct
@@ -2317,6 +2456,8 @@ class Fluke5560AConnectionManager:
         self._sim_last_out = "0 V, 0 HZ"
         self.last_error = ""
         self.source_ip = ""
+        self._last_lan_source = None
+        self._lan_tcp_failures = []
         self.last_diagnostic = ""
         self.operation_timeout = 60.0
         self.cancel_event = threading.Event()
@@ -2392,6 +2533,35 @@ class Fluke5560AConnectionManager:
             raise ValueError("포트는 1~65535 사이여야 합니다.")
         return port
 
+    def _lan_source_ips(self, ip, port, source_ip, adapter_idx):
+        if source_ip and not adapter_idx:
+            return (AutoNetworkAligner.normalize_ipv4(source_ip),)
+        primary = AutoNetworkAligner.select_source_ip(adapter_idx, ip)
+        candidates = list(AutoNetworkAligner.link_local_source_ips(primary, ip, adapter_idx))
+        previous = self._last_lan_source
+        if previous and previous[:2] == (ip, port) and previous[2] in candidates:
+            candidates.remove(previous[2])
+            candidates.insert(0, previous[2])
+        return tuple(candidates[:3])
+
+    def _open_lan_socket(self, ip, port, timeout, source_ips):
+        self._lan_tcp_failures = []
+        for index, source_ip in enumerate(source_ips):
+            self.source_ip = source_ip
+            if source_ip == ip:
+                raise ValueError("5560A IP와 PC IP가 같습니다. 장비 화면의 IP를 확인하세요.")
+            try:
+                sock = socket.create_connection((ip, port), timeout,
+                                                source_address=(source_ip, 0) if source_ip else None)
+            except (TimeoutError, ConnectionRefusedError) as exc:
+                self._lan_tcp_failures.append(f"PC {source_ip or '자동 경로'} · {type(exc).__name__}: {exc}")
+                if index + 1 == len(source_ips):
+                    raise
+                self.record_event(f"[LAN 재시도] {self._lan_tcp_failures[-1]} → PC {source_ips[index + 1]}", notify=True)
+            else:
+                self.source_ip = sock.getsockname()[0]
+                return sock
+
     def scan_and_auto_connect(self, preferred_mode="AUTO", lan_ip="", lan_port=3490,
                               gpib_addr=1, timeout_sec=3.0, allow_raw_socket_fallback=False,
                               source_ip="", eol="CRLF", visa_resource="", adapter_idx="",
@@ -2429,12 +2599,8 @@ class Fluke5560AConnectionManager:
         if "LAN" in profile.interfaces and mode in ("AUTO", "LAN", "LAN (SOCKET)", "LAN (VISA)") and lan_ip.strip():
             ip = AutoNetworkAligner.normalize_ipv4(lan_ip)
             port = self._validate_port(lan_port)
-            if adapter_idx:
-                source_ip = AutoNetworkAligner.select_source_ip(adapter_idx, ip)
-            elif source_ip:
-                source_ip = AutoNetworkAligner.normalize_ipv4(source_ip)
-            self.source_ip = source_ip
-            result = self._try_lan_socket(ip, port, timeout_sec, source_ip=source_ip, eol=eol)
+            source_ips = self._lan_source_ips(ip, port, source_ip, adapter_idx)
+            result = self._try_lan_socket(ip, port, timeout_sec, eol=eol, source_ips=source_ips)
             if result.connected:
                 return result
             errors.append(self.last_error)
@@ -2456,18 +2622,15 @@ class Fluke5560AConnectionManager:
         raise ConnectionError(self.last_error or "연결할 인터페이스와 장비 IP/리소스를 지정하세요.")
 
     def _try_lan_socket(self, ip, port=3490, timeout_sec=3.0, allow_open_port_fallback=False,
-                        source_ip="", eol="CRLF"):
+                        source_ip="", eol="CRLF", *, source_ips=None):
         sock = None
+        self._lan_tcp_failures = []
         stage = "TCP 연결"
         try:
             ip = AutoNetworkAligner.normalize_ipv4(ip)
             port = self._validate_port(port)
-            if source_ip and source_ip == ip:
-                raise ValueError("5560A IP와 PC IP가 같습니다. 장비 화면의 IP를 확인하세요.")
-            sock = socket.create_connection((ip, port), timeout_sec,
-                                             source_address=(source_ip, 0) if source_ip else None)
+            sock = self._open_lan_socket(ip, port, timeout_sec, source_ips or (source_ip,))
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.source_ip = sock.getsockname()[0]
             transport = TelnetLineTransport(sock, timeout_sec, eol)
             stage = "장비 식별 (*IDN?)"
             idn = transport.query("*IDN?", identity=True)
@@ -2477,10 +2640,13 @@ class Fluke5560AConnectionManager:
             self._prepare_remote_stream(transport, "LAN")
             self._lan_sock, self._transport = sock, transport
             self.info = ConnectionInfo(True, "LAN (Ethernet Socket)", f"TCPIP::{ip}::{port}::SOCKET", idn, ip, port)
+            self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = ""
             return self.info
         except Exception as exc:
             self.last_error = f"[{stage}] {ip}:{port} / PC {self.source_ip or source_ip or '자동 경로'}\n{type(exc).__name__}: {exc}"
+            if len(self._lan_tcp_failures) > 1:
+                self.last_error += "\n시도한 PC 주소:\n" + "\n".join(self._lan_tcp_failures)
             if sock is not None:
                 close_lan_socket(sock)
             self._lan_sock = self._transport = None
@@ -2614,24 +2780,24 @@ class Fluke5560AConnectionManager:
             raise ValueError("통신 제한 시간은 0.2~60초 사이여야 합니다.")
         ip = AutoNetworkAligner.normalize_ipv4(ip)
         port = self._validate_port(port)
-        self.source_ip = AutoNetworkAligner.select_source_ip(adapter_idx, ip) if adapter_idx else (
-            AutoNetworkAligner.normalize_ipv4(source_ip) if source_ip else "")
+        source_ips = self._lan_source_ips(ip, port, source_ip, adapter_idx)
         stage = "TCP 연결"
         sock = None
         try:
-            sock = socket.create_connection((ip, port), timeout,
-                    source_address=(self.source_ip, 0) if self.source_ip else None)
-            self.source_ip = sock.getsockname()[0]
+            sock = self._open_lan_socket(ip, port, timeout, source_ips)
             stage = "TCP 성공, *IDN? 확인"
             idn = TelnetLineTransport(sock, timeout, eol).query("*IDN?", identity=True)
             if not self._validate_idn(idn):
                 raise InstrumentProtocolError(f"다른 장비 응답: {idn}")
+            self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = f"[진단 성공] TCP 및 {self.expected_model} 식별 확인: {idn}"
         except Exception as exc:
             self.last_error = f"[{stage}] {type(exc).__name__}: {exc}"
         finally:
             if sock is not None:
                 close_lan_socket(sock)
+        if self._lan_tcp_failures:
+            self.last_error += "\n앞선 TCP 연결 실패:\n" + "\n".join(self._lan_tcp_failures)
         self.last_diagnostic = self.build_lan_diagnostic_report(ip, port)
         return self.last_diagnostic
 
@@ -2713,7 +2879,16 @@ class Fluke5560AConnectionManager:
                 self._fail_control_session(f"조회 {command}", exc)
                 raise
 
-    def send_command(self, cmd):
+    def _stop_after_command_error(self, error, phase):
+        # A valid error reply means the stream is still synchronized.
+        self._write("STBY")
+        if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
+            raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
+        raise InstrumentCommandError(
+            f"{self.profile.model} 오류 ({phase}): {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
+        )
+
+    def send_command(self, cmd, *, check_before=False):
         command = self._validate_command(cmd)
         with self._lock:
             if not self.info.connected:
@@ -2736,17 +2911,16 @@ class Fluke5560AConnectionManager:
             try:
                 if self.cancel_event.is_set():
                     raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
+                if check_before:
+                    pending = self._query("ERR?")
+                    if not re.match(r"^\+?0\s*(?:,|$)", pending):
+                        self._stop_after_command_error(pending, "출력 전 대기 중이던 오류")
                 self._write(command)
                 if self._query("*OPC?", timeout=self.operation_timeout) != "1":
                     raise InstrumentProtocolError("명령 처리 완료를 확인하지 못했습니다.")
                 error = self._query("ERR?")
                 if not re.match(r"^\+?0\s*(?:,|$)", error):
-                    # A valid error reply means the stream is still synchronized.
-                    # Stop output and verify it, but retain a healthy connection.
-                    self._write("STBY")
-                    if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
-                        raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
-                    raise InstrumentCommandError(f"{self.profile.model} 오류: {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다.")
+                    self._stop_after_command_error(error, command)
                 self.record_event(f"[명령 완료] {command} | {time.monotonic() - started:.3f}s", notify=True)
             except InstrumentCommandError as exc:
                 self.last_error = str(exc)
@@ -2757,16 +2931,32 @@ class Fluke5560AConnectionManager:
                 self._fail_control_session(context, exc)
                 raise
 
+    def _record_shutdown_error(self, phase):
+        error = self.query("ERR?")
+        self.record_event(f"[연결 해제 · {phase}] {error}",
+                          notify=not re.match(r"^\+?0\s*(?:,|$)", error))
+
     def disconnect(self, standby=True):
         with self._lock:
             try:
                 self.cancel_event.clear()
                 if self.info.connected and standby:
-                    self.send_command("STBY")
+                    checked_shutdown = self.profile.model == "5560A" and self._lan_sock is not None
+                    if not checked_shutdown or self.query("OPER?") != "0":
+                        self.send_command("STBY")
+                        if checked_shutdown and self.query("OPER?") != "0":
+                            raise InstrumentProtocolError("연결 해제 전 STBY를 확인하지 못했습니다.")
+                    if checked_shutdown:
+                        self.record_event("[연결 해제] STBY 확인")
+                        self._record_shutdown_error("LOCAL 전")
                     if self._transport is not None:
-                        self._transport.write("LOCAL")
-                        if self._transport.query("*OPC?") != "1":
+                        self._write("LOCAL")
+                        if self._query("*OPC?", timeout=self.operation_timeout) != "1":
                             raise InstrumentProtocolError("LOCAL 완료 응답을 확인하지 못했습니다.")
+                        if checked_shutdown:
+                            if self.query("OPER?") != "0":
+                                raise InstrumentProtocolError("LOCAL 이후 STBY를 확인하지 못했습니다.")
+                            self._record_shutdown_error("LOCAL 후")
                     elif self._visa_inst is not None:
                         try:
                             self._visa_inst.control_ren(pyvisa.constants.RENLineOperation.deassert_gtl)
@@ -2784,12 +2974,11 @@ if HAS_TKINTER:
     class ExcelSheetGrid(tk.Frame):
         COL_SPECS = [
             ("행", 44, "center", False), ("제어", 76, "center", False),
-            ("전압·전류 조건", 140, "center", True), ("주파수·조건", 90, "center", True),
-            ("역률", 100, "center", True), ("목표값", 110, "e", True),
-            ("실제 출력", 180, "w", False), ("전송 명령", 230, "w", False),
-            ("상태", 90, "center", False),
-            ("측정값", 140, "e", True),
-            ("분해능", 120, "e", True),
+            ("전압·전류 조건", 140, "center", True), ("주파수·조건", 105, "center", True),
+            ("역률", 130, "center", True), ("목표값", 125, "e", True),
+            ("실제 출력", 240, "w", False), ("전송 명령", 230, "w", False),
+            ("상태", 110, "center", False),
+            ("측정값", 130, "e", True),
         ]
 
         def __init__(
@@ -2826,7 +3015,7 @@ if HAS_TKINTER:
 
         @staticmethod
         def _display_column(index):
-            return 6 if index == 10 else 7 if index == 9 else (index + 2 if index >= 6 else index)
+            return 6 if index == 9 else (index + 1 if index >= 6 else index)
 
         def set_measurement_visibility(self, visible):
             self.show_measurements = bool(visible)
@@ -2854,7 +3043,24 @@ if HAS_TKINTER:
         def _measurement_changed(self, row):
             if self._rendering_measurements or not 0 <= row < len(self._steps):
                 return
-            self._steps[row].measured_raw = self._row_widgets[row]["measurement_var"].get()
+            step = self._steps[row]
+            measured = self._row_widgets[row]["measurement_var"].get()
+            step.measured_raw = SIUnits.with_nominal_unit(measured, step.nominal_raw)
+
+        def _refresh_measurement_value(self, row, *, preserve_entry=False):
+            step = self._steps[row]
+            widgets = self._row_widgets[row]
+            measured = widgets["measurement_var"]
+            if (preserve_entry and self.focus_get() is widgets["entries"][9]
+                    and SIUnits.with_nominal_unit(measured.get(), step.nominal_raw) == step.measured_raw):
+                return
+            display = SIUnits.format_measurement(step.measured_raw, step.nominal_raw)
+            if measured.get() != display:
+                self._rendering_measurements = True
+                try:
+                    measured.set(display)
+                finally:
+                    self._rendering_measurements = False
 
         def _init_measurement_selection(self):
             self._measurement_anchor = self._measurement_end = None
@@ -2867,102 +3073,6 @@ if HAS_TKINTER:
             self._measurement_menu.add_command(label="현재 행부터 끝까지 복사", command=self._copy_measurements_to_end)
             self._measurement_menu.add_command(label="측정값 전체 복사", command=self._copy_all_measurements)
             self.bind("<Destroy>", self._measurement_destroyed, add="+")
-
-        RESOLUTION_COLUMN = 10
-
-        def _bind_resolution_entry(self, row):
-            value = tk.StringVar(master=self, value="")
-            widgets = self._row_widgets[row]
-            widgets["resolution_var"] = value
-            widgets["resolution_error"] = ""
-            widgets["entries"][10].configure(textvariable=value)
-            value.trace_add("write", lambda *_args, r=row: self._resolution_changed(r))
-
-        def _resolution_changed(self, row):
-            if self._rendering_measurements or not 0 <= row < len(self._steps):
-                return
-            self._steps[row].resolution_raw = self._row_widgets[row]["resolution_var"].get()
-            self._refresh_resolution_value(row)
-
-        def _measurement_display(self, row):
-            step = self._steps[row]
-            MeasurementResolution.validate(step.resolution_raw, step.nominal_raw, step.func_type)
-            return MeasurementResolution.format_value(step.measured_raw, step.resolution_raw,
-                                                      step.nominal_raw, step.func_type)
-
-        def _set_measurement_display(self, row, text):
-            self._rendering_measurements = True
-            try:
-                variable = self._row_widgets[row]["measurement_var"]
-                if variable.get() != text:
-                    variable.set(text)
-            finally:
-                self._rendering_measurements = False
-
-        def _begin_measurement_edit(self, row):
-            if 0 <= row < len(self._steps):
-                self._set_measurement_display(row, self._steps[row].measured_raw)
-
-        def _refresh_resolution_value(self, row, force=False):
-            if not 0 <= row < len(self._steps):
-                return
-            step = self._steps[row]
-            widgets = self._row_widgets[row]
-            error = ""
-            try:
-                MeasurementResolution.validate(step.resolution_raw, step.nominal_raw, step.func_type)
-                display = self._measurement_display(row)
-            except ValueError as exc:
-                display, error = step.measured_raw, str(exc)
-            widgets["resolution_error"] = error
-            base_bg, _, border = widgets.get("measurement_base_colors", ("white", "#0F172A", "#CBD5E1"))
-            widgets["entries"][10].configure(bg="#FEE2E2" if error else base_bg)
-            widgets["frames"][10].configure(highlightbackground="#DC2626" if error else border)
-            if force or self.focus_get() is not widgets["entries"][9]:
-                self._set_measurement_display(row, display)
-            return error
-
-        def _sync_resolution_row(self, row):
-            step = self._steps[row]
-            self._rendering_measurements = True
-            try:
-                self._row_widgets[row]["resolution_var"].set(step.resolution_raw)
-            finally:
-                self._rendering_measurements = False
-            self._refresh_resolution_value(row)
-
-        def _report_resolution_error(self, row, message):
-            self.bell()
-            callback = getattr(self, "on_resolution_error_callback", None)
-            if callback:
-                callback(f"{row + 1}행 분해능·측정값 확인: {message}")
-
-        def _commit_result_value(self, row):
-            error = self._refresh_resolution_value(row, force=True)
-            if error:
-                self._report_resolution_error(row, error)
-
-        def _paste_resolutions(self, text, start_row):
-            values = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-            if values and values[-1] == "":
-                values.pop()
-            if any("\t" in value for value in values) or start_row + len(values) > len(self._steps):
-                self._report_resolution_error(start_row, "분해능 한 열을 기존 행 수에 맞게 붙여넣으세요.")
-                return False
-            # Validate the whole paste before replacing any existing resolution.
-            for offset, value in enumerate(values):
-                row = start_row + offset
-                if row < 0:
-                    return False
-                step = self._steps[row]
-                try:
-                    MeasurementResolution.validate(value, step.nominal_raw, step.func_type)
-                except ValueError as exc:
-                    self._report_resolution_error(row, str(exc))
-                    return False
-            for offset, value in enumerate(values):
-                self._row_widgets[start_row + offset]["resolution_var"].set(value.strip())
-            return True
 
         def _bind_measurement_header(self):
             header = self.header_frame.winfo_children()[self.MEASUREMENT_COLUMN]
@@ -3122,7 +3232,10 @@ if HAS_TKINTER:
                 return None
             lo, hi = bounds
             # Include empty rows and a final record separator, including a trailing empty cell.
-            return "\r\n".join(self._measurement_display(row) for row in range(lo, hi + 1)) + "\r\n"
+            return "\r\n".join(
+                SIUnits.format_measurement(step.measured_raw, step.nominal_raw)
+                for step in self._steps[lo:hi + 1]
+            ) + "\r\n"
 
         def _copy_measurements(self, row=None, force_cells=False):
             bounds = self._measurement_bounds()
@@ -3135,11 +3248,7 @@ if HAS_TKINTER:
                     return None  # Let Tk copy a substring selected inside one cell.
             if bounds is None:
                 self._set_measurement_selection(row, row)
-            try:
-                text = self.measurement_selection_text()
-            except ValueError as exc:
-                self._report_resolution_error(row, str(exc))
-                return "break"
+            text = self.measurement_selection_text()
             if text is not None:
                 self.clipboard_clear()
                 self.clipboard_append(text)
@@ -3168,7 +3277,7 @@ if HAS_TKINTER:
                 if not 0 <= row < len(self._row_widgets):
                     break
                 self._row_widgets[row]["measurement_var"].set(value)
-                self._refresh_resolution_value(row, force=True)
+                self._refresh_measurement_value(row)
             return True
 
 
@@ -3208,8 +3317,8 @@ if HAS_TKINTER:
             self.canvas_window = self.canvas.create_window((0, 0), window=self.cells_frame, anchor="nw")
 
             self.cells_frame.bind("<Configure>", self._on_frame_configure)
-            self.header_frame.grid_columnconfigure(8, weight=1)
-            self.cells_frame.grid_columnconfigure(8, weight=1)
+            self.header_frame.grid_columnconfigure(7, weight=1)
+            self.cells_frame.grid_columnconfigure(7, weight=1)
             self.canvas.bind("<Configure>", self._resize_columns)
             self.canvas.bind("<Enter>", lambda _e: self._bind_mousewheel(True))
             self.canvas.bind("<Leave>", lambda _e: self._bind_mousewheel(False))
@@ -3369,7 +3478,6 @@ if HAS_TKINTER:
             self._row_widgets.append({"frames": row_frames, "entries": entries, "labels": labels, "measurement_var": measured})
             measured.trace_add("write", lambda *_args, r=r_idx: self._measurement_changed(r))
             self._bind_measurement_selection(r_idx)
-            self._bind_resolution_entry(r_idx)
 
         def _update_single_row_visual(self, r_idx: int, st: SequenceStep, is_active: bool = False) -> None:
             self._steps[r_idx] = st
@@ -3418,17 +3526,10 @@ if HAS_TKINTER:
                 4: st.pf_cond_raw,
                 5: st.nominal_raw,
             }
-            measured = rw["measurement_var"]
-            if measured.get() != st.measured_raw and self.focus_get() is not entries[9]:
-                self._rendering_measurements = True
-                try:
-                    measured.set(st.measured_raw)
-                finally:
-                    self._rendering_measurements = False
+            self._refresh_measurement_value(r_idx, preserve_entry=True)
             entries[9].configure(bg=row_bg, fg=row_fg, font=row_font)
             rw["measurement_base_colors"] = (row_bg, row_fg, border_col)
             self._paint_measurement_cell(r_idx)
-            self._sync_resolution_row(r_idx)
             for c_idx, val_str in col_vals.items():
                 ent = entries[c_idx]
                 ent.configure(bg=row_bg, fg=row_fg, font=row_font)
@@ -3447,16 +3548,15 @@ if HAS_TKINTER:
         def _on_cell_focus(self, r_idx: int, c_idx: int) -> None:
             self.selected_row_idx = r_idx
             self.selected_col_idx = c_idx
-            if c_idx == self.MEASUREMENT_COLUMN:
-                self._begin_measurement_edit(r_idx)
-            if c_idx not in (self.MEASUREMENT_COLUMN, self.RESOLUTION_COLUMN):
+            if c_idx != self.MEASUREMENT_COLUMN:
                 self.on_row_select_callback(r_idx)
             elif not self._measurement_drag_active and not self._measurement_contains(r_idx):
                 self._set_measurement_selection(r_idx, r_idx)
 
         def _commit_cell(self, r_idx: int, c_idx: int) -> None:
-            if c_idx in (self.MEASUREMENT_COLUMN, self.RESOLUTION_COLUMN):
-                self._commit_result_value(r_idx)
+            if c_idx == self.MEASUREMENT_COLUMN:
+                if 0 <= r_idx < len(self._steps):
+                    self._refresh_measurement_value(r_idx)
                 return
             if not (0 <= r_idx < len(self._row_widgets)):
                 return
@@ -3489,9 +3589,6 @@ if HAS_TKINTER:
             if not clip_text or not clip_text.strip():
                 return "break"
 
-            if c_idx == self.RESOLUTION_COLUMN:
-                self._paste_resolutions(clip_text, r_idx)
-                return "break"
             if c_idx == self.MEASUREMENT_COLUMN:
                 if not self._paste_measurements(clip_text, r_idx):
                     self.bell()
@@ -3512,11 +3609,11 @@ if HAS_TKINTER:
 # =====================================================================
 if HAS_TKINTER:
     class Fluke5560AControllerApp(tk.Tk):
-        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.9.0"""
+        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.10.4"""
 
         def __init__(self) -> None:
             super().__init__()
-            self.title("Fluke 교정기 통합 제어 프로그램 v6.9.0 (USB / LAN / RS232 / GPIB)")
+            self.title("Fluke 교정기 통합 제어 프로그램 v6.10.4 (USB / LAN / RS232 / GPIB)")
             self.geometry("1280x930")
             self.minsize(1140, 840)
             self.configure(bg="#F4F6F9")
@@ -3863,10 +3960,16 @@ if HAS_TKINTER:
                 result, error = None, None
                 try:
                     if operation == "connect":
-                        result = self.dut_session.connect(settings)
-                        if selected is not None and result != selected.identity:
+                        identity = self.dut_session.connect(settings)
+                        if selected is not None and identity != selected.identity:
                             self.dut_session.disconnect()
                             raise ConnectionError("검색 때 확인한 장비와 다릅니다. 다시 자동 검색하세요.")
+                        try:
+                            defaults = self.dut_session.apply_measurement_defaults()
+                        except Exception as exc:
+                            self.dut_session.disconnect()
+                            raise ConnectionError(f"DUT 기본 설정 적용 중 오류: {exc}") from exc
+                        result = identity, defaults
                     elif operation == "discover":
                         result = discover_duts(self.dut_session.cancel, excluded_resource=info.resource_name,
                                                excluded_ip=excluded_ip)
@@ -3987,12 +4090,17 @@ if HAS_TKINTER:
                     self.var_dut_status.set(f"DUT 오류: {error}")
                     self._log(f"[DUT {operation}] {error}")
                 elif operation == "connect":
-                    self.var_dut_identity.set(result)
+                    identity, defaults = result
+                    self.var_dut_identity.set(identity)
                     self.var_dut_status.set("DUT 연결됨 · 측정표에서 DUT 자동 기록을 사용할 수 있습니다." if not self.dut_session.simulated
                                             else "가상 DUT 연결됨 · 화면에서 예제 값을 조회할 수 있습니다.")
-                    self.combo_dut_channel.configure(values=tuple(range(1, self.dut_session.profile.channels + 1)))
-                    self.var_dut_channel.set("1")
-                    self._log(f"[DUT 연결] {result}")
+                    channels = self.dut_session.input_channels or tuple(range(1, self.dut_session.profile.channels + 1))
+                    self.combo_dut_channel.configure(values=channels)
+                    self.var_dut_channel.set(str(channels[0]))
+                    self._log(f"[DUT 연결] {identity}")
+                    if defaults:
+                        self.var_dut_note.set(f"연결 시 기본값 적용 · {defaults}")
+                        self._log(f"[DUT 기본 설정] {defaults}")
                 elif operation in ("read", "sequence_read"):
                     self._dut_show_sample(result)
                 elif operation == "discover":
@@ -4045,7 +4153,7 @@ if HAS_TKINTER:
             header.pack(fill="x")
             tk.Label(header, text="Fluke Controller", bg="#F5F7FA", fg="#0F172A",
                      font=("Segoe UI", 18, "bold")).pack(side="left")
-            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.9.0", bg="#F5F7FA",
+            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.10.4", bg="#F5F7FA",
                      fg="#64748B", font=("Segoe UI", 9)).pack(side="left", padx=16)
             self.lbl_conn_badge = tk.Label(header, text="연결 안 됨", bg="#E2E8F0", fg="#64748B", padx=12, pady=5)
             self.lbl_conn_badge.pack(side="right")
@@ -4333,8 +4441,8 @@ if HAS_TKINTER:
                 return
             try:
                 self.conn_mgr.disconnect()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.conn_mgr.record_event(f"[종료 확인 오류] {exc}")
             self.after_cancel(self._poll_after_id)
             self.destroy()
 
@@ -4356,6 +4464,7 @@ if HAS_TKINTER:
             toolbar = tk.Frame(container, bg="white")
             toolbar.pack(fill="x", pady=(0, 10))
             self._ui_button(toolbar, "붙여넣기  Ctrl+V", lambda: self._on_paste_into_sheet_button(replace_all=False))
+            self._ui_button(toolbar, "끝에 붙여넣기", lambda: self._on_paste_into_sheet_button(append=True))
             edit = ttk.Menubutton(toolbar, text="표 편집 ▾")
             edit.pack(side="left", padx=(0, 12))
             menu = tk.Menu(edit, tearoff=False)
@@ -4414,6 +4523,7 @@ if HAS_TKINTER:
             controls = tk.Frame(container, bg="white", pady=4)
             controls.pack(side="bottom", fill="x")
             self._ui_button(controls, "시작", self._on_seq_start_from_selected_or_range, "Primary.TButton")
+            self._ui_button(controls, "처음부터", lambda: self._on_seq_start_from_selected_or_range(all_rows=True))
             self._ui_button(controls, "일시정지", lambda: self._on_seq_stop_auto(silent=False))
             self._ui_button(controls, "재개", self._on_seq_resume_from_paused)
             self._ui_label(controls, "  유지")
@@ -4428,7 +4538,6 @@ if HAS_TKINTER:
                 on_paste_text_callback=self._handle_excel_paste_at_cell, on_cell_edited_callback=self._handle_excel_cell_edited,
                 on_row_start_callback=self._handle_row_direct_start, on_row_breakpoint_callback=self._on_seq_toggle_breakpoint,
                 on_row_select_callback=self._handle_row_selected)
-            self.excel_grid.on_resolution_error_callback = self._show_resolution_error
             self.excel_grid.pack(fill="both", expand=True, pady=(0, 8))
 
         def _get_coil_turns(self) -> float:
@@ -4465,13 +4574,13 @@ if HAS_TKINTER:
             if not silent:
                 self._log(f"[엑셀 시트 로드] 총 {len(steps)}개 행이 엑셀 칸에 맞춰 등록되었습니다.")
 
-        def _on_paste_into_sheet_button(self, replace_all: bool = False) -> None:
-            if not replace_all and self.excel_grid.selected_col_idx in (self.excel_grid.MEASUREMENT_COLUMN, self.excel_grid.RESOLUTION_COLUMN):
+        def _on_paste_into_sheet_button(self, replace_all: bool = False, *, append=False) -> None:
+            if not (replace_all or append) and self.excel_grid.selected_col_idx == self.excel_grid.MEASUREMENT_COLUMN:
                 try:
                     text = self.clipboard_get()
                 except tk.TclError:
                     return
-                self._handle_excel_paste_at_cell(text, self.excel_grid.selected_row_idx, self.excel_grid.selected_col_idx)
+                self._handle_excel_paste_at_cell(text, self.excel_grid.selected_row_idx, self.excel_grid.MEASUREMENT_COLUMN)
                 return
             if self._io_busy or self.seq_running or self._seq_dut_pending is not None:
                 self._log("표를 수정하려면 실행을 일시중단하고 현재 응답을 기다려 주세요.")
@@ -4489,15 +4598,10 @@ if HAS_TKINTER:
                 return
 
             start_r = 0 if replace_all else self.excel_grid.selected_row_idx
-            if replace_all:
-                self.seq_steps = []
-                self._original_row_positions = None
-            self._handle_excel_paste_at_cell(clip_text, start_row_idx=start_r, start_col_idx=2)
+            self._handle_excel_paste_at_cell(clip_text, start_row_idx=start_r,
+                                             start_col_idx=2, replace_all=replace_all, append=append)
 
-        def _handle_excel_paste_at_cell(self, clip_text: str, start_row_idx: int, start_col_idx: int) -> None:
-            if start_col_idx == self.excel_grid.RESOLUTION_COLUMN:
-                self.excel_grid._paste_resolutions(clip_text, start_row_idx)
-                return
+        def _handle_excel_paste_at_cell(self, clip_text: str, start_row_idx: int, start_col_idx: int, *, replace_all=False, append=False) -> None:
             if start_col_idx == self.excel_grid.MEASUREMENT_COLUMN:
                 if not self.excel_grid._paste_measurements(clip_text, start_row_idx):
                     self._log("측정값은 한 열만 복사해서 붙여넣으세요.")
@@ -4506,17 +4610,21 @@ if HAS_TKINTER:
                 self._log("표를 수정하려면 실행을 일시중단하고 현재 응답을 기다려 주세요.")
                 return
             self._on_seq_stop_auto(silent=True)
-            lines = [ln.strip() for ln in clip_text.splitlines() if ln.strip()]
+            lines = [ln for ln in clip_text.splitlines() if ln.strip()]
             if not lines:
                 return
 
             turns = self._get_coil_turns()
             use_coil = self.var_seq_use_coil.get()
 
+            if append:
+                start_row_idx = len(self.seq_steps)
             parsed_rows: List[Tuple[str, str, str, str]] = []
-            for ln in lines:
+            for line_no, ln in enumerate(lines, 1):
                 try:
-                    pf, _resolution = SmartClipboardSequenceParser.parse_input_row(ln)
+                    pf = SmartClipboardSequenceParser.parse_line_to_fields(ln)
+                    if append and pf is None and not SmartClipboardSequenceParser._is_header_line(ln):
+                        raise ValueError(f"붙여넣은 {line_no}행의 출력 조건을 인식할 수 없습니다.")
                 except ValueError as exc:
                     self._log(f"[붙여넣기 입력 오류] {exc}")
                     messagebox.showerror("붙여넣기 값 오류", str(exc))
@@ -4524,11 +4632,9 @@ if HAS_TKINTER:
                 if pf is not None:
                     parsed_rows.append(pf)
 
-            if len(parsed_rows) == len(lines) and parsed_rows:
-                if start_row_idx == 0 and len(parsed_rows) > 1:
-                    self.seq_steps = []
-                    self._original_row_positions = None
-
+            tabular = any("\t" in line for line in lines)
+            if parsed_rows and (append or tabular or len(parsed_rows) == len(lines)):
+                new_steps = []
                 for offset, (vi_c, fq_c, pf_c, nom_c) in enumerate(parsed_rows):
                     target_idx = start_row_idx + offset
                     step_num = target_idx + 1
@@ -4544,14 +4650,24 @@ if HAS_TKINTER:
                         )
                     except Exception as e:
                         messagebox.showerror("붙여넣기 값 오류", f"{step_num}번 행 변환 오류:\n{e}")
-                        break
+                        return
+                    new_steps.append(new_step)
 
-                    _, new_step.resolution_raw = SmartClipboardSequenceParser.parse_input_row(lines[offset])
-                    if target_idx < len(self.seq_steps):
-                        self.seq_steps[target_idx] = new_step
-                    else:
-                        self.seq_steps.append(new_step)
-
+                if replace_all or (not append and start_row_idx == 0 and len(new_steps) > 1):
+                    self.seq_steps = []
+                    self._original_row_positions = None
+                    self.seq_current_idx = self.seq_paused_idx = -1
+                    self.progress_var.set(0)
+                self.seq_steps[start_row_idx:start_row_idx + len(new_steps)] = new_steps
+                if append or replace_all:
+                    self.var_seq_start_row.set("1")
+                if append:
+                    self.var_active_row_banner.set(f"{len(new_steps)}행 추가 · 실행 범위 1~{len(self.seq_steps)}행")
+                invalid_rows = [str(step.step_no) for step in new_steps if not step.scpi_cmd]
+                if invalid_rows:
+                    text = "전력 조건과 명목값 확인 · " + ", ".join(invalid_rows) + "행"
+                    self.var_active_row_banner.set(text)
+                    self._log(text)
                 for i, st in enumerate(self.seq_steps):
                     st.step_no = i + 1
 
@@ -4563,7 +4679,10 @@ if HAS_TKINTER:
                 )
                 return
 
+            if tabular or replace_all or append:
+                return
             for offset, ln in enumerate(lines):
+                ln = ln.strip()
                 target_idx = start_row_idx + offset
                 while target_idx >= len(self.seq_steps):
                     dummy = SmartClipboardSequenceParser.build_Single_step_from_fields(
@@ -4593,8 +4712,7 @@ if HAS_TKINTER:
                         coil_turns=turns,
                         breakpoint=st.breakpoint,
                     )
-                    self.seq_steps[target_idx].measured_raw = st.measured_raw
-                    self.seq_steps[target_idx].resolution_raw = st.resolution_raw
+                    self.seq_steps[target_idx].measured_raw = SIUnits.with_nominal_unit(st.measured_raw, st.nominal_raw)
                 except Exception:
                     pass
 
@@ -4616,11 +4734,12 @@ if HAS_TKINTER:
                 try:
                     dc = SmartClipboardSequenceParser.parse_dc_power_row(vi_c)
                 except ValueError as exc:
-                    invalid = SequenceStep(st.step_no, vi_c, fq_c, pf_c, nom_c, "ERROR", "", str(exc), "⚠ 설정 확인", st.breakpoint, st.measured_raw, st.resolution_raw)
+                    invalid = SequenceStep(st.step_no, vi_c, fq_c, pf_c, nom_c, "ERROR", "", str(exc),
+                                           "⚠ 설정 확인", st.breakpoint, st.measured_raw)
                     self.seq_steps[r_idx] = invalid
                     self.excel_grid._update_single_row_visual(r_idx, invalid)
-                    self.var_active_row_banner.set(f"{r_idx + 1}행 출력 조건 확인: {exc}")
-                    self._log(str(exc))
+                    self._refresh_current_group_preview()
+                    self._log(f"[#{st.step_no}행 셀 입력 오류] {exc}")
                     return
                 if dc:
                     nom_c, pf_c = dc[3], "1"
@@ -4642,14 +4761,14 @@ if HAS_TKINTER:
                     coil_turns=self._get_coil_turns(),
                     breakpoint=st.breakpoint,
                 )
-                updated.measured_raw = st.measured_raw
-                updated.resolution_raw = st.resolution_raw
-                updated.status = st.status
+                updated.measured_raw = SIUnits.with_nominal_unit(st.measured_raw, st.nominal_raw)
+                if updated.scpi_cmd and st.scpi_cmd:
+                    updated.status = st.status
                 self.seq_steps[r_idx] = updated
                 self.excel_grid._update_single_row_visual(r_idx, updated, is_active=(r_idx == self.seq_current_idx))
                 self._refresh_current_group_preview()
             except Exception as e:
-                invalid = SequenceStep(st.step_no, vi_c, fq_c, pf_c, nom_c, "ERROR", "", str(e), "⚠ 설정 확인", st.breakpoint, st.measured_raw, st.resolution_raw)
+                invalid = SequenceStep(st.step_no, vi_c, fq_c, pf_c, nom_c, "ERROR", "", str(e), "⚠ 설정 확인", st.breakpoint, st.measured_raw)
                 self.seq_steps[r_idx] = invalid
                 self.excel_grid._update_single_row_visual(r_idx, invalid)
                 self._refresh_current_group_preview()
@@ -4725,7 +4844,6 @@ if HAS_TKINTER:
                                            st.nominal_raw, "ERROR", "", str(exc), "⚠ 설정 확인", st.breakpoint)
                     self._log(f"[#{st.step_no}행 설정 확인] {exc}")
                 rebuilt.measured_raw = st.measured_raw
-                rebuilt.resolution_raw = st.resolution_raw
                 rebuilt_steps.append(rebuilt)
             self.seq_steps = rebuilt_steps
             self.excel_grid.render_steps(self.seq_steps, active_idx=-1)
@@ -4798,7 +4916,6 @@ if HAS_TKINTER:
                         if not .2 <= dwell <= 86_400:
                             raise ValueError("유지시간은 0.2~86400초 사이여야 합니다.")
                         dwell_ms = int(dwell * 1000)
-                    MeasurementResolution.validate(step.resolution_raw, step.nominal_raw, step.func_type)
                 except (ValueError, ConnectionError, RuntimeError, OverflowError) as exc:
                     self._sequence_dut_failure(index, step, exc)
                     return False
@@ -4863,7 +4980,8 @@ if HAS_TKINTER:
                               else "DUT 입력 범위와 배선을 확인하세요.")
                     failed(f"유효한 DUT 측정값이 없습니다. {detail}")
                     return
-                raw = f"{value:.16g}{' ' + unit if unit else ''}"
+                number = (sample.raw_values or {}).get(metric, f"{value:.16g}")
+                raw = f"{number} {unit}" if unit else number
 
                 def record(state):
                     if not current_capture():
@@ -4876,18 +4994,13 @@ if HAS_TKINTER:
                     if not self.is_operating or self.conn_mgr.info is not calibrator:
                         failed("교정기의 OPER 상태를 확인하세요.")
                         return
-                    try:
-                        MeasurementResolution.format_value(raw, step.resolution_raw, step.nominal_raw, step.func_type)
-                    except ValueError as exc:
-                        failed(exc)
-                        return
                     step.measured_raw = raw
-                    self.excel_grid._refresh_resolution_value(index, force=True)
                     step.status = "✓ 완료 · DUT"
                     self.excel_grid._update_single_row_visual(index, step, is_active=True)
                     publish_progress()
-                    self.var_active_row_banner.set(f"#{step.step_no}행 DUT 자동 기록 · CH{channel} · {raw}")
-                    self._log(f"[#{step.step_no}행 DUT 자동 기록] CH{channel} {raw}")
+                    result = SIUnits.format_measurement(raw, step.nominal_raw)
+                    self.var_active_row_banner.set(f"#{step.step_no}행 DUT 자동 기록 · CH{channel} · {result}")
+                    self._log(f"[#{step.step_no}행 DUT 자동 기록] CH{channel} {result}")
                     self._seq_dut_pending = None
                     self._seq_dut_resume_required = False
                     self._dut_sync_controls()
@@ -4941,7 +5054,9 @@ if HAS_TKINTER:
 
             try:
                 started = self._send_and_log(step.scpi_cmd, auto_oper=self.var_seq_auto_oper.get(),
-                                             on_done=done, on_error=failed, stop_sequence=False)
+                                             on_done=done, on_error=failed, stop_sequence=False,
+                                             verify_setpoint=(step.func_type == "ACV"
+                                                              and self.conn_mgr.profile.model == "5560A"))
                 if linked and not started:
                     failed("교정기 출력 요청을 시작할 수 없습니다.")
                 return started
@@ -4964,10 +5079,13 @@ if HAS_TKINTER:
             stop_idx = max(start_idx, min(total - 1, stop_r - 1))
             return start_idx, stop_idx
 
-        def _on_seq_start_from_selected_or_range(self):
+        def _on_seq_start_from_selected_or_range(self, *, all_rows=False):
             if not self.seq_steps:
                 self._log("먼저 시트에 측정값을 넣으세요.")
                 return
+            if all_rows:
+                self.var_seq_start_row.set("1")
+                self.var_seq_stop_row.set(str(len(self.seq_steps)))
             self._start_filtered_sequence(*self._get_start_and_stop_indices())
 
         def _on_seq_resume_from_paused(self):
@@ -5687,7 +5805,7 @@ if HAS_TKINTER:
                 return False
             return True
 
-        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True):
+        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True, *, verify_setpoint=False):
             standby = cmd == "STBY" and not auto_oper
             if (self._seq_close_standby or self._dut_closing) and not standby:
                 return False
@@ -5704,7 +5822,12 @@ if HAS_TKINTER:
             self.is_operating = None
             self._refresh_oper_badge()
             def operation():
-                self.conn_mgr.send_command(full_cmd)
+                if verify_setpoint:
+                    self.conn_mgr.send_command(cmd, check_before=True)
+                    if auto_oper:
+                        self.conn_mgr.send_command("OPER")
+                else:
+                    self.conn_mgr.send_command(full_cmd)
                 state = self.conn_mgr.query("OPER?").strip()
                 if state not in ("0", "1"):
                     error = InstrumentProtocolError(f"출력 상태 확인 실패: {state}")
@@ -5859,10 +5982,6 @@ if HAS_TKINTER:
         def _on_check_err(self) -> None:
             self.var_manual_cmd.set("ERR?")
             self._on_manual_send(is_query=True)
-
-        def _show_resolution_error(self, text):
-            self.var_active_row_banner.set(text)
-            self._log(text)
 
         def _build_current_group_panel(self, container):
             self._group_high_only = False
@@ -6226,7 +6345,7 @@ if HAS_TKINTER:
 def run_cli_interactive(model="5560A") -> None:
     mgr = Fluke5560AConnectionManager()
     print("=" * 88)
-    print(" Fluke 5560A Multi-Product Calibrator Controller v6.9.0 (CLI Mode)")
+    print(" Fluke 5560A Multi-Product Calibrator Controller v6.10.4 (CLI Mode)")
     print("=" * 88)
     print(f"현재 PC 로컬 IPv4: {mgr.get_local_pc_ipv4_list()}")
     print(f"감지된 이더넷 어댑터: {AutoNetworkAligner.list_ethernet_interfaces()}")

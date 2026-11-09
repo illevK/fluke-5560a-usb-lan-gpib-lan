@@ -28,7 +28,7 @@ class FakeInstrument:
 
     def write(self, command):
         self.commands.append(command)
-        if command.startswith(':NUMERIC:NORMAL:ITEM'):
+        if command.startswith((':NUMERIC:NORMAL:ITEM', ':DISPLAY:')):
             key, value = command.split(' ', 1)
             self.items[key] = value
 
@@ -40,6 +40,8 @@ class FakeInstrument:
             return self.identity
         if command in self.replies:
             return self.replies[command]
+        if command.startswith(':DISPLAY:'):
+            return self.items[command[:-1]]
         if command.startswith(':NUMERIC:NORMAL:ITEM'):
             return 'P,1' if self.bad_item else self.items[command[:-1]]
         if command == ':NUMERIC:NORMAL:VALUE?':
@@ -174,7 +176,7 @@ class DUTProtocolTests(unittest.TestCase):
         self.assertEqual(instrument.commands, ['*IDN?', 'RESOLU,HIGH', 'POWER,PHASE1,RMS?', 'POWER,PHASE1,WATTS?'])
 
     def test_mapping_failure_and_timeout_close_stream_and_clear_sample(self):
-        session, instrument = self.make_session(FakeInstrument(bad_item=True))
+        session, instrument = self.make_session(FakeInstrument(bad_item=True, replies={":INPUT:MODE?": "RMS"}))
         with self.assertRaises(ValueError): session.read()
         self.assertTrue(instrument.closed)
         self.assertNotIn(':NUMERIC:NORMAL:VALUE?', instrument.commands)
@@ -221,7 +223,7 @@ class DUTProtocolTests(unittest.TestCase):
             settings = SimpleNamespace(timeout=1.0)
             events = iter(("1", "8", "1", "0", "1"))
             event_count = 0
-            event_filter = "RISE"
+            event_filter = ":STATUS:FILT1 NEV"
 
             def write(self, command):
                 super().write(command)
@@ -248,7 +250,60 @@ class DUTProtocolTests(unittest.TestCase):
         self.assertEqual((sample.values["dc_voltage"], sample.values["dc_current"]), (-119.99, -0.9999))
         self.assertEqual(instrument.items[":NUMERIC:NORMAL:ITEM8"], "UDC,1")
         self.assertEqual(instrument.items[":NUMERIC:NORMAL:ITEM9"], "IDC,1")
-        self.assertEqual(instrument.event_filter, "RISE")
+        self.assertEqual(instrument.event_filter, "NEVER")
+
+    def test_wt310e_connection_defaults_accept_actual_readbacks(self):
+        session, instrument = self.make_session(FakeInstrument(replies={
+            ":COMMUNICATE:HEADER?": "0",
+            ":RATE?": "100.0E-03",
+            ":INPUT:MODE?": "RMS",
+            ":INPUT:SYNCHRONIZE?": "VOLT",
+            ":INPUT:VOLTAGE:AUTO?": "1",
+            ":INPUT:CURRENT:AUTO?": "1",
+        }))
+        self.assertEqual(instrument.commands, ["*IDN?"])
+        self.assertIn("본체 전압/전류/전력/역률", session.apply_measurement_defaults())
+        self.assertEqual([instrument.items[f":DISPLAY:NORMAL:ITEM{i}"] for i in range(1, 5)],
+                         ["U,1", "I,1", "P,1", "LAMBDA,1"])
+        for command in (":RATE 100MS", ":INPUT:MODE RMS", ":INPUT:SYNCHRONIZE VOLTAGE",
+                        ":INPUT:VOLTAGE:AUTO ON", ":INPUT:CURRENT:AUTO ON"):
+            self.assertIn(command, instrument.commands)
+
+    def test_wt5000_defaults_configure_installed_elements(self):
+        replies = {f":SYSTEM:ELEMENT{n}:MODEL?": "NONE" for n in range(1, 8)}
+        replies.update({
+            ":SYSTEM:ELEMENT2:MODEL?": '"760901"',
+            ":COMMUNICATE:HEADER?": "0",
+            ":UPDATE:MODE?": "CONS",
+            ":UPDATE:METHOD?": "SSP",
+            ":UPDATE:RATE?": "500.0E-03",
+            ":INPUT:VOLTAGE:AUTO:ELEMENT2?": "1",
+            ":INPUT:CURRENT:AUTO:ELEMENT2?": "1",
+            ":INPUT:SYNCHRONIZE:ELEMENT2?": "U2",
+        })
+        session, instrument = self.make_session(FakeInstrument("YOKOGAWA,WT5000,1,1", replies=replies))
+        self.assertIn("500 ms", session.apply_measurement_defaults())
+        self.assertEqual([instrument.items[f":DISPLAY:NUMERIC1:NORMAL:VAL4:ITEM{i}"] for i in range(1, 5)],
+                         ["URMS,2", "IRMS,2", "P,2", "LAMBDA,2"])
+        self.assertIn(":DISPLAY:NUMERIC1:NORMAL:FORMAT VAL4", instrument.commands)
+        self.assertIn(":DISPLAY:CONFIG NUMERIC", instrument.commands)
+        self.assertEqual(session.input_channels, (2,))
+        self.assertIn(":INPUT:SYNCHRONIZE:ELEMENT2 U2", instrument.commands)
+        self.assertNotIn(":INPUT:VOLTAGE:AUTO:ELEMENT1 ON", instrument.commands)
+        with self.assertRaisesRegex(ValueError, "2"):
+            session.read(1)
+
+    def test_ppa_defaults_verify_model_specific_reference(self):
+        for model, reference in (("550", 38), ("2530", 40)):
+            with self.subTest(model=model):
+                session, instrument = self.make_session(FakeInstrument(f"NEWTONS4TH,{model},1,1", replies={
+                    "CONFIG,13?": "3", "CONFIG,28?": "0", "CONFIG,29?": "0",
+                    f"CONFIG,{reference}?": "0", "COUPLI,PHASE1?": "0",
+                }))
+                self.assertIn("FAST", session.apply_measurement_defaults())
+                self.assertIn("FQREF,VOLTAGE", instrument.commands)
+                self.assertIn("CONFIG,28,0", instrument.commands)
+                self.assertIn("CONFIG,29,0", instrument.commands)
 
     def test_wt_linked_read_refuses_held_data(self):
         for settings, message in (({":HOLD?": "1"}, "HOLD"), ({":HOLD?": "0", ":MEASURE:MHOLD?": "1"}, "MAX HOLD")):
@@ -464,7 +519,7 @@ class DUTGuiTests(unittest.TestCase):
         grid._copy_all_measurements()
         grid.selected_row_idx = 1
         grid._copy_measurements_to_end()
-        self.assertEqual(copied, ['01.20\r\n\r\n3.0\r\n', '\r\n3.0\r\n'])
+        self.assertEqual(copied, ['01.20 V\r\n\r\n3.0 V\r\n', '\r\n3.0 V\r\n'])
         self.assertEqual([s.measured_raw for s in rows], ['01.20', '', '3.0'])
 
 

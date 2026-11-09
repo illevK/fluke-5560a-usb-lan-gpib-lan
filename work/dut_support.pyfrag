@@ -2,8 +2,8 @@
 # Command references and supported families: outputs/DUT_연결_안내.md.
 DUT_METRICS = (
     ("voltage", "전압 · RMS", "V"), ("current", "전류 · RMS", "A"),
-    ("power", "유효전력", "W"), ("apparent", "피상전력", "VA"),
-    ("reactive", "무효전력", "var"), ("pf", "역률", ""),
+    ("power", "유효전력", "W"), ("pf", "역률", ""),
+    ("apparent", "피상전력", "VA"), ("reactive", "무효전력", "var"),
     ("frequency", "주파수", "Hz"),
 )
 
@@ -52,23 +52,27 @@ def identify_dut(identity):
                      "다른 모델은 해당 통신 명령 확인 후 추가할 수 있습니다.")
 
 
-def dut_numbers(reply, count):
+def dut_number_fields(reply, count):
     # A bad response must never be silently shifted into another measurement.
     tokens = reply.strip().split(',')
     if len(tokens) != count:
         raise ValueError(f"DUT 응답 항목 수가 다릅니다 (예상 {count}, 수신 {len(tokens)}): {reply[:160]}")
     values = []
     for token in tokens:
-        token = token.strip().upper()
-        if token in ("NAN", "INF", "+INF", "-INF", "OVLD", "OVER", "OVERLOAD", "---", "----"):
-            values.append(None)
+        token = token.strip()
+        if token.upper() in ("NAN", "INF", "+INF", "-INF", "OVLD", "OVER", "OVERLOAD", "---", "----"):
+            values.append((None, token))
             continue
         try:
             value = float(token)
         except ValueError as exc:
             raise ValueError(f"DUT의 숫자 응답을 해석할 수 없습니다: {token[:80]}") from exc
-        values.append(value if math.isfinite(value) and abs(value) < 9e36 else None)
+        values.append((value if math.isfinite(value) and abs(value) < 9e36 else None, token))
     return values
+
+
+def dut_numbers(reply, count):
+    return [value for value, _ in dut_number_fields(reply, count)]
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,7 @@ class DUTSample:
     note: str
     simulated: bool = False
     vi_modes: tuple[str, str] | None = None
+    raw_values: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -236,6 +241,7 @@ class DUTSession:
         self.transport = self.profile = self.sample = None
         self.identity = ""
         self.simulated = False
+        self.input_channels = ()
 
     @property
     def connected(self):
@@ -244,6 +250,108 @@ class DUTSession:
     @property
     def supports_fresh_capture(self):
         return self.connected and self.profile.family in ("WT", "PPA")
+
+    @staticmethod
+    def _wt_reply_value(reply):
+        # Preserve whitespace in the payload, even when a response header is present.
+        return re.sub(r"^:\S+\s+", "", reply.strip()).upper()
+
+    def _set_wt_default(self, command, value, *accepted):
+        self.transport.write(f"{command} {value}")
+        raw = self.transport.query(f"{command}?")
+        reply = self._wt_reply_value(raw)
+        if reply not in (accepted or (value,)):
+            raise ValueError(f"{command} {value} 설정 확인 실패: {raw[:100]}")
+
+    def _set_wt_display(self, compact, channel):
+        profile = self.profile
+        if compact:
+            prefix = ":DISPLAY:NORMAL"
+        else:
+            panel = ":DISPLAY:NUMERIC1" if profile.model == "WT5000" else ":DISPLAY:NUMERIC"
+            prefix = panel + ":NORMAL:VAL4"
+        functions = ("U", "I", "P", "LAMBDA") if compact or profile.wt3000_numeric else (
+            "URMS", "IRMS", "P", "LAMBDA")
+        for index, function in enumerate(functions, 1):
+            command = f"{prefix}:ITEM{index}"
+            item = f"{function},{channel}"
+            short = item.replace("LAMBDA,", "LAMB,")
+            self._set_wt_default(command, item, item, short, item + ",TOTAL", short + ",TOT",
+                                 short + ",TOTAL", item + ",TOT")
+        if not compact:
+            self._set_wt_default(f"{panel}:NORMAL:FORMAT", "VAL4")
+            self._set_wt_default(f"{prefix}:PAGE", "1")
+            if profile.model == "WT5000":
+                self._set_wt_default(":DISPLAY:CUSTOM:MODE", "OFF", "OFF", "0")
+                mode_command = ":DISPLAY:CONFIG"
+            else:
+                mode_command = ":DISPLAY:MODE"
+            self._set_wt_default(mode_command, "NUMERIC", "NUM", "NUME", "NUMERIC")
+
+    def apply_measurement_defaults(self):
+        """Apply only after the UI has verified the connected DUT's identity."""
+        if self.transport is None:
+            return ""
+        t, profile = self.transport, self.profile
+        if profile.family == "PPA":
+            # CONFIG indices are the common voltage/current autorange controls.
+            # This preserves the configured minimum ranges and input scaling.
+            t.write("SPEED,FAST")
+            t.write("FQREF,VOLTAGE")
+            t.write("COUPLI,PHASE1,AC+DC")
+            for index in (28, 29):
+                t.write(f"CONFIG,{index},0")
+            ref_index = 40 if profile.model.startswith(("PPA25", "PPA26")) else 38
+            checks = (("CONFIG,13?", "3"), ("CONFIG,28?", "0"), ("CONFIG,29?", "0"),
+                      (f"CONFIG,{ref_index}?", "0"), ("COUPLI,PHASE1?", "0"))
+            for query, expected in checks:
+                raw = t.query(query)
+                if raw.strip() != expected:
+                    raise ValueError(f"PPA 기본 설정 확인 실패: {query} / {raw[:100]}")
+            return "FAST · 전압 기준 · V/I 자동 범위"
+
+        self._set_wt_default(":COMMUNICATE:HEADER", "OFF", "0", "OFF")
+        compact_wt = profile.model.startswith(("WT310", "WT332", "WT333"))
+        channels = tuple(range(1, profile.channels + 1))
+        rate_command, rate_ms = ":RATE", 500
+        if compact_wt or profile.wt3000_numeric:
+            rate_ms = 100 if compact_wt else 250
+        if profile.model == "WT5000":
+            self._set_wt_default(":UPDATE:MODE", "CONSTANT", "CONS", "CONSTANT")
+            self._set_wt_default(":UPDATE:METHOD", "SSPERIOD", "SSP", "SSPERIOD")
+            rate_command = ":UPDATE:RATE"
+            channels = tuple(ch for ch in channels if self._wt_reply_value(
+                t.query(f":SYSTEM:ELEMENT{ch}:MODEL?")).strip('"') != "NONE")
+            if not channels:
+                raise ValueError("WT5000에 장착된 입력 모듈을 찾을 수 없습니다.")
+        t.write(f"{rate_command} {rate_ms}MS")
+        raw = t.query(f"{rate_command}?")
+        try:
+            actual_rate = float(self._wt_reply_value(raw))
+        except ValueError:
+            actual_rate = None
+        if actual_rate is None or not math.isclose(actual_rate, rate_ms / 1000):
+            raise ValueError(f"갱신 주기 {rate_ms} ms 설정 확인 실패: {raw[:100]}")
+        if compact_wt:
+            self._set_wt_default(":INPUT:MODE", "RMS")
+            self._set_wt_default(":INPUT:SYNCHRONIZE", "VOLTAGE", "VOLT", "VOLTAGE")
+            for quantity in ("VOLTAGE", "CURRENT"):
+                self._set_wt_default(f":INPUT:{quantity}:AUTO", "ON", "1", "ON")
+        else:
+            for channel in channels:
+                element = f"ELEMENT{channel}"
+                for quantity in ("VOLTAGE", "CURRENT"):
+                    if profile.wt3000_numeric:
+                        self._set_wt_default(f":INPUT:{quantity}:MODE:{element}", "RMS")
+                    self._set_wt_default(f":INPUT:{quantity}:AUTO:{element}", "ON", "1", "ON")
+                self._set_wt_default(f":INPUT:SYNCHRONIZE:{element}", f"U{channel}")
+        self.input_channels = channels
+        defaults = f"{rate_ms} ms · RMS · 전압 동기 · V/I 자동 범위"
+        try:
+            self._set_wt_display(compact_wt, channels[0])
+        except ValueError as exc:
+            return f"{defaults} · 본체 표시 확인 실패 ({exc})"
+        return f"{defaults} · 본체 전압/전류/전력/역률"
 
     def connect(self, settings):
         settings.validate()
@@ -293,21 +401,24 @@ class DUTSession:
             if t.query(":MEASURE:MHOLD?").strip().upper() not in ("0", "OFF"):
                 raise ValueError("WT 본체의 MAX HOLD를 해제한 뒤 다시 실행하세요.")
 
-    def _read_wt_numbers(self, count, fresh):
+    def _read_wt_fields(self, count, fresh):
         command = ":NUMERIC:NORMAL:VALUE?"
         if not fresh:
-            return dut_numbers(self.transport.query(command), count)
+            return dut_number_fields(self.transport.query(command), count)
         t = self.transport
         self._require_wt_live_reading()
-        original_filter = t.query(":STATUS:FILTER1?").strip().upper()
+        raw_filter = t.query(":STATUS:FILTER1?")
+        original_filter = self._wt_reply_value(raw_filter)
+        if original_filter in {"NEV", "NEVE"}:
+            original_filter = "NEVER"
         if original_filter not in {"RISE", "FALL", "BOTH", "NEVER"}:
-            raise ValueError("WT 데이터 갱신 이벤트 설정을 확인할 수 없습니다.")
+            raise ValueError(f"WT 데이터 갱신 이벤트 설정을 확인할 수 없습니다: {raw_filter[:80]}")
         changed_filter = original_filter != "FALL"
         failed = True
         try:
             if changed_filter:
                 t.write(":STATUS:FILTER1 FALL")
-                if t.query(":STATUS:FILTER1?").strip().upper() != "FALL":
+                if self._wt_reply_value(t.query(":STATUS:FILTER1?")) != "FALL":
                     raise ValueError("WT 데이터 갱신 이벤트 설정이 적용되지 않았습니다.")
             # EESR is cleared on read. Discard events before the stabilized
             # output, then wait through a complete post-output update interval.
@@ -316,9 +427,9 @@ class DUTSession:
                 self._wait_data_flag(":STATUS:EESR?", 1,
                     "WT 새 측정값 대기 시간 초과: 본체 HOLD·갱신 주기와 DUT 응답 대기 시간을 확인하세요.")
             self._require_wt_live_reading()
-            values = dut_numbers(t.query(command), count)
+            fields = dut_number_fields(t.query(command), count)
             failed = False
-            return values
+            return fields
         finally:
             if changed_filter and not self.cancel.is_set():
                 try:
@@ -340,14 +451,17 @@ class DUTSession:
         if self.cancel.is_set():
             self.disconnect()
             raise InterruptedError("DUT 조회를 중지했습니다.")
-        if not 1 <= channel <= self.profile.channels:
-            raise ValueError(f"{self.profile.model}: 입력 채널은 1~{self.profile.channels} 중 선택하세요.")
+        channels = self.input_channels or range(1, self.profile.channels + 1)
+        if channel not in channels:
+            raise ValueError(f"{self.profile.model}: 사용 가능한 입력 채널은 {', '.join(map(str, channels))}입니다.")
         try:
             vi_modes = None
+            # Instrument record positions are independent of the app's display order.
+            metrics = ("voltage", "current", "power", "apparent", "reactive", "pf", "frequency")
             if self.simulated:
                 if fresh:
                     raise ValueError("미리보기 값을 실제 측정표에 자동 기록할 수 없습니다.")
-                values = dict(zip((m[0] for m in DUT_METRICS), (120., 1., 60., 120., 103.923048, .5, 60.)))
+                fields = {key: (value, "") for key, value in zip(metrics, (120., 1., 60., 120., 103.923048, .5, 60.))}
                 note = "미리보기 · 실제 측정값이 아닙니다."
             elif self.profile.family == "PPA":
                 # A POWER result read clears DAV bit 0. Discard the current
@@ -366,12 +480,12 @@ class DUTSession:
                             "PPA 새 측정값 대기 시간 초과: 본체 측정 상태·갱신 주기와 DUT 응답 대기 시간을 확인하세요.")
                         if index == 0:
                             dut_numbers(self.transport.query(rms_command), 5)
-                rms = dut_numbers(self.transport.query(rms_command), 5)
-                power = dut_numbers(self.transport.query(f"POWER,PHASE{channel},WATTS?"), 11)
-                values = dict(zip((m[0] for m in DUT_METRICS),
+                rms = dut_number_fields(self.transport.query(rms_command), 5)
+                power = dut_number_fields(self.transport.query(f"POWER,PHASE{channel},WATTS?"), 11)
+                fields = dict(zip(metrics,
                     (rms[1], rms[3], power[1], power[3], power[5], power[7], power[0])))
                 if include_dc:
-                    values.update(dc_voltage=rms[2], dc_current=rms[4])
+                    fields.update(dc_voltage=rms[2], dc_current=rms[4])
                 if fresh and channel <= 3:
                     voltage_over = self._ppa_range_overloaded(2 * channel - 1)
                     current_over = self._ppa_range_overloaded(2 * channel)
@@ -379,10 +493,10 @@ class DUTSession:
                                              (current_over, ("current", "dc_current"))):
                         if overloaded:
                             for key in keys:
-                                if key in values:
-                                    values[key] = None
+                                if key in fields:
+                                    fields[key] = (None, "")
                     if voltage_over or current_over:
-                        values.update(power=None, apparent=None, reactive=None, pf=None)
+                        fields.update(dict.fromkeys(("power", "apparent", "reactive", "pf"), (None, "")))
                 note = ("PPA 새 데이터 갱신 확인 · RMS·전력 순차 조회" if fresh
                         else "PPA RMS·전력 순차 조회 (동시 샘플 아님) · 역률 부호는 본체 설정 기준")
             else:
@@ -415,8 +529,8 @@ class DUTSession:
                 # Readback prevents unsupported firmware from returning older,
                 # differently ordered values after silently rejecting a setting.
                 for index, item in enumerate(items, 1):
-                    raw_reply = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
-                    reply = raw_reply.split()[-1].replace(' ', '') if raw_reply else ""
+                    query = f":NUMERIC:NORMAL:ITEM{index}?"
+                    reply = self._wt_reply_value(self.transport.query(query)).replace(" ", "")
                     if reply.startswith("LAMB,"):
                         reply = reply.replace("LAMB,", "LAMBDA,", 1)
                     if reply.endswith(",TOT"):
@@ -424,39 +538,33 @@ class DUTSession:
                     if reply != item and self.profile.model.startswith(("WT310", "WT332", "WT333")):
                         fallback = item.replace("URMS,", "U,", 1).replace("IRMS,", "I,", 1)
                         if fallback != item:
-                            self.transport.write(":INPUT:MODE RMS")
+                            self._set_wt_default(":INPUT:MODE", "RMS")
                             self.transport.write(f":NUMERIC:NORMAL:ITEM{index} {fallback}")
-                            raw_reply2 = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
-                            reply2 = raw_reply2.split()[-1].replace(' ', '') if raw_reply2 else ""
-                            if reply2 == fallback:
-                                items[index - 1] = fallback
-                                reply = fallback
-                    if reply != items[index - 1]:
-                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {items[index - 1]} / {reply[:100]}")
-                if self.profile.model.startswith(("WT310", "WT332", "WT333", "WT500")) and self.profile.model != "WT5000":
-                    if type(self.transport) is DUTTransport:
-                        self.transport.write(":HOLD OFF")
-                    else:
-                        self.transport.write(":NUMERIC:HOLD OFF")
-                else:
-                    self.transport.write(":NUMERIC:HOLD OFF")
-                numbers = self._read_wt_numbers(count, fresh)
-                values = dict(zip((m[0] for m in DUT_METRICS), numbers))
+                            reply = self._wt_reply_value(self.transport.query(query)).replace(" ", "")
+                            item = fallback
+                    if reply != item:
+                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {item} / {reply[:100]}")
+                self.transport.write(":NUMERIC:HOLD OFF")
+                readings = self._read_wt_fields(count, fresh)
+                fields = dict(zip(metrics, readings))
                 if count == 9:
-                    values.update(dc_voltage=numbers[7], dc_current=numbers[8])
+                    fields.update(dc_voltage=readings[7], dc_current=readings[8])
                 elif include_dc and vi_modes:
                     if vi_modes[0] == "DC":
-                        values["dc_voltage"] = numbers[0]
+                        fields["dc_voltage"] = readings[0]
                     if vi_modes[1] == "DC":
-                        values["dc_current"] = numbers[1]
+                        fields["dc_current"] = readings[1]
                 note = ("WT 새 데이터 갱신 확인 · 본체 배율 적용값" if fresh
                         else "WT 통신 출력 7항목 · 주파수는 전압 기준 · 본체 배율 적용값")
             if self.cancel.is_set():
                 raise InterruptedError("DUT 조회를 중지했습니다.")
-            if values["pf"] is not None and abs(values["pf"]) > 1.000001:
-                values["pf"] = None
+            pf, _ = fields["pf"]
+            if pf is not None and abs(pf) > 1.000001:
+                fields["pf"] = (None, "")
+            values = {key: value for key, (value, _) in fields.items()}
+            raw_values = {key: token for key, (value, token) in fields.items() if value is not None and token}
             self.sample = DUTSample(self.identity, channel, datetime.datetime.now().isoformat(timespec='seconds'),
-                                    values, note, self.simulated, vi_modes)
+                                    values, note, self.simulated, vi_modes, raw_values)
             return self.sample
         except Exception:
             # A late response cannot become the next query's result.
@@ -469,5 +577,6 @@ class DUTSession:
         self.transport = self.profile = self.sample = None
         self.identity = ""
         self.simulated = False
+        self.input_channels = ()
 
 

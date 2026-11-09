@@ -202,9 +202,11 @@ source = source.replace('v6.0.0', 'v6.1.0')
 source = source.replace('v6.1.0', 'v6.1.1')
 from enhance_units_grid import enhance_source
 source = enhance_source(source, root)
-from enhance_resolution_grid import enhance_resolution
-source = enhance_resolution(source, root)
-source = source.replace('v6.2.0', 'v6.8.1')
+source = source.replace('v6.2.0', 'v6.10.4')
+# The historical DC voltage example included a reading after the target.
+source = re.sub(r'(SAMPLE_DCV_TABLE = """)(.*?)(""")',
+                lambda m: m[1] + '\n'.join(row.rsplit(r'\t', 1)[0] for row in m[2].splitlines()) + m[3],
+                source, count=1, flags=re.S)
 # A new sheet establishes a new original row order. Edits and appends keep it.
 source = re.sub(r'^( +)self\.seq_steps = (?:steps|\[\])\n',
                 lambda match: match[0] + match[1] + 'self._original_row_positions = None\n', source, flags=re.M)

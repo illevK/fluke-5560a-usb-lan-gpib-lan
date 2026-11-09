@@ -212,7 +212,9 @@ class TransportTests(unittest.TestCase):
                 mgr.scan_and_auto_connect('LAN','127.0.0.1',server.port,timeout_sec=1)
                 mgr.disconnect()
                 self.assertFalse(mgr.info.connected)
-                self.assertEqual(server.commands[-5:],['STBY','*OPC?','ERR?','LOCAL','*OPC?'])
+                self.assertEqual(server.commands[-6:],
+                                 ['OPER?', 'ERR?', 'LOCAL', '*OPC?', 'OPER?', 'ERR?'])
+                self.assertNotIn('STBY', server.commands)
 
 
 class AdapterAndVisaTests(unittest.TestCase):
@@ -229,6 +231,16 @@ class AdapterAndVisaTests(unittest.TestCase):
             adapters[0]['state']='Disconnected'
             with self.assertRaises(ConnectionError):
                 f.AutoNetworkAligner.select_source_ip('17','169.254.1.1')
+
+    def test_link_local_auto_prefers_wired_and_keeps_routed_defaults(self):
+        wired = dict(idx='17', state='Up', wired=True,
+                     addresses=[dict(ip='10.0.0.3', prefix=24), dict(ip='169.254.2.3', prefix=16)])
+        wifi = dict(idx='3', state='Up', wired=False, addresses=[dict(ip='169.254.1.2', prefix=16)])
+        with patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[wifi, wired]):
+            self.assertEqual(f.AutoNetworkAligner.select_source_ip('', '169.254.1.1'), '169.254.2.3')
+            wired["addresses"].pop()
+            self.assertEqual(f.AutoNetworkAligner.select_source_ip('', '169.254.1.1'), '10.0.0.3')
+            self.assertEqual(f.AutoNetworkAligner.select_source_ip('', '10.2.3.4'), '')
 
     def test_usb_failure_closes_each_handle_and_reports_error(self):
         rm=Mock()
@@ -260,6 +272,68 @@ class AdapterAndVisaTests(unittest.TestCase):
             inst.close.assert_called_once()
 
 
+class LinkLocalReconnectTests(unittest.TestCase):
+    target = '169.254.1.1'
+    primary = '169.254.1.100'
+    alternate = '10.0.0.3'
+
+    def setUp(self):
+        adapters = [
+            dict(idx='3', name='Wi-Fi', state='Up', wired=False, addresses=[dict(ip='169.254.1.2', prefix=16)]),
+            dict(idx='17', name='Ethernet', state='Up', wired=True, addresses=[
+                dict(ip=self.alternate, prefix=24), dict(ip=self.primary, prefix=16)]),
+        ]
+        inventory = patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=adapters)
+        inventory.start()
+        self.addCleanup(inventory.stop)
+        self.mgr = f.Fluke5560AConnectionManager()
+        self.mgr.record_event = Mock()
+        self.socket = Mock()
+        self.socket.getsockname.return_value = self.alternate, 50001
+        self.socket.recv.return_value = b''
+        self.transport = Mock()
+        self.transport.query.side_effect = lambda command, **_: {
+            '*IDN?': IDN, 'COMM_MODE? TELNET': 'COMP', '*OPC?': '1'
+        }[command]
+
+    def test_alternate_source_and_preferred_source_on_reconnect(self):
+        with patch.object(f.socket, 'create_connection', side_effect=[TimeoutError(), self.socket, self.socket]) as dial, \
+             patch.object(f, 'TelnetLineTransport', return_value=self.transport):
+            self.assertTrue(self.mgr.scan_and_auto_connect('LAN', self.target, adapter_idx='17').connected)
+            self.assertEqual(self.mgr.source_ip, self.alternate)
+            self.mgr.disconnect(standby=False)
+            self.assertTrue(self.mgr.scan_and_auto_connect('LAN', self.target, adapter_idx='17').connected)
+        self.assertEqual([call.kwargs['source_address'][0] for call in dial.call_args_list],
+                         [self.primary, self.alternate, self.alternate])
+        self.mgr.disconnect(standby=False)
+
+    def test_diagnostic_falls_back_without_sending_control_commands(self):
+        with patch.object(f.socket, 'create_connection', side_effect=[ConnectionRefusedError(), self.socket]) as dial, \
+             patch.object(f, 'TelnetLineTransport', return_value=self.transport):
+            report = self.mgr.diagnose_lan(self.target)
+        self.assertEqual([call.kwargs['source_address'][0] for call in dial.call_args_list],
+                         [self.primary, self.alternate])
+        self.assertIn('[진단 성공]', report)
+        self.assertIn(self.primary, report)
+        self.transport.query.assert_called_once_with('*IDN?', identity=True)
+        self.transport.write.assert_not_called()
+        self.socket.close.assert_called_once()
+
+    def test_post_connect_timeout_and_explicit_binding_do_not_retry(self):
+        self.transport.query.side_effect = TimeoutError()
+        with patch.object(f.socket, 'create_connection', return_value=self.socket) as dial, \
+             patch.object(f, 'TelnetLineTransport', return_value=self.transport):
+            with self.assertRaisesRegex(ConnectionError, '장비 식별'):
+                self.mgr.scan_and_auto_connect('LAN', self.target)
+            dial.assert_called_once()
+            self.transport.write.assert_not_called()
+        with patch.object(f.socket, 'create_connection', side_effect=TimeoutError()) as dial:
+            report = self.mgr.diagnose_lan(self.target, source_ip=self.primary)
+        self.assertNotIn('[진단 성공]', report)
+        dial.assert_called_once()
+        self.assertEqual(dial.call_args.kwargs['source_address'], (self.primary, 0))
+
+
 class SlowOutputTests(unittest.TestCase):
     def peer(self, delay=0, missing=False, error='0,"No error"'):
         state = {'output': False, 'error': error}
@@ -286,6 +360,17 @@ class SlowOutputTests(unittest.TestCase):
         mgr.scan_and_auto_connect('LAN','127.0.0.1',server.port,timeout_sec=timeout,
                                   operation_timeout_sec=operation_timeout)
         return mgr
+
+    def test_disconnect_active_output_verifies_standby_before_local(self):
+        with self.peer() as server:
+            mgr = self.connect(server)
+            mgr.send_command('OUT 1 V, 50 HZ; OPER')
+            mgr.disconnect()
+            self.assertFalse(mgr.info.connected)
+            self.assertEqual(server.commands[-10:], [
+                'OPER?', 'STBY', '*OPC?', 'ERR?', 'OPER?', 'ERR?',
+                'LOCAL', '*OPC?', 'OPER?', 'ERR?'
+            ])
 
     def test_reply_after_original_three_second_limit_is_accepted_once(self):
         with self.peer(delay=3.4) as server:

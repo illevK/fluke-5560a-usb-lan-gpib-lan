@@ -62,9 +62,22 @@ class AutoNetworkAligner:
 
     @classmethod
     def select_source_ip(cls, adapter_idx: str, target_ip: str) -> str:
-        if not adapter_idx:
-            return ""
         target = ipaddress.IPv4Address(cls.normalize_ipv4(target_ip))
+        if not adapter_idx:
+            if not target.is_link_local:
+                return ""
+            # Link-local instrument traffic belongs on the attached cable.
+            wired = [adapter for adapter in cls.list_ethernet_interfaces()
+                     if adapter.get("wired") and adapter["state"] == "Up" and adapter.get("addresses")]
+            for adapter in wired:
+                for item in adapter["addresses"]:
+                    network = ipaddress.IPv4Interface(f"{item['ip']}/{item['prefix']}").network
+                    if target in network and str(target) != item["ip"] and target not in (
+                            network.network_address, network.broadcast_address):
+                        return item["ip"]
+            if len(wired) == 1:
+                return wired[0]["addresses"][0]["ip"]
+            return ""
         for adapter in cls.list_ethernet_interfaces(refresh=True):
             if adapter["idx"] != str(adapter_idx):
                 continue
@@ -82,6 +95,23 @@ class AutoNetworkAligner:
             # Routed networks are legitimate. Report the mismatch, but do not force /24.
             return addresses[0]["ip"]
         raise ConnectionError("선택한 실제 랜카드를 찾을 수 없습니다. 랜카드 새로고침을 눌러주세요.")
+
+    @classmethod
+    def link_local_source_ips(cls, source_ip, target_ip, adapter_idx):
+        """Offer alternate addresses only on the adapter selected for link-local LAN."""
+        if not source_ip or not ipaddress.IPv4Address(target_ip).is_link_local:
+            return (source_ip,)
+        for adapter in cls.list_ethernet_interfaces():
+            if adapter["state"] != "Up":
+                continue
+            if adapter_idx and adapter["idx"] != str(adapter_idx):
+                continue
+            if not adapter_idx and not adapter.get("wired"):
+                continue
+            ips = [item["ip"] for item in adapter.get("addresses", ())]
+            if source_ip in ips:
+                return (source_ip, *(ip for ip in ips if ip not in (source_ip, target_ip)))
+        return (source_ip,)
 
     @classmethod
     def describe(cls, target_ip="", source_ip=""):
@@ -249,6 +279,8 @@ class Fluke5560AConnectionManager:
         self._sim_last_out = "0 V, 0 HZ"
         self.last_error = ""
         self.source_ip = ""
+        self._last_lan_source = None
+        self._lan_tcp_failures = []
         self.last_diagnostic = ""
         self.operation_timeout = 60.0
         self.cancel_event = threading.Event()
@@ -324,6 +356,35 @@ class Fluke5560AConnectionManager:
             raise ValueError("포트는 1~65535 사이여야 합니다.")
         return port
 
+    def _lan_source_ips(self, ip, port, source_ip, adapter_idx):
+        if source_ip and not adapter_idx:
+            return (AutoNetworkAligner.normalize_ipv4(source_ip),)
+        primary = AutoNetworkAligner.select_source_ip(adapter_idx, ip)
+        candidates = list(AutoNetworkAligner.link_local_source_ips(primary, ip, adapter_idx))
+        previous = self._last_lan_source
+        if previous and previous[:2] == (ip, port) and previous[2] in candidates:
+            candidates.remove(previous[2])
+            candidates.insert(0, previous[2])
+        return tuple(candidates[:3])
+
+    def _open_lan_socket(self, ip, port, timeout, source_ips):
+        self._lan_tcp_failures = []
+        for index, source_ip in enumerate(source_ips):
+            self.source_ip = source_ip
+            if source_ip == ip:
+                raise ValueError("5560A IP와 PC IP가 같습니다. 장비 화면의 IP를 확인하세요.")
+            try:
+                sock = socket.create_connection((ip, port), timeout,
+                                                source_address=(source_ip, 0) if source_ip else None)
+            except (TimeoutError, ConnectionRefusedError) as exc:
+                self._lan_tcp_failures.append(f"PC {source_ip or '자동 경로'} · {type(exc).__name__}: {exc}")
+                if index + 1 == len(source_ips):
+                    raise
+                self.record_event(f"[LAN 재시도] {self._lan_tcp_failures[-1]} → PC {source_ips[index + 1]}", notify=True)
+            else:
+                self.source_ip = sock.getsockname()[0]
+                return sock
+
     def scan_and_auto_connect(self, preferred_mode="AUTO", lan_ip="", lan_port=3490,
                               gpib_addr=1, timeout_sec=3.0, allow_raw_socket_fallback=False,
                               source_ip="", eol="CRLF", visa_resource="", adapter_idx="",
@@ -361,12 +422,8 @@ class Fluke5560AConnectionManager:
         if "LAN" in profile.interfaces and mode in ("AUTO", "LAN", "LAN (SOCKET)", "LAN (VISA)") and lan_ip.strip():
             ip = AutoNetworkAligner.normalize_ipv4(lan_ip)
             port = self._validate_port(lan_port)
-            if adapter_idx:
-                source_ip = AutoNetworkAligner.select_source_ip(adapter_idx, ip)
-            elif source_ip:
-                source_ip = AutoNetworkAligner.normalize_ipv4(source_ip)
-            self.source_ip = source_ip
-            result = self._try_lan_socket(ip, port, timeout_sec, source_ip=source_ip, eol=eol)
+            source_ips = self._lan_source_ips(ip, port, source_ip, adapter_idx)
+            result = self._try_lan_socket(ip, port, timeout_sec, eol=eol, source_ips=source_ips)
             if result.connected:
                 return result
             errors.append(self.last_error)
@@ -388,18 +445,15 @@ class Fluke5560AConnectionManager:
         raise ConnectionError(self.last_error or "연결할 인터페이스와 장비 IP/리소스를 지정하세요.")
 
     def _try_lan_socket(self, ip, port=3490, timeout_sec=3.0, allow_open_port_fallback=False,
-                        source_ip="", eol="CRLF"):
+                        source_ip="", eol="CRLF", *, source_ips=None):
         sock = None
+        self._lan_tcp_failures = []
         stage = "TCP 연결"
         try:
             ip = AutoNetworkAligner.normalize_ipv4(ip)
             port = self._validate_port(port)
-            if source_ip and source_ip == ip:
-                raise ValueError("5560A IP와 PC IP가 같습니다. 장비 화면의 IP를 확인하세요.")
-            sock = socket.create_connection((ip, port), timeout_sec,
-                                             source_address=(source_ip, 0) if source_ip else None)
+            sock = self._open_lan_socket(ip, port, timeout_sec, source_ips or (source_ip,))
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.source_ip = sock.getsockname()[0]
             transport = TelnetLineTransport(sock, timeout_sec, eol)
             stage = "장비 식별 (*IDN?)"
             idn = transport.query("*IDN?", identity=True)
@@ -409,10 +463,13 @@ class Fluke5560AConnectionManager:
             self._prepare_remote_stream(transport, "LAN")
             self._lan_sock, self._transport = sock, transport
             self.info = ConnectionInfo(True, "LAN (Ethernet Socket)", f"TCPIP::{ip}::{port}::SOCKET", idn, ip, port)
+            self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = ""
             return self.info
         except Exception as exc:
             self.last_error = f"[{stage}] {ip}:{port} / PC {self.source_ip or source_ip or '자동 경로'}\n{type(exc).__name__}: {exc}"
+            if len(self._lan_tcp_failures) > 1:
+                self.last_error += "\n시도한 PC 주소:\n" + "\n".join(self._lan_tcp_failures)
             if sock is not None:
                 close_lan_socket(sock)
             self._lan_sock = self._transport = None
@@ -546,24 +603,24 @@ class Fluke5560AConnectionManager:
             raise ValueError("통신 제한 시간은 0.2~60초 사이여야 합니다.")
         ip = AutoNetworkAligner.normalize_ipv4(ip)
         port = self._validate_port(port)
-        self.source_ip = AutoNetworkAligner.select_source_ip(adapter_idx, ip) if adapter_idx else (
-            AutoNetworkAligner.normalize_ipv4(source_ip) if source_ip else "")
+        source_ips = self._lan_source_ips(ip, port, source_ip, adapter_idx)
         stage = "TCP 연결"
         sock = None
         try:
-            sock = socket.create_connection((ip, port), timeout,
-                    source_address=(self.source_ip, 0) if self.source_ip else None)
-            self.source_ip = sock.getsockname()[0]
+            sock = self._open_lan_socket(ip, port, timeout, source_ips)
             stage = "TCP 성공, *IDN? 확인"
             idn = TelnetLineTransport(sock, timeout, eol).query("*IDN?", identity=True)
             if not self._validate_idn(idn):
                 raise InstrumentProtocolError(f"다른 장비 응답: {idn}")
+            self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = f"[진단 성공] TCP 및 {self.expected_model} 식별 확인: {idn}"
         except Exception as exc:
             self.last_error = f"[{stage}] {type(exc).__name__}: {exc}"
         finally:
             if sock is not None:
                 close_lan_socket(sock)
+        if self._lan_tcp_failures:
+            self.last_error += "\n앞선 TCP 연결 실패:\n" + "\n".join(self._lan_tcp_failures)
         self.last_diagnostic = self.build_lan_diagnostic_report(ip, port)
         return self.last_diagnostic
 
@@ -645,7 +702,16 @@ class Fluke5560AConnectionManager:
                 self._fail_control_session(f"조회 {command}", exc)
                 raise
 
-    def send_command(self, cmd):
+    def _stop_after_command_error(self, error, phase):
+        # A valid error reply means the stream is still synchronized.
+        self._write("STBY")
+        if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
+            raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
+        raise InstrumentCommandError(
+            f"{self.profile.model} 오류 ({phase}): {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
+        )
+
+    def send_command(self, cmd, *, check_before=False):
         command = self._validate_command(cmd)
         with self._lock:
             if not self.info.connected:
@@ -668,17 +734,16 @@ class Fluke5560AConnectionManager:
             try:
                 if self.cancel_event.is_set():
                     raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
+                if check_before:
+                    pending = self._query("ERR?")
+                    if not re.match(r"^\+?0\s*(?:,|$)", pending):
+                        self._stop_after_command_error(pending, "출력 전 대기 중이던 오류")
                 self._write(command)
                 if self._query("*OPC?", timeout=self.operation_timeout) != "1":
                     raise InstrumentProtocolError("명령 처리 완료를 확인하지 못했습니다.")
                 error = self._query("ERR?")
                 if not re.match(r"^\+?0\s*(?:,|$)", error):
-                    # A valid error reply means the stream is still synchronized.
-                    # Stop output and verify it, but retain a healthy connection.
-                    self._write("STBY")
-                    if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
-                        raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
-                    raise InstrumentCommandError(f"{self.profile.model} 오류: {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다.")
+                    self._stop_after_command_error(error, command)
                 self.record_event(f"[명령 완료] {command} | {time.monotonic() - started:.3f}s", notify=True)
             except InstrumentCommandError as exc:
                 self.last_error = str(exc)
@@ -689,16 +754,32 @@ class Fluke5560AConnectionManager:
                 self._fail_control_session(context, exc)
                 raise
 
+    def _record_shutdown_error(self, phase):
+        error = self.query("ERR?")
+        self.record_event(f"[연결 해제 · {phase}] {error}",
+                          notify=not re.match(r"^\+?0\s*(?:,|$)", error))
+
     def disconnect(self, standby=True):
         with self._lock:
             try:
                 self.cancel_event.clear()
                 if self.info.connected and standby:
-                    self.send_command("STBY")
+                    checked_shutdown = self.profile.model == "5560A" and self._lan_sock is not None
+                    if not checked_shutdown or self.query("OPER?") != "0":
+                        self.send_command("STBY")
+                        if checked_shutdown and self.query("OPER?") != "0":
+                            raise InstrumentProtocolError("연결 해제 전 STBY를 확인하지 못했습니다.")
+                    if checked_shutdown:
+                        self.record_event("[연결 해제] STBY 확인")
+                        self._record_shutdown_error("LOCAL 전")
                     if self._transport is not None:
-                        self._transport.write("LOCAL")
-                        if self._transport.query("*OPC?") != "1":
+                        self._write("LOCAL")
+                        if self._query("*OPC?", timeout=self.operation_timeout) != "1":
                             raise InstrumentProtocolError("LOCAL 완료 응답을 확인하지 못했습니다.")
+                        if checked_shutdown:
+                            if self.query("OPER?") != "0":
+                                raise InstrumentProtocolError("LOCAL 이후 STBY를 확인하지 못했습니다.")
+                            self._record_shutdown_error("LOCAL 후")
                     elif self._visa_inst is not None:
                         try:
                             self._visa_inst.control_ren(pyvisa.constants.RENLineOperation.deassert_gtl)

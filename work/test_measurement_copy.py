@@ -26,7 +26,7 @@ class MeasurementCopyTests(unittest.TestCase):
         with patch.object(self.grid, 'clipboard_clear') as clear, patch.object(self.grid, 'clipboard_append') as copy:
             self.assertEqual(self.grid._copy_measurements(2), 'break')
             clear.assert_called_once()
-            copy.assert_called_once_with('1.00020 mV\r\n0.4999 LEAD\r\n')
+            copy.assert_called_once_with('0.00100020 V\r\n0.4999 LEAD\r\n')
         self.assertEqual([s.scpi_cmd for s in self.app.seq_steps], commands)
         self.app.conn_mgr.send_command.assert_not_called()
 
@@ -35,9 +35,9 @@ class MeasurementCopyTests(unittest.TestCase):
         self.enter(1, '')
         self.enter(2, '')
         self.grid._set_measurement_selection(2, 0)
-        self.assertEqual(self.grid.measurement_selection_text(), '0.00100\r\n\r\n\r\n')
+        self.assertEqual(self.grid.measurement_selection_text(), '0.00100 V\r\n\r\n\r\n')
         self.enter(2, '3.0')
-        self.assertEqual(self.grid.measurement_selection_text(), '0.00100\r\n\r\n3.0\r\n')
+        self.assertEqual(self.grid.measurement_selection_text(), '0.00100 V\r\n\r\n3.0 V\r\n')
 
     def test_single_cell_text_selection_and_normal_cursor_are_preserved(self):
         entry = self.enter(0, '1.234 V')
@@ -91,7 +91,7 @@ class MeasurementCopyTests(unittest.TestCase):
         self.grid.set_measurement_visibility(False)
         self.assertIsNone(self.grid._measurement_bounds())
         self.grid.set_measurement_visibility(True)
-        self.assertEqual(self.app.seq_steps[1].measured_raw, '1.999')
+        self.assertEqual(self.app.seq_steps[1].measured_raw, '1.999 V')
         self.grid._set_measurement_selection(1, 2)
         self.app.seq_steps = self.app.seq_steps[:1]
         self.grid.render_steps(self.app.seq_steps)

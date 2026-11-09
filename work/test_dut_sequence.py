@@ -57,16 +57,89 @@ class LinkedDutTests(unittest.TestCase):
         self.app.seq_steps = steps
         self.app.excel_grid.render_steps(steps)
 
-    def sample(self, channel, **quantities):
+    def sample(self, channel, *, raw_values=None, **quantities):
         values = {key: 0.0 for key, _, _ in f.DUT_METRICS}
         values.update(quantities)
         return f.DUTSample(self.app.dut_session.identity, channel, datetime.datetime.now().isoformat(),
-                           values, "")
+                           values, "", raw_values=raw_values)
+
+    def acv_peer(self, pending='0,"No error"', setting_error='0,"No error"'):
+        error, operating = pending, False
+
+        def reply(conn, command):
+            nonlocal error, operating
+            if command.startswith("OUT "):
+                error = setting_error
+            elif command == "OPER":
+                operating = True
+            elif command == "STBY":
+                operating = False
+            response = {"*IDN?": local.IDN, "COMM_MODE? TELNET": "COMP", "*OPC?": "1",
+                        "OPER?": "1" if operating else "0"}.get(command)
+            if command == "ERR?":
+                response, error = error, '0,"No error"'
+            if response is not None:
+                conn.sendall((response + "\r\n").encode())
+
+        return local.FakeInstrument(handler=reply)
+
+    def test_acv_waits_for_setpoint_ack_then_records_fresh_rms(self):
+        self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("50 Hz\t1 V"))
+        with self.acv_peer() as peer:
+            self.connect(peer)
+            self.app.dut_session.read = lambda channel, **kwargs: self.sample(
+                channel, voltage=.9998, raw_values={"voltage": "0.999800E+00"})
+            self.app._start_filtered_sequence(0, 0)
+            self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy)
+            self.assertEqual(self.app.seq_steps[0].measured_raw, "0.999800E+00 V")
+            index = peer.commands.index("OUT 1 V, 50 HZ")
+            self.assertEqual(peer.commands[index - 1:index + 6],
+                             ["ERR?", "OUT 1 V, 50 HZ", "*OPC?", "ERR?", "OPER", "*OPC?", "ERR?"])
+
+    def test_appended_batches_run_in_order_within_active_current_group(self):
+        batches = (('50 Hz\t1 mV', True), ('1 A\n5 A', False),
+                   ('120 V / 1 A', False), ('60 Hz\t120 V\t1 A\t0.5', False))
+        for text, first in batches:
+            with patch.object(self.app, 'clipboard_get', return_value=text):
+                self.app._on_paste_into_sheet_button(replace_all=first, append=not first)
+        with local.SlowOutputTests().peer() as peer:
+            self.connect(peer)
+            self.app.dut_session.read = lambda channel, **_: self.sample(
+                channel, voltage=.0009998, dc_current=.999, power=119.9, pf=.4999,
+                raw_values={"voltage": "0.0009998"})
+            self.app.var_seq_start_row.set('3')
+            self.app._on_seq_start_from_selected_or_range(all_rows=True)
+            self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy)
+            self.assertEqual([row.measured_raw for row in self.app.seq_steps],
+                             ['0.0009998 V', '0.999 A', '', '119.9 W', '0.4999'])
+            self.assertEqual(self.app.excel_grid._row_widgets[0]["measurement_var"].get(), "0.9998 mV")
+            self.assertEqual([cmd for cmd in peer.commands if cmd.startswith('OUT ')], [
+                'OUT 0.001 V, 50 HZ', 'OUT 1 A, 0 HZ; OPER',
+                'OUT 120 V, 1 A, 0 HZ; OPER', 'OUT 120 V, 1 A, 60 HZ; DPF 0.5, LAG; OPER',
+            ])
+            self.assertFalse(self.app.is_operating)
+
+    def test_acv_pending_error_and_setpoint_error_both_stop_before_oper(self):
+        for pending, setting_error, expected in (
+            ('4100,"Compliance voltage exceeded"', '0,"No error"', "출력 전 대기 중이던 오류"),
+            ('0,"No error"', '-102,"Syntax error"', "OUT 1 V, 50 HZ"),
+        ):
+            with self.subTest(expected=expected), self.acv_peer(pending, setting_error) as peer:
+                self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("50 Hz\t1 V"))
+                self.connect(peer)
+                with patch.object(self.app.dut_session, "read") as read:
+                    self.app._start_filtered_sequence(0, 0)
+                    self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy)
+                    read.assert_not_called()
+                self.assertIn(expected, self.app.var_active_row_banner.get())
+                self.assertIn("STBY", peer.commands)
+                self.assertNotIn("OPER", peer.commands)
+                self.assertEqual("OUT 1 V, 50 HZ" in peer.commands, pending.startswith("0,"))
+                self.app.conn_mgr.disconnect(standby=False)
 
     def test_auto_capture_after_dwell_and_excludes_other_current_group(self):
         rows = [
-            f.SequenceStep(1, "120 V / 1 A", "DC", "-", "120 W", "DCP", "OUT 120 V, 1 A, 0 HZ", "120 W",
-                           resolution_raw="0.0001 kW"),
+            f.SequenceStep(1, "120 V / 1 A", "DC", "-", "0.12 kW", "DCP", "OUT 120 V, 1 A, 0 HZ", "120 W"),
             f.SequenceStep(2, "120 V / 5 A", "DC", "-", "600 W", "DCP", "OUT 120 V, 5 A, 0 HZ", "600 W"),
             f.SequenceStep(3, "-", "DC", "-", "-5 V", "DCV", "OUT -5 V, 0 HZ", "-5 V"),
         ]
@@ -75,15 +148,16 @@ class LinkedDutTests(unittest.TestCase):
             self.connect(peer)
             def read(channel, *, include_dc, fresh):
                 self.read_calls.append((channel, include_dc, fresh, list(peer.commands), time.monotonic()))
-                return self.sample(channel, power=1234.56, voltage=5.0, dc_voltage=-4.99)
+                return self.sample(channel, power=1234.56, voltage=5.0, dc_voltage=-4.99,
+                                   raw_values={"power": "+1.234560000000000000E+03"})
             self.app.dut_session.read = read
             start = time.monotonic()
             self.app._start_filtered_sequence(0, 2)
             self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy)
-            self.assertEqual([row.measured_raw for row in rows], ["1234.56 W", "", "-4.99 V"])
-            self.assertEqual(self.app.excel_grid._measurement_display(0), "1.2346 kW")
+            self.assertEqual([row.measured_raw for row in rows], ["+1.234560000000000000E+03 W", "", "-4.99 V"])
+            self.assertEqual(self.app.excel_grid._row_widgets[0]["measurement_var"].get(), "1.234560000000000000 kW")
             self.app.excel_grid._set_measurement_selection(0, 0)
-            self.assertEqual(self.app.excel_grid.measurement_selection_text(), "1.2346 kW\r\n")
+            self.assertEqual(self.app.excel_grid.measurement_selection_text(), "1.234560000000000000 kW\r\n")
             self.assertEqual([call[:3] for call in self.read_calls], [(1, True, True), (1, True, True)])
             self.assertGreaterEqual(self.read_calls[0][-1] - start, .2)
             self.assertEqual(self.read_calls[0][-2][-1], "OPER?")
@@ -93,7 +167,7 @@ class LinkedDutTests(unittest.TestCase):
 
     def test_selected_row_links_and_records_pf_without_a_unit(self):
         row = f.SequenceStep(1, "120 V / 1 A", "60 Hz", "LEAD", "0.5 LEAD", "PF",
-                             "OUT 120 V, 1 A, 60 HZ", "0.5", resolution_raw="0.001")
+                             "OUT 120 V, 1 A, 60 HZ", "0.5")
         self.set_rows([row])
         self.app.excel_grid.selected_row_idx = 0
         with local.SlowOutputTests().peer() as peer:
@@ -102,7 +176,7 @@ class LinkedDutTests(unittest.TestCase):
             self.app._on_seq_output_selected()
             self.pump_until(lambda: row.status == "✓ 완료 · DUT")
             self.assertEqual(row.measured_raw, "0.49851")
-            self.assertEqual(self.app.excel_grid._measurement_display(0), "0.499")
+            self.assertEqual(self.app.excel_grid._row_widgets[0]["measurement_var"].get(), "0.49851")
 
     def test_invalid_sample_stops_run_and_keeps_previous_cell(self):
         rows = [

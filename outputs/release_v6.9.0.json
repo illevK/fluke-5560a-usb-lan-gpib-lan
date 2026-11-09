@@ -1,14 +1,13 @@
 {
   "version": "v6.9.0",
-  "released_at": "2026-11-09T13:06:03",
   "exe_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "04DBEBDB19D070F2FD156912F1FB780304DAD2D43A1F9074FD84763C7A31296C",
+  "source_sha256": "14E9A37D360D205E7CADA2806BF88D08E7A5282820B62C5540C21AE62E1ADACF",
   "desktop_copied": [
     "C:\\Users\\HCT-2714\\Desktop\\Fluke 교정기.exe"
   ],
-  "highlights": [
-    "WT310E :STATUS:FILTER1? 'NEV' 축약형 응답 정규화 및 시작 시 연결 끊김 방지",
-    "DUT 연결 직후 공통 디폴트 설정 자동 적용 (Urate=250MS/FAST, Mode=RMS, Sync=Voltage, V/I Range=AUTO, Hold=OFF)",
-    "WT310/332/333 WT300 호환 명령 모드(U, I) 자동 폴백 및 :HOLD OFF 지원",
-    "Fluke 5560A LAN 유선 랜카드(17번 이더넷) 우선 바인딩 및 보조 IP(169.254.1.100, 192.168.100.100) 복구"
-  ]
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\AppData\\Local\\Temp\\Fluke-controller-desktop-before-6.9.0.exe",
+  "focused_tests_passed": 40,
+  "verified_hardware_filter_reply": "WT310E: NEV observed before changes",
+  "new_hardware_capture_verified": false
 }

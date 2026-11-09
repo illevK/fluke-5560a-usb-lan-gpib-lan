@@ -1,0 +1,13 @@
+{
+  "version": "v6.10.2",
+  "exe_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "82B3D8A573E51C27E9A3C0417E29B45EC76CAA28F443D121AA1D22D2D2816300",
+  "source_sha256": "C0A3B6B500BB3F15793288EF30CEF1F5AA23CCCDBA540C469CE29637C9B305A4",
+  "desktop_copied": [
+    "C:\\Users\\HCT-2714\\Desktop\\Fluke 교정기.exe"
+  ],
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\AppData\\Local\\Temp\\Fluke-before-v6.10.2-20261109160931052.exe",
+  "focused_tests_passed": 9,
+  "packaged_code_checks_passed": 4,
+  "verified_hardware": "5560A real LAN: clean error queue and 1 V / 50 Hz setpoint accepted in STBY. WT310E real USB: 100 ms, RMS, voltage sync, V/I autorange and U/I/P/PF display order confirmed. Real WT RMS value recorded into ACV grid with a local mock calibrator."
+}

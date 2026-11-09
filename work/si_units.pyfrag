@@ -66,4 +66,43 @@ class SIUnits:
             raise ValueError(f"수치 또는 단위가 붙은 값을 입력하세요: {text}")
         return cls.number(cleaned)
 
+    @classmethod
+    def with_nominal_unit(cls, measured, nominal):
+        """Keep the unit of a number typed without a suffix at the time of entry."""
+        target = cls.VALUE.fullmatch(nominal.replace("−", "-"))
+        if target and re.fullmatch(cls.NUMBER, cls.clean(measured).strip()):
+            try:
+                cls.normalize(target[2])
+            except ValueError:
+                return measured
+            return f"{measured.strip()} {target[2]}"
+        return measured
+
+    @classmethod
+    def format_measurement(cls, measured, nominal):
+        target = cls.VALUE.fullmatch(nominal.replace("−", "-"))
+        if not target or not measured.strip():
+            return measured
+        source = cls.VALUE.fullmatch(cls.clean(cls.with_nominal_unit(measured, nominal)))
+        if not source:
+            return measured
+        try:
+            target_base, target_scale = cls.split(target[2])
+            source_base, source_scale = cls.split(source[2])
+            if source_base != target_base:
+                return measured
+            if source_scale == target_scale and "e" not in source[1].lower():
+                return f"{source[1]} {target[2]}"
+            value = Decimal(source[1].replace(",", ""))
+            # All SI prefixes here are powers of ten. Shift the decimal exponent
+            # directly to avoid rounding the meter's original digit sequence.
+            shift = Decimal(str(source_scale)).adjusted() - Decimal(str(target_scale)).adjusted()
+            sign, digits, exponent = value.as_tuple()
+            value = Decimal((sign, digits, exponent + shift))
+            notation = "f" if -12 <= value.adjusted() <= 15 else "E"
+            display = format(value, notation)
+            return f"{display} {target[2]}"
+        except (ValueError, DecimalException):
+            return measured
+
 

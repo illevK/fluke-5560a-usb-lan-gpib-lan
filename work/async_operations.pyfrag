@@ -1,4 +1,4 @@
-        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True):
+        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True, *, verify_setpoint=False):
             if not self._ensure_connected_or_sim():
                 return False
             self.conn_mgr.operation_timeout = self._get_operation_timeout()
@@ -8,7 +8,12 @@
             self.is_operating = None
             self._refresh_oper_badge()
             def operation():
-                self.conn_mgr.send_command(full_cmd)
+                if verify_setpoint:
+                    self.conn_mgr.send_command(cmd, check_before=True)
+                    if auto_oper:
+                        self.conn_mgr.send_command("OPER")
+                else:
+                    self.conn_mgr.send_command(full_cmd)
                 state = self.conn_mgr.query("OPER?").strip()
                 if state not in ("0", "1"):
                     self.conn_mgr.disconnect(standby=False)

@@ -247,8 +247,8 @@
             self._on_seq_stop_auto(silent=True)
             try:
                 self.conn_mgr.disconnect()
-            except Exception:
-                pass
+            except Exception as exc:
+                self.conn_mgr.record_event(f"[종료 확인 오류] {exc}")
             self.after_cancel(self._poll_after_id)
             self.destroy()
 

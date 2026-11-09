@@ -67,7 +67,6 @@ class CurrentGroupOrderTests(unittest.TestCase):
         self.load_current_example()
         self.app._reorder_current_group_rows()
         self.app._handle_excel_paste_at_cell('0.9999 A\n1.9999 A\n0.4999 A\n2.9999 A', 0, self.grid.MEASUREMENT_COLUMN)
-        self.app._handle_excel_paste_at_cell('0.01 A\n0.001 A\n0.001 A\n0.0001 A', 0, self.grid.RESOLUTION_COLUMN)
         self.app.seq_steps[3].breakpoint = True
         self.app._handle_excel_cell_edited(2, '-', 'DC', '-', '4 A')
         self.app.var_model.set('5522A')
@@ -78,10 +77,9 @@ class CurrentGroupOrderTests(unittest.TestCase):
         self.assertEqual(self.nominal_values(), ['1 A', '2 A', '3 A', '4 A', '1.0 V'])
         self.assertEqual([step.step_no for step in self.app.seq_steps], [1, 2, 3, 4, 5])
         self.assertEqual([step.measured_raw for step in self.app.seq_steps], ['0.9999 A', '1.9999 A', '2.9999 A', '0.4999 A', ''])
-        self.assertEqual([step.resolution_raw for step in self.app.seq_steps], ['0.01 A', '0.001 A', '0.0001 A', '0.001 A', ''])
         self.assertEqual([step.breakpoint for step in self.app.seq_steps], [False, False, True, False, False])
         self.assertEqual(self.grid._row_widgets[2]['measurement_var'].get(), '2.9999 A')
-        self.assertEqual(self.grid._row_widgets[3]['measurement_var'].get(), '0.500 A')
+        self.assertEqual(self.grid._row_widgets[3]['measurement_var'].get(), '0.4999 A')
 
     def test_sort_and_restore_are_blocked_during_execution_and_pending_io(self):
         self.load_current_example()

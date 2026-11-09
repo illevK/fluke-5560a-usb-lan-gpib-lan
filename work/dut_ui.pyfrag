@@ -279,10 +279,16 @@
                 result, error = None, None
                 try:
                     if operation == "connect":
-                        result = self.dut_session.connect(settings)
-                        if selected is not None and result != selected.identity:
+                        identity = self.dut_session.connect(settings)
+                        if selected is not None and identity != selected.identity:
                             self.dut_session.disconnect()
                             raise ConnectionError("검색 때 확인한 장비와 다릅니다. 다시 자동 검색하세요.")
+                        try:
+                            defaults = self.dut_session.apply_measurement_defaults()
+                        except Exception as exc:
+                            self.dut_session.disconnect()
+                            raise ConnectionError(f"DUT 기본 설정 적용 중 오류: {exc}") from exc
+                        result = identity, defaults
                     elif operation == "discover":
                         result = discover_duts(self.dut_session.cancel, excluded_resource=info.resource_name,
                                                excluded_ip=excluded_ip)
@@ -390,12 +396,17 @@
                     self.var_dut_status.set(f"DUT 오류: {error}")
                     self._log(f"[DUT {operation}] {error}")
                 elif operation == "connect":
-                    self.var_dut_identity.set(result)
+                    identity, defaults = result
+                    self.var_dut_identity.set(identity)
                     self.var_dut_status.set("DUT 연결됨 · 측정표에서 DUT 자동 기록을 사용할 수 있습니다." if not self.dut_session.simulated
                                             else "가상 DUT 연결됨 · 화면에서 예제 값을 조회할 수 있습니다.")
-                    self.combo_dut_channel.configure(values=tuple(range(1, self.dut_session.profile.channels + 1)))
-                    self.var_dut_channel.set("1")
-                    self._log(f"[DUT 연결] {result}")
+                    channels = self.dut_session.input_channels or tuple(range(1, self.dut_session.profile.channels + 1))
+                    self.combo_dut_channel.configure(values=channels)
+                    self.var_dut_channel.set(str(channels[0]))
+                    self._log(f"[DUT 연결] {identity}")
+                    if defaults:
+                        self.var_dut_note.set(f"연결 시 기본값 적용 · {defaults}")
+                        self._log(f"[DUT 기본 설정] {defaults}")
                 elif operation == "read":
                     self._dut_show_sample(result)
                 elif operation == "discover":
