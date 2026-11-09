@@ -1,0 +1,42 @@
+PYSERIAL_IMPORT_ERROR = ""
+try:
+    import serial
+    import serial.tools.list_ports
+    HAS_PYSERIAL = True
+except ImportError as exc:
+    serial = None
+    HAS_PYSERIAL = False
+    PYSERIAL_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+class SerialEndpoint:
+    """Adapt pyserial to the cancellable line reader; an empty read is a timeout."""
+    def __init__(self, port):
+        self.port = port
+
+    def settimeout(self, timeout):
+        self.port.timeout = timeout
+        self.port.write_timeout = timeout
+
+    def recv(self, size):
+        if not self.port.is_open:
+            raise ConnectionError("COM 포트가 닫혔습니다. USB–RS-232 연결을 확인하세요.")
+        data = self.port.read(min(size, max(1, self.port.in_waiting)))
+        if not data:
+            raise socket.timeout()
+        return data
+
+    def sendall(self, data):
+        sent = self.port.write(data)
+        if sent != len(data):
+            raise TimeoutError("RS-232 명령 일부만 전송되었습니다. 재전송하지 않고 연결을 종료합니다.")
+
+
+class SerialLineTransport(TelnetLineTransport):
+    def _feed(self, raw):
+        # RS-232 is not Telnet. Never send IAC negotiation bytes to a serial port.
+        self.buffer.extend(raw)
+        if len(self.buffer) > 65536:
+            raise InstrumentProtocolError("RS-232 응답이 64 KiB를 초과했습니다.")
+
+

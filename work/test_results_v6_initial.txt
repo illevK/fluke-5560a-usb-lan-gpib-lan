@@ -1,0 +1,115 @@
+test_gpib_honors_address_and_never_sends_serial_remote (test_communications.AdapterAndVisaTests.test_gpib_honors_address_and_never_sends_serial_remote) ... ok
+test_padded_ip_and_invalid_addresses (test_communications.AdapterAndVisaTests.test_padded_ip_and_invalid_addresses) ... ok
+test_source_binding_uses_real_mask_and_rejects_down_adapter (test_communications.AdapterAndVisaTests.test_source_binding_uses_real_mask_and_rejects_down_adapter) ... ok
+test_usb_failure_closes_each_handle_and_reports_error (test_communications.AdapterAndVisaTests.test_usb_failure_closes_each_handle_and_reports_error) ... ok
+test_abort_interrupts_lan_wait_and_sends_standby (test_communications.SlowOutputTests.test_abort_interrupts_lan_wait_and_sends_standby) ... FAIL
+test_final_timeout_attempts_standby_before_closing_without_replay (test_communications.SlowOutputTests.test_final_timeout_attempts_standby_before_closing_without_replay) ... ok
+test_opc_timeout_does_not_extend_ordinary_query_timeout (test_communications.SlowOutputTests.test_opc_timeout_does_not_extend_ordinary_query_timeout) ... ERROR
+test_reply_after_original_three_second_limit_is_accepted_once (test_communications.SlowOutputTests.test_reply_after_original_three_second_limit_is_accepted_once) ... ok
+test_reported_device_error_retains_confirmed_standby_connection (test_communications.SlowOutputTests.test_reported_device_error_retains_confirmed_standby_connection) ... ERROR
+test_visa_uses_operation_timeout_and_restores_read_timeout (test_communications.SlowOutputTests.test_visa_uses_operation_timeout_and_restores_read_timeout) ... ERROR
+test_command_ack_and_error_queue (test_communications.TransportTests.test_command_ack_and_error_queue) ... ok
+test_connect_fragmented_identity_then_repeated_queries (test_communications.TransportTests.test_connect_fragmented_identity_then_repeated_queries) ... ok
+test_cr_lf_and_crlf_replies (test_communications.TransportTests.test_cr_lf_and_crlf_replies) ... ok
+test_echo_prompt_and_delayed_line_termination (test_communications.TransportTests.test_echo_prompt_and_delayed_line_termination) ... ok
+test_eof_and_partial_response_never_report_success (test_communications.TransportTests.test_eof_and_partial_response_never_report_success) ... ok
+test_graceful_disconnect_and_reconnect (test_communications.TransportTests.test_graceful_disconnect_and_reconnect) ... ok
+test_incremental_telnet_negotiation_and_subnegotiation (test_communications.TransportTests.test_incremental_telnet_negotiation_and_subnegotiation) ... ok
+test_open_port_without_response_is_not_connected (test_communications.TransportTests.test_open_port_without_response_is_not_connected) ... ok
+test_parallel_queries_remain_serialized (test_communications.TransportTests.test_parallel_queries_remain_serialized) ... ok
+test_readonly_diagnosis_sends_only_identity (test_communications.TransportTests.test_readonly_diagnosis_sends_only_identity) ... ok
+test_terminal_mode_changes_only_after_verified_identity (test_communications.TransportTests.test_terminal_mode_changes_only_after_verified_identity) ... ok
+test_timeout_drops_session_to_prevent_stale_response (test_communications.TransportTests.test_timeout_drops_session_to_prevent_stale_response) ... ok
+test_wrong_fluke_model_cannot_connect_or_receive_control (test_communications.TransportTests.test_wrong_fluke_model_cannot_connect_or_receive_control) ... ok
+test_empty_range_does_not_send_commands (test_current_groups.GroupGuiTests.test_empty_range_does_not_send_commands) ... C:\Users\HCT-2714\AppData\Local\Programs\Python\Python314\Lib\tkinter\__init__.py:1712: ResourceWarning: unclosed <socket.socket fd=720, family=2, type=1, proto=0, laddr=('127.0.0.1', 58428), raddr=('127.0.0.1', 58427)>
+  self.tk.createcommand(name, f)
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+C:\Users\HCT-2714\AppData\Local\Programs\Python\Python314\Lib\tkinter\__init__.py:1712: ResourceWarning: unclosed <socket.socket fd=756, family=2, type=1, proto=0, laddr=('127.0.0.1', 58432), raddr=('127.0.0.1', 58431)>
+  self.tk.createcommand(name, f)
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+C:\Users\HCT-2714\AppData\Local\Programs\Python\Python314\Lib\tkinter\__init__.py:1712: ResourceWarning: unclosed <socket.socket fd=788, family=2, type=1, proto=0, laddr=('127.0.0.1', 58437), raddr=('127.0.0.1', 58436)>
+  self.tk.createcommand(name, f)
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_excluded_breakpoint_does_not_interrupt_remaining_normal_rows (test_current_groups.GroupGuiTests.test_excluded_breakpoint_does_not_interrupt_remaining_normal_rows) ... ok
+test_excluded_direct_row_is_blocked_and_next_prev_skip_it (test_current_groups.GroupGuiTests.test_excluded_direct_row_is_blocked_and_next_prev_skip_it) ... ok
+test_group_change_during_pending_or_running_is_rejected (test_current_groups.GroupGuiTests.test_group_change_during_pending_or_running_is_rejected) ... ok
+test_low_then_high_current_runs_once_each_and_switch_starts_at_top (test_current_groups.GroupGuiTests.test_low_then_high_current_runs_once_each_and_switch_starts_at_top) ... ok
+test_same_filter_controls_power_rows (test_current_groups.GroupGuiTests.test_same_filter_controls_power_rows) ... ok
+test_switch_does_not_commit_if_standby_fails (test_current_groups.GroupGuiTests.test_switch_does_not_commit_if_standby_fails) ... ok
+test_coil_current_and_power_use_actual_output (test_current_groups.GroupPolicyTests.test_coil_current_and_power_use_actual_output) ... ok
+test_noncurrent_runs_in_normal_group_only_and_invalid_current_is_rejected (test_current_groups.GroupPolicyTests.test_noncurrent_runs_in_normal_group_only_and_invalid_current_is_rejected) ... ok
+test_physical_terminal_boundary_is_strictly_above_3_1 (test_current_groups.GroupPolicyTests.test_physical_terminal_boundary_is_strictly_above_3_1) ... ok
+test_power_uses_current_not_watts_and_includes_pf_calculation (test_current_groups.GroupPolicyTests.test_power_uses_current_not_watts_and_includes_pf_calculation) ... ok
+test_requested_order_and_inclusive_three_amp_boundary (test_current_groups.GroupPolicyTests.test_requested_order_and_inclusive_three_amp_boundary) ... ok
+test_units_signs_and_scientific_notation (test_current_groups.GroupPolicyTests.test_units_signs_and_scientific_notation) ... ok
+test_device_error_stops_rows_but_keeps_confirmed_standby (test_gui_async.AsyncGuiTests.test_device_error_stops_rows_but_keeps_confirmed_standby) ... ok
+test_pause_prevents_scheduling_next_row_after_late_reply (test_gui_async.AsyncGuiTests.test_pause_prevents_scheduling_next_row_after_late_reply) ... ok
+test_slow_sequence_keeps_gui_responsive_and_waits_before_next_row (test_gui_async.AsyncGuiTests.test_slow_sequence_keeps_gui_responsive_and_waits_before_next_row) ... ok
+test_standby_button_interrupts_pending_output_without_replay (test_gui_async.AsyncGuiTests.test_standby_button_interrupts_pending_output_without_replay) ... ok
+test_timeout_marks_failed_row_and_does_not_execute_next (test_gui_async.AsyncGuiTests.test_timeout_marks_failed_row_and_does_not_execute_next) ... ok
+
+======================================================================
+ERROR: test_opc_timeout_does_not_extend_ordinary_query_timeout (test_communications.SlowOutputTests.test_opc_timeout_does_not_extend_ordinary_query_timeout)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\test_communications.py", line 347, in test_opc_timeout_does_not_extend_ordinary_query_timeout
+    mgr.send_command('OUT 1 V; OPER')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 1645, in send_command
+    self.profile.validate_command(command)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 830, in validate_command
+    values = self.output_values(out_parts[0]) if out_parts else {}
+             ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 822, in output_values
+    raise ValueError("���С����� OUT���� ���ļ��� �����ϼ���. DC�� 0 HZ�Դϴ�.")
+ValueError: ���С����� OUT���� ���ļ��� �����ϼ���. DC�� 0 HZ�Դϴ�.
+
+======================================================================
+ERROR: test_reported_device_error_retains_confirmed_standby_connection (test_communications.SlowOutputTests.test_reported_device_error_retains_confirmed_standby_connection)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\test_communications.py", line 338, in test_reported_device_error_retains_confirmed_standby_connection
+    mgr.send_command('OUT 1 V; OPER')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 1645, in send_command
+    self.profile.validate_command(command)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 830, in validate_command
+    values = self.output_values(out_parts[0]) if out_parts else {}
+             ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 822, in output_values
+    raise ValueError("���С����� OUT���� ���ļ��� �����ϼ���. DC�� 0 HZ�Դϴ�.")
+ValueError: ���С����� OUT���� ���ļ��� �����ϼ���. DC�� 0 HZ�Դϴ�.
+
+======================================================================
+ERROR: test_visa_uses_operation_timeout_and_restores_read_timeout (test_communications.SlowOutputTests.test_visa_uses_operation_timeout_and_restores_read_timeout)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\test_communications.py", line 362, in test_visa_uses_operation_timeout_and_restores_read_timeout
+    mgr.send_command('OUT 1 V; OPER')
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 1645, in send_command
+    self.profile.validate_command(command)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 830, in validate_command
+    values = self.output_values(out_parts[0]) if out_parts else {}
+             ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py", line 822, in output_values
+    raise ValueError("���С����� OUT���� ���ļ��� �����ϼ���. DC�� 0 HZ�Դϴ�.")
+ValueError: ���С����� OUT���� ���ļ��� �����ϼ���. DC�� 0 HZ�Դϴ�.
+
+======================================================================
+FAIL: test_abort_interrupts_lan_wait_and_sends_standby (test_communications.SlowOutputTests.test_abort_interrupts_lan_wait_and_sends_standby)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\test_communications.py", line 330, in test_abort_interrupts_lan_wait_and_sends_standby
+    self.assertIsInstance(failures[0],f.OperationCancelled)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ValueError('���С����� OUT���� ���ļ��� �����ϼ���. DC�� 0 HZ�Դϴ�.') is not an instance of <class 'fluke_5560a_controller.OperationCancelled'>
+
+----------------------------------------------------------------------
+Ran 41 tests in 64.406s
+
+FAILED (failures=1, errors=3)

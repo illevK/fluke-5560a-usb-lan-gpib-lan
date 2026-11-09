@@ -1,0 +1,10 @@
+test_auto_capture_after_dwell_and_excludes_other_current_group (__main__.LinkedDutTests.test_auto_capture_after_dwell_and_excludes_other_current_group) ... ok
+test_close_requests_standby_while_dut_is_waiting (__main__.LinkedDutTests.test_close_requests_standby_while_dut_is_waiting) ... ok
+test_invalid_sample_stops_run_and_keeps_previous_cell (__main__.LinkedDutTests.test_invalid_sample_stops_run_and_keeps_previous_cell) ... ok
+test_selected_row_links_and_records_pf_without_a_unit (__main__.LinkedDutTests.test_selected_row_links_and_records_pf_without_a_unit) ... ok
+test_standby_does_not_wait_for_dut_and_rejects_late_reply (__main__.LinkedDutTests.test_standby_does_not_wait_for_dut_and_rejects_late_reply) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 35.957s
+
+OK

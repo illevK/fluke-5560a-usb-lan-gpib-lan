@@ -1,0 +1,17 @@
+test_autoscroll_stops_on_release_without_mutating_results (test_measurement_copy.MeasurementCopyTests.test_autoscroll_stops_on_release_without_mutating_results) ... ok
+test_context_menu_preserves_selection_inside_and_selects_outside (test_measurement_copy.MeasurementCopyTests.test_context_menu_preserves_selection_inside_and_selects_outside) ... ok
+test_drag_copies_only_selected_rows_in_table_order (test_measurement_copy.MeasurementCopyTests.test_drag_copies_only_selected_rows_in_table_order) ... ok
+test_empty_middle_and_trailing_cells_preserve_excel_row_alignment (test_measurement_copy.MeasurementCopyTests.test_empty_middle_and_trailing_cells_preserve_excel_row_alignment) ... ok
+test_live_status_refresh_keeps_highlight_and_replacement_clears_selection (test_measurement_copy.MeasurementCopyTests.test_live_status_refresh_keeps_highlight_and_replacement_clears_selection) ... ok
+test_shift_click_and_keys_extend_and_enter_returns_to_editing (test_measurement_copy.MeasurementCopyTests.test_shift_click_and_keys_extend_and_enter_returns_to_editing) ... ok
+test_single_cell_text_selection_and_normal_cursor_are_preserved (test_measurement_copy.MeasurementCopyTests.test_single_cell_text_selection_and_normal_cursor_are_preserved) ... ok
+test_enter_down_commits_only_results_and_never_starts_output (test_units_measurements.MeasurementTests.test_enter_down_commits_only_results_and_never_starts_output) ... ok
+test_goal_edits_keep_result_but_invalid_unit_removes_command (test_units_measurements.MeasurementTests.test_goal_edits_keep_result_but_invalid_unit_removes_command) ... ok
+test_live_edit_and_result_paste_preserve_output_rows (test_units_measurements.MeasurementTests.test_live_edit_and_result_paste_preserve_output_rows) ... ok
+test_pf_table_paste_then_edit_direction_and_result (test_units_measurements.MeasurementTests.test_pf_table_paste_then_edit_direction_and_result) ... ok
+test_records_survive_visibility_rerender_and_recalculation (test_units_measurements.MeasurementTests.test_records_survive_visibility_rerender_and_recalculation) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 280.717s
+
+OK

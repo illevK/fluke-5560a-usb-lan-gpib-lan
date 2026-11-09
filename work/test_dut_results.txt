@@ -1,0 +1,23 @@
+test_auto_refresh_failure_stops_and_removes_old_values (test_dut.DUTGuiTests.test_auto_refresh_failure_stops_and_removes_old_values) ... ok
+test_copy_header_and_row_to_bottom_preserve_blanks (test_dut.DUTGuiTests.test_copy_header_and_row_to_bottom_preserve_blanks) ... ok
+test_demo_reads_and_preserves_calibrator_and_measurement_table (test_dut.DUTGuiTests.test_demo_reads_and_preserves_calibrator_and_measurement_table) ... ok
+test_disconnect_during_worker_discards_late_sample (test_dut.DUTGuiTests.test_disconnect_during_worker_discards_late_sample) ... ok
+test_dut_cannot_open_the_connected_calibrator_endpoint (test_dut.DUTGuiTests.test_dut_cannot_open_the_connected_calibrator_endpoint) ... ok
+test_app_close_stops_calibrator_sequence_before_waiting_for_dut (test_dut.DUTProtocolTests.test_app_close_stops_calibrator_sequence_before_waiting_for_dut) ... ok
+test_bad_channel_sends_no_commands (test_dut.DUTProtocolTests.test_bad_channel_sends_no_commands) ... ok
+test_cancellation_does_not_retry (test_dut.DUTProtocolTests.test_cancellation_does_not_retry) ... ok
+test_identification_rejects_other_devices_before_configuration (test_dut.DUTProtocolTests.test_identification_rejects_other_devices_before_configuration) ... ok
+test_invalid_values_and_record_length (test_dut.DUTProtocolTests.test_invalid_values_and_record_length) ... ok
+test_mapping_failure_and_timeout_close_stream_and_clear_sample (test_dut.DUTProtocolTests.test_mapping_failure_and_timeout_close_stream_and_clear_sample) ... ok
+test_n4l_data_positions_are_not_confused_with_fundamentals (test_dut.DUTProtocolTests.test_n4l_data_positions_are_not_confused_with_fundamentals) ... ok
+test_requested_and_related_model_identification (test_dut.DUTProtocolTests.test_requested_and_related_model_identification) ... ok
+test_serial_configuration_and_no_telnet_negotiation (test_dut.DUTProtocolTests.test_serial_configuration_and_no_telnet_negotiation) ... ok
+test_settings_and_demo_cannot_open_any_resource (test_dut.DUTProtocolTests.test_settings_and_demo_cannot_open_any_resource) ... ok
+test_tcp_fragmented_crlf_and_consecutive_queries (test_dut.DUTProtocolTests.test_tcp_fragmented_crlf_and_consecutive_queries) ... ok
+test_visa_vxi11_and_cleanup_on_failed_configuration (test_dut.DUTProtocolTests.test_visa_vxi11_and_cleanup_on_failed_configuration) ... ok
+test_wt_mapping_readback_and_values (test_dut.DUTProtocolTests.test_wt_mapping_readback_and_values) ... ok
+
+----------------------------------------------------------------------
+Ran 18 tests in 18.780s
+
+OK

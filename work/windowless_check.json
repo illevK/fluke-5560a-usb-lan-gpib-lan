@@ -1,0 +1,7 @@
+{
+  "console_window": 0,
+  "python": "C:\\Users\\HCT-2714\\AppData\\Local\\Python\\pythoncore-3.14-64\\pythonw.exe",
+  "tkinter": true,
+  "pyvisa": true,
+  "pyserial": true
+}

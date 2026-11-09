@@ -1,0 +1,709 @@
+class AutoNetworkAligner:
+    """Read-only network inventory. Never infer a physical adapter from its name."""
+
+    _cache_time = 0.0
+    _cache = []
+    last_error = ""
+
+    @staticmethod
+    def normalize_ipv4(ip_str: str) -> str:
+        value = ip_str.strip()
+        if not re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}", value):
+            raise ValueError("5560A 화면의 IPv4 주소를 입력하세요. 예: 192.168.100.101")
+        value = ".".join(str(int(part)) for part in value.split("."))
+        addr = ipaddress.IPv4Address(value)
+        if addr.is_unspecified or addr.is_multicast or int(addr) == 0xffffffff:
+            raise ValueError("0.0.0.0 또는 브로드캐스트/멀티캐스트 주소에는 연결할 수 없습니다.")
+        return str(addr)
+
+    @classmethod
+    def list_ethernet_interfaces(cls, refresh=False):
+        if not refresh and cls._cache and time.monotonic() - cls._cache_time < 5:
+            return cls._cache
+        cls.last_error = ""
+        adapters = []
+        if sys.platform == "win32":
+            # JSON and explicit UTF-8 avoid localized netsh headings and CP949 issues.
+            script = r"""
+            $ErrorActionPreference = 'Stop'
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+            $allIPs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop)
+            $rows = @(Get-NetAdapter -Physical -ErrorAction Stop | ForEach-Object {
+                $nic = $_
+                $ips = @($allIPs | Where-Object { $_.InterfaceIndex -eq $nic.ifIndex -and $_.AddressState -eq 'Preferred' } | ForEach-Object {
+                    @{ ip = $_.IPAddress; prefix = [int]$_.PrefixLength }
+                })
+                @{ idx = [string]$nic.ifIndex; name = $nic.Name; state = [string]$nic.Status;
+                   description = $nic.InterfaceDescription; wired = ($nic.NdisPhysicalMedium -eq 14);
+                   hardware = [bool]$nic.HardwareInterface; addresses = $ips }
+            })
+            ConvertTo-Json -InputObject $rows -Depth 5 -Compress
+            """
+            try:
+                proc = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                    capture_output=True, timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if proc.returncode:
+                    raise RuntimeError(proc.stderr.decode("utf-8", errors="replace").strip())
+                rows = json.loads(proc.stdout.decode("utf-8-sig")) or []
+                if isinstance(rows, dict):
+                    rows = [rows]
+                adapters = [row for row in rows if row.get("hardware")]
+                adapters.sort(key=lambda row: (row["state"] != "Up", not row["wired"], int(row["idx"])))
+            except Exception as exc:
+                cls.last_error = f"랜카드 조회 실패: {exc}"
+        else:
+            cls.last_error = "랜카드 상세 조회는 Windows에서 지원합니다. LAN 원본 IP는 직접 지정할 수 있습니다."
+        cls._cache = adapters
+        cls._cache_time = time.monotonic()
+        return adapters
+
+    @classmethod
+    def select_source_ip(cls, adapter_idx: str, target_ip: str) -> str:
+        if not adapter_idx:
+            return ""
+        target = ipaddress.IPv4Address(cls.normalize_ipv4(target_ip))
+        for adapter in cls.list_ethernet_interfaces(refresh=True):
+            if adapter["idx"] != str(adapter_idx):
+                continue
+            if adapter["state"] != "Up":
+                raise ConnectionError(f"{adapter['name']}: 케이블 연결 상태가 Up이 아닙니다.")
+            addresses = adapter.get("addresses") or []
+            if not addresses:
+                raise ConnectionError(f"{adapter['name']}: 사용 가능한 IPv4 주소가 없습니다.")
+            for item in addresses:
+                network = ipaddress.IPv4Interface(f"{item['ip']}/{item['prefix']}").network
+                if target in network:
+                    if str(target) == item['ip'] or target in (network.network_address, network.broadcast_address):
+                        raise ValueError("대상 주소가 PC 자체 주소 또는 해당 서브넷의 네트워크/브로드캐스트 주소입니다.")
+                    return item["ip"]
+            # Routed networks are legitimate. Report the mismatch, but do not force /24.
+            return addresses[0]["ip"]
+        raise ConnectionError("선택한 실제 랜카드를 찾을 수 없습니다. 랜카드 새로고침을 눌러주세요.")
+
+    @classmethod
+    def describe(cls, target_ip="", source_ip=""):
+        lines = []
+        target = None
+        if target_ip:
+            target = ipaddress.IPv4Address(cls.normalize_ipv4(target_ip))
+        for adapter in cls.list_ethernet_interfaces():
+            addresses = adapter.get("addresses") or []
+            ips = ", ".join(f"{a['ip']}/{a['prefix']}" for a in addresses) or "사용 가능한 IPv4 없음"
+            lines.append(f"{adapter['idx']}: {adapter['name']} [{adapter['state']}] {ips}")
+            for item in addresses:
+                if item['ip'] == source_ip and target:
+                    network = ipaddress.IPv4Interface(f"{item['ip']}/{item['prefix']}").network
+                    if target not in network:
+                        lines.append("  대상과 PC가 다른 서브넷입니다. 직결이라면 양쪽 IP/마스크를 맞춰야 합니다. 사내망이라면 라우팅도 확인하세요.")
+        if cls.last_error:
+            lines.append(cls.last_error)
+        return "\n".join(lines) or "랜카드 정보 없음"
+
+
+class InstrumentProtocolError(ConnectionError):
+    pass
+
+
+class OperationCancelled(RuntimeError):
+    pass
+
+
+class InstrumentCommandError(RuntimeError):
+    """The instrument replied with an error; this is not a TCP failure."""
+    pass
+
+
+def close_lan_socket(sock):
+    """Send FIN, consume final bytes briefly, then release the single-client session."""
+    try:
+        sock.shutdown(socket.SHUT_WR)
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            if not sock.recv(4096):
+                break
+    except OSError:
+        pass
+    finally:
+        sock.close()
+
+
+class TelnetLineTransport:
+    """Incremental Telnet parser + CR/LF framing; one transaction at a time."""
+
+    PROMPT = re.compile(r"^(?:(?:5[0-9]{3}A)?\s*[=!?>]>?\s*)", re.I)
+
+    def __init__(self, sock, timeout=3.0, eol="CRLF"):
+        self.sock = sock
+        self.timeout = timeout
+        self.terminator = {"CRLF": b"\r\n", "CR": b"\r", "LF": b"\n"}[eol]
+        self.buffer = bytearray()
+        self.iac_state = "data"
+        self.iac_verb = 0
+        self.last_received = ""
+        self._recent_writes = []
+
+    def _feed(self, raw):
+        for byte in raw:
+            state = self.iac_state
+            if state == "data":
+                if byte == 255:
+                    self.iac_state = "iac"
+                elif byte != 0:  # Telnet CR-NUL padding
+                    self.buffer.append(byte)
+            elif state == "iac":
+                if byte == 255:
+                    self.buffer.append(byte)
+                    self.iac_state = "data"
+                elif byte in (251, 252, 253, 254):
+                    self.iac_verb = byte
+                    self.iac_state = "option"
+                elif byte == 250:
+                    self.iac_state = "sub"
+                else:
+                    self.iac_state = "data"
+            elif state == "option":
+                if self.iac_verb == 251:  # WILL -> DONT; WONT/DONT need no reply
+                    self.sock.sendall(bytes((255, 254, byte)))
+                elif self.iac_verb == 253:  # DO -> WONT
+                    self.sock.sendall(bytes((255, 252, byte)))
+                self.iac_state = "data"
+            elif state == "sub":
+                if byte == 255:
+                    self.iac_state = "sub_iac"
+            elif state == "sub_iac":
+                self.iac_state = "data" if byte == 240 else "sub"
+        if len(self.buffer) > 65536:
+            raise InstrumentProtocolError("응답이 64 KiB를 초과했습니다. 대상 IP와 장비 종류를 확인하세요.")
+
+    @classmethod
+    def clean_line(cls, line, command):
+        text = line.decode("ascii", errors="replace").strip()
+        if re.match(r"^[!?]>", text):
+            raise InstrumentProtocolError(f"장비 오류 응답: {text}")
+        text = cls.PROMPT.sub("", text).strip()
+        return "" if text.upper() == command.upper() else text
+
+    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None):
+        limit = self.timeout if timeout is None else timeout
+        # One query, one reply. Never retransmit OPC while a reply is pending.
+        self.write(command)
+        started = time.monotonic()
+        deadline = started + limit
+        next_progress = started + 1
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise OperationCancelled("사용자가 현재 응답 대기를 중단했습니다.")
+            while True:
+                match = re.search(rb"[\r\n]", self.buffer)
+                if match is None:
+                    break
+                line = bytes(self.buffer[:match.start()])
+                del self.buffer[:match.end()]
+                text = self.clean_line(line, command)
+                if not text or text.upper() in self._recent_writes:
+                    continue
+                self.last_received = text
+                # Initial banners/prompts are not identification responses.
+                if identity and len(text.split(",")) < 4:
+                    continue
+                return text
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                partial = bytes(self.buffer[-120:]).decode("ascii", errors="replace")
+                raise TimeoutError(f"{command}: {limit:g}초 동안 완전한 응답 없음 (부분 수신: {partial or '없음'}).")
+            if progress and time.monotonic() >= next_progress:
+                progress(time.monotonic() - started, limit)
+                next_progress = time.monotonic() + 1
+            self.sock.settimeout(min(0.2, remaining))
+            try:
+                raw = self.sock.recv(4096)
+            except socket.timeout:
+                continue
+            if not raw:
+                raise ConnectionError("장비가 TCP 연결을 종료했습니다.")
+            self._feed(raw)
+
+    def write(self, command):
+        self.sock.settimeout(self.timeout)
+        self.sock.sendall(command.encode("ascii") + self.terminator)
+        self._recent_writes.append(command.upper())
+        self._recent_writes = self._recent_writes[-16:]
+
+
+class Fluke5560AConnectionManager:
+    def __init__(self):
+        self.info = ConnectionInfo()
+        self._visa_rm = None
+        self._visa_inst = None
+        self._lan_sock = None
+        self._transport = None
+        self._serial_port = None
+        self.expected_model = "5560A"
+        self.profile = MODEL_PROFILES["5560A"]
+        self._lock = threading.RLock()
+        self._sim_oper_state = False
+        self._sim_last_out = "0 V, 0 HZ"
+        self.last_error = ""
+        self.source_ip = ""
+        self.last_diagnostic = ""
+        self.operation_timeout = 60.0
+        self.cancel_event = threading.Event()
+        self.events = queue.Queue()
+        self._log_lock = threading.Lock()
+        application_path = sys.executable if getattr(sys, "frozen", False) else __file__
+        self.log_path = os.path.join(os.path.dirname(os.path.abspath(application_path)), "logs",
+                                     f"fluke_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}.log")
+
+    def record_event(self, message, notify=False):
+        with self._log_lock:
+            try:
+                os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+                with open(self.log_path, "a", encoding="utf-8") as log:
+                    log.write(f"[{datetime.datetime.now().isoformat(timespec='milliseconds')}] {message}\n")
+            except OSError:
+                if notify:
+                    message += " (로그 파일 저장 실패)"
+        if notify:
+            self.events.put(message)
+
+    def request_abort(self):
+        self.cancel_event.set()
+
+    def _waiting(self, elapsed, limit):
+        self.events.put(f"[출력 안정화 대기] {elapsed:.0f}/{limit:g}초 — 완료 응답을 기다리고 있습니다.")
+
+    @staticmethod
+    def get_local_pc_ipv4_list():
+        return [item['ip'] for adapter in AutoNetworkAligner.list_ethernet_interfaces()
+                if adapter['state'] == 'Up' for item in (adapter.get('addresses') or [])]
+
+    def _validate_idn(self, value):
+        fields = [part.strip() for part in value.split(",")]
+        return (len(fields) >= 4 and fields[0].upper() == "FLUKE"
+                and fields[1].upper() == self.expected_model)
+
+    def _identify(self, value, interface):
+        if not self._validate_idn(value):
+            raise InstrumentProtocolError(f"선택 모델 {self.expected_model}과 식별 응답이 다릅니다: {value}")
+        profile = MODEL_PROFILES[value.split(",")[1].strip().upper()]
+        if interface not in profile.interfaces:
+            raise InstrumentProtocolError(f"{profile.model}은 {interface} 포트를 지원하지 않습니다.")
+        self.profile = profile
+
+    def _prepare_remote_stream(self, transport, interface):
+        # 552x/5080A do not have 5560A's COMM_MODE command. Their TERM echo
+        # and prompts are handled by the reader without changing saved settings.
+        if self.profile.model == "5560A":
+            port = "TELNET" if interface == "LAN" else "SERIAL"
+            mode = transport.query(f"COMM_MODE? {port}").strip().upper()
+            if mode == "TERM":
+                transport.write(f"COMM_MODE {port}, COMP")
+                mode = transport.query(f"COMM_MODE? {port}").strip().upper()
+            if mode != "COMP":
+                raise InstrumentProtocolError("Computer 모드 전환을 확인하지 못했습니다.")
+        transport.write("REMOTE")
+        if transport.query("*OPC?").strip() != "1":
+            raise InstrumentProtocolError("REMOTE 처리 완료 응답이 올바르지 않습니다.")
+
+    @staticmethod
+    def _validate_command(command):
+        command = command.strip()
+        if not command or any(c in command for c in "\r\n\x00"):
+            raise ValueError("명령은 비어 있지 않은 한 줄이어야 합니다.")
+        command.encode("ascii")
+        return command
+
+    @staticmethod
+    def _validate_port(port):
+        port = int(port)
+        if not 1 <= port <= 65535:
+            raise ValueError("포트는 1~65535 사이여야 합니다.")
+        return port
+
+    def scan_and_auto_connect(self, preferred_mode="AUTO", lan_ip="", lan_port=3490,
+                              gpib_addr=1, timeout_sec=3.0, allow_raw_socket_fallback=False,
+                              source_ip="", eol="CRLF", visa_resource="", adapter_idx="",
+                              operation_timeout_sec=60.0, model="5560A", serial_port="",
+                              baudrate=9600, data_bits=8, parity="N", stop_bits=1, flow_control="XON/XOFF"):
+        # Legacy fallback argument is intentionally ignored: IDN verification is mandatory.
+        mode = preferred_mode.strip().upper()
+        if mode not in ("AUTO", "USB", "GPIB", "RS232", "LAN", "LAN (SOCKET)", "LAN (VISA)", "SIMULATION"):
+            raise ValueError(f"지원하지 않는 연결 모드: {mode}")
+        model = model.strip().upper()
+        if model not in MODEL_PROFILES:
+            raise ValueError(f"지원하지 않는 모델: {model}")
+        profile = MODEL_PROFILES[model]
+        interface = "LAN" if mode.startswith("LAN") else mode
+        if interface not in ("AUTO", "SIMULATION") and interface not in profile.interfaces:
+            raise ValueError(f"{model} 연결 가능: {', '.join(profile.interfaces)}. USB–RS-232 컨버터는 RS232를 선택하세요.")
+        if not math.isfinite(timeout_sec) or not 0.2 <= timeout_sec <= 60:
+            raise ValueError("통신 제한 시간은 0.2~60초 사이여야 합니다.")
+        if not math.isfinite(operation_timeout_sec) or not 1 <= operation_timeout_sec <= 300:
+            raise ValueError("출력 안정화 제한 시간은 1~300초 사이여야 합니다.")
+        self.disconnect()
+        self.expected_model = model
+        self.profile = profile
+        self.cancel_event.clear()
+        self.operation_timeout = operation_timeout_sec
+        self.last_error = ""
+        self.source_ip = source_ip
+        if mode == "SIMULATION":
+            self._sim_oper_state = False
+            self._sim_last_out = "0 V, 0 HZ"
+            self.info = ConnectionInfo(True, "SIMULATION (가상 장비 모드)", f"SIM::FLUKE_{model}::INSTR", f"FLUKE,{model},SIM-9901234,1.0")
+            return self.info
+        errors = []
+        # Explicit LAN address in AUTO takes precedence over unrelated instruments.
+        if "LAN" in profile.interfaces and mode in ("AUTO", "LAN", "LAN (SOCKET)", "LAN (VISA)") and lan_ip.strip():
+            ip = AutoNetworkAligner.normalize_ipv4(lan_ip)
+            port = self._validate_port(lan_port)
+            if adapter_idx:
+                source_ip = AutoNetworkAligner.select_source_ip(adapter_idx, ip)
+            elif source_ip:
+                source_ip = AutoNetworkAligner.normalize_ipv4(source_ip)
+            self.source_ip = source_ip
+            result = self._try_lan_socket(ip, port, timeout_sec, source_ip=source_ip, eol=eol)
+            if result.connected:
+                return result
+            errors.append(self.last_error)
+            if mode != "AUTO":
+                raise ConnectionError(self.build_lan_diagnostic_report(ip, port))
+        elif mode.startswith("LAN"):
+            raise ValueError("5560A 본체 Ethernet 화면에 표시된 현재 IP 주소를 입력하세요.")
+        if mode == "RS232" or (mode == "AUTO" and serial_port.strip()):
+            result = self._try_serial(serial_port, timeout_sec, eol, baudrate, data_bits, parity, stop_bits, flow_control)
+            if result.connected:
+                return result
+            errors.append(self.last_error)
+        if mode in ("AUTO", "USB", "GPIB") and set(profile.interfaces) & {"USB", "GPIB"}:
+            result = self._try_visa_auto_scan(mode, gpib_addr, timeout_sec, visa_resource)
+            if result.connected:
+                return result
+            errors.append(self.last_error)
+        self.last_error = "\n".join(errors)
+        raise ConnectionError(self.last_error or "연결할 인터페이스와 장비 IP/리소스를 지정하세요.")
+
+    def _try_lan_socket(self, ip, port=3490, timeout_sec=3.0, allow_open_port_fallback=False,
+                        source_ip="", eol="CRLF"):
+        sock = None
+        stage = "TCP 연결"
+        try:
+            ip = AutoNetworkAligner.normalize_ipv4(ip)
+            port = self._validate_port(port)
+            if source_ip and source_ip == ip:
+                raise ValueError("5560A IP와 PC IP가 같습니다. 장비 화면의 IP를 확인하세요.")
+            sock = socket.create_connection((ip, port), timeout_sec,
+                                             source_address=(source_ip, 0) if source_ip else None)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.source_ip = sock.getsockname()[0]
+            transport = TelnetLineTransport(sock, timeout_sec, eol)
+            stage = "장비 식별 (*IDN?)"
+            idn = transport.query("*IDN?", identity=True)
+            self._identify(idn, "LAN")
+            # Identification is complete before sending any state-changing commands.
+            stage = "Computer 통신 모드 확인"
+            self._prepare_remote_stream(transport, "LAN")
+            self._lan_sock, self._transport = sock, transport
+            self.info = ConnectionInfo(True, "LAN (Ethernet Socket)", f"TCPIP::{ip}::{port}::SOCKET", idn, ip, port)
+            self.last_error = ""
+            return self.info
+        except Exception as exc:
+            self.last_error = f"[{stage}] {ip}:{port} / PC {self.source_ip or source_ip or '자동 경로'}\n{type(exc).__name__}: {exc}"
+            if sock is not None:
+                close_lan_socket(sock)
+            self._lan_sock = self._transport = None
+            self.info = ConnectionInfo()
+            return self.info
+
+    @staticmethod
+    def list_serial_ports():
+        if not HAS_PYSERIAL:
+            return []
+        return [(p.device, p.description) for p in serial.tools.list_ports.comports()]
+
+    def _try_serial(self, port, timeout, eol, baudrate, data_bits, parity, stop_bits, flow_control):
+        if not HAS_PYSERIAL:
+            self.last_error = dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR)
+            return ConnectionInfo()
+        handle = None
+        stage = "COM 포트 열기"
+        try:
+            if not port.strip():
+                raise ValueError("장치 관리자 또는 COM 목록에서 컨버터의 COM 번호를 선택하세요.")
+            rates = (300, 600, 1200, 2400, 4800, 9600)
+            if self.profile.model in ("5560A", "5080A"):
+                rates += (19200, 38400, 57600, 115200)
+            if self.profile.model == "5560A":
+                rates = rates[5:]
+            if int(baudrate) not in rates or int(data_bits) not in (7, 8) or parity not in ("N", "E", "O") or float(stop_bits) not in (1, 2):
+                raise ValueError(f"{self.profile.model}의 속도/데이터/패리티/정지 비트 설정을 확인하세요.")
+            if flow_control not in ("NONE", "XON/XOFF", "RTS/CTS"):
+                raise ValueError("흐름 제어는 NONE, XON/XOFF, RTS/CTS 중 선택하세요.")
+            handle = serial.Serial(port=port.strip(), baudrate=int(baudrate), bytesize=int(data_bits),
+                                   parity=parity, stopbits=float(stop_bits), timeout=.2, write_timeout=timeout,
+                                   xonxoff=flow_control == "XON/XOFF", rtscts=flow_control == "RTS/CTS", dsrdtr=False)
+            transport = SerialLineTransport(SerialEndpoint(handle), timeout, eol)
+            stage = "장비 식별 (*IDN?)"
+            idn = transport.query("*IDN?", identity=True)
+            self._identify(idn, "RS232")
+            stage = "원격 제어 준비"
+            self._prepare_remote_stream(transport, "RS232")
+            self._serial_port, self._transport = handle, transport
+            self.info = ConnectionInfo(True, "RS232 (COM / USB–RS-232)",
+                                       f"{port} / {baudrate} / {data_bits}{parity}{stop_bits} / {flow_control}", idn)
+            self.last_error = ""
+            return self.info
+        except Exception as exc:
+            if handle is not None:
+                handle.close()
+            self._serial_port = self._transport = None
+            self.info = ConnectionInfo()
+            self.last_error = (f"[{stage}] {port}: {type(exc).__name__}: {exc}\n"
+                               "본체의 RS-232 선택, 속도/데이터/패리티/정지 비트/흐름 제어/EOL 일치 여부를 확인하세요. "
+                               "5522A·5520A는 SERIAL 1 FROM HOST에 연결하고 null-modem 결선이 필요합니다.")
+            return self.info
+
+    def _try_visa_auto_scan(self, filter_mode, gpib_addr, timeout_sec, visa_resource=""):
+        if not HAS_PYVISA:
+            self.last_error = dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR)
+            return ConnectionInfo()
+        errors = []
+        try:
+            self._visa_rm = SharedVisaManager()
+            resources = [visa_resource.strip()] if visa_resource.strip() else list(self._visa_rm.list_resources())
+            if filter_mode == "GPIB" and not visa_resource.strip():
+                if not 0 <= int(gpib_addr) <= 30:
+                    raise ValueError("GPIB 주소는 0~30 사이여야 합니다.")
+                # Honor the requested address, not whichever device answers first.
+                resources = [f"GPIB0::{int(gpib_addr)}::INSTR"]
+            for resource in resources:
+                kind = resource.upper().split("::", 1)[0]
+                if not kind.startswith(("USB", "GPIB")):
+                    continue
+                interface = "USB" if kind.startswith("USB") else "GPIB"
+                if interface not in self.profile.interfaces:
+                    continue
+                if filter_mode in ("USB", "GPIB") and not kind.startswith(filter_mode):
+                    continue
+                inst = None
+                try:
+                    inst = self._visa_rm.open_resource(resource, open_timeout=int(timeout_sec * 1000))
+                    inst.timeout = int(timeout_sec * 1000)
+                    inst.read_termination = "\n"
+                    inst.write_termination = "\n"
+                    idn = inst.query("*IDN?").strip()
+                    self._identify(idn, interface)
+                    if interface == "GPIB":
+                        inst.control_ren(pyvisa.constants.RENLineOperation.asrt_address)
+                    self._visa_inst = inst
+                    # REMOTE/LOCAL strings are Ethernet/serial commands, not GPIB/USBTMC.
+                    self.info = ConnectionInfo(True, "USB (USBTMC)" if kind.startswith("USB") else "GPIB (IEEE-488.2)", resource, idn)
+                    return self.info
+                except Exception as exc:
+                    errors.append(f"{resource}: {exc}")
+                    if inst is not None:
+                        self._visa_rm.close_resource(inst)
+            self.last_error = "\n".join(errors) or "VISA에서 해당 장비를 찾지 못했습니다. USB는 후면 USB Device(B형) 포트와 USBTMC 활성화, GPIB는 주소/어댑터 드라이버를 확인하세요."
+        except Exception as exc:
+            self.last_error = (f"VISA 초기화/검색 실패: {type(exc).__name__}: {exc}\n"
+                               f"실행 Python: {sys.executable}\n"
+                               "PyVISA는 불러왔습니다. NI-VISA 또는 사용 중인 USB/GPIB 어댑터의 VISA 드라이버를 확인하세요.")
+        if self._visa_rm is not None:
+            self._visa_rm.close()
+            self._visa_rm = None
+        return ConnectionInfo()
+
+    def build_lan_diagnostic_report(self, target_ip, target_port):
+        if self.expected_model == "5080A":
+            return (f"대상: 5080A {target_ip}:{target_port}\nPC 원본 IP: {self.source_ip or 'Windows 자동 경로'}\n"
+                    f"{self.last_error}\n\n{AutoNetworkAligner.describe(target_ip, self.source_ip)}\n\n"
+                    "5080A 확인 순서:\n1. 본체 Remote Interface Port를 LAN으로 선택하세요.\n"
+                    "2. LAN 메뉴의 현재 IP/마스크/포트와 맞추세요. 기본 포트는 3490입니다.\n"
+                    "3. 다른 프로그램의 연결을 해제하세요. LAN은 한 번에 한 연결만 허용합니다.\n"
+                    "4. 직결이면 PC와 장비가 같은 서브넷의 서로 다른 주소여야 합니다.\n"
+                    "PC IP/방화벽/장비 설정은 이 진단으로 변경하지 않습니다.")
+        return (f"대상: {target_ip}:{target_port}\nPC 원본 IP: {self.source_ip or 'Windows 자동 경로'}\n"
+                f"{self.last_error}\n\n{AutoNetworkAligner.describe(target_ip, self.source_ip)}\n\n"
+                "확인 순서:\n"
+                "1. 장비 Setup > System Settings > Remote Port Setup > Ethernet 활성화 및 현재 IP/마스크/포트를 확인하세요. 기본 포트는 3490입니다.\n"
+                "2. Network Security에서 실제 PC 원본 IP를 포함하는 허용 범위를 Enable 하세요. 세 범위가 모두 Disable이면 모든 접속이 차단됩니다.\n"
+                "3. 다른 PC, PuTTY, NI MAX, 기존 제어 프로그램의 LAN 세션을 닫으세요. 5560A는 LAN 연결을 하나만 허용합니다.\n"
+                "4. TCP는 연결되지만 응답이 없으면 Remote Interface=Computer, EOL=CR/LF를 확인하세요.\n"
+                "5. 직결 환경에서 DHCP 서버가 없으면 양쪽에 같은 서브넷의 서로 다른 고정 IP를 지정하세요.\n"
+                "시간 초과만으로 방화벽 차단을 확정할 수 없습니다. 이 진단은 PC IP나 방화벽을 변경하지 않습니다.")
+
+    def diagnose_lan(self, ip, port=3490, timeout=3.0, source_ip="", eol="CRLF", adapter_idx=""):
+        """One read-only IDN session, no REMOTE, STBY, OUT, or configuration commands."""
+        if self.info.connected:
+            raise ConnectionError("현재 연결을 해제한 후 LAN 진단을 실행하세요.")
+        if "LAN" not in MODEL_PROFILES[self.expected_model].interfaces:
+            raise ValueError(f"{self.expected_model}은 기본 LAN 포트를 지원하지 않습니다.")
+        if not math.isfinite(timeout) or not 0.2 <= timeout <= 60:
+            raise ValueError("통신 제한 시간은 0.2~60초 사이여야 합니다.")
+        ip = AutoNetworkAligner.normalize_ipv4(ip)
+        port = self._validate_port(port)
+        self.source_ip = AutoNetworkAligner.select_source_ip(adapter_idx, ip) if adapter_idx else (
+            AutoNetworkAligner.normalize_ipv4(source_ip) if source_ip else "")
+        stage = "TCP 연결"
+        sock = None
+        try:
+            sock = socket.create_connection((ip, port), timeout,
+                    source_address=(self.source_ip, 0) if self.source_ip else None)
+            self.source_ip = sock.getsockname()[0]
+            stage = "TCP 성공, *IDN? 확인"
+            idn = TelnetLineTransport(sock, timeout, eol).query("*IDN?", identity=True)
+            if not self._validate_idn(idn):
+                raise InstrumentProtocolError(f"다른 장비 응답: {idn}")
+            self.last_error = f"[진단 성공] TCP 및 {self.expected_model} 식별 확인: {idn}"
+        except Exception as exc:
+            self.last_error = f"[{stage}] {type(exc).__name__}: {exc}"
+        finally:
+            if sock is not None:
+                close_lan_socket(sock)
+        self.last_diagnostic = self.build_lan_diagnostic_report(ip, port)
+        return self.last_diagnostic
+
+    def _drop_connection(self):
+        if self._lan_sock is not None:
+            close_lan_socket(self._lan_sock)
+        for handle in (self._serial_port, self._visa_rm):
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+        self._visa_inst = self._visa_rm = self._lan_sock = self._transport = None
+        self._serial_port = None
+        self.info = ConnectionInfo()
+
+    def _query(self, command, timeout=None, cancellable=True):
+        """Caller holds the transaction lock and owns failure cleanup."""
+        started = time.monotonic()
+        self.record_event(f"TX QUERY >> {command} | timeout={timeout or '조회 설정'}")
+        if cancellable and self.cancel_event.is_set():
+            raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
+        if self._visa_inst is not None:
+            previous = self._visa_inst.timeout
+            try:
+                if timeout is not None:
+                    self._visa_inst.timeout = int(timeout * 1000)
+                response = self._visa_inst.query(command).strip()
+            finally:
+                self._visa_inst.timeout = previous
+            if cancellable and self.cancel_event.is_set():
+                raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
+        elif self._transport is not None:
+            response = self._transport.query(command, timeout=timeout,
+                       cancel_event=self.cancel_event if cancellable else None,
+                       progress=self._waiting if command == "*OPC?" and timeout else None)
+        else:
+            raise ConnectionError("유효한 통신 핸들이 없습니다.")
+        self.record_event(f"RX << {response} | {command} | {time.monotonic() - started:.3f}s")
+        return response
+
+    def _write(self, command):
+        self.record_event(f"TX COMMAND >> {command}")
+        if self._visa_inst is not None:
+            self._visa_inst.write(command)
+        elif self._transport is not None:
+            self._transport.write(command)
+        else:
+            raise ConnectionError("유효한 통신 핸들이 없습니다.")
+
+    def _fail_control_session(self, context, exc):
+        # Keep the handle until STBY has been attempted. Never read after an
+        # uncertain reply: a late OPC '1' could be mistaken for a new query.
+        message = f"{context}: {type(exc).__name__}: {exc}"
+        try:
+            self._write("STBY")
+            message += "\nSTBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요."
+        except Exception as standby_error:
+            message += f"\nSTBY 전송 실패: {standby_error}. 본체의 STBY 상태를 확인하세요."
+        finally:
+            self._drop_connection()
+        self.last_error = message
+        self.record_event(message, notify=True)
+
+    def query(self, cmd):
+        command = self._validate_command(cmd)
+        if ";" in command or "?" not in command:
+            raise ValueError("조회는 물음표가 포함된 단일 명령만 사용하세요. 출력 설정은 전송 버튼을 사용하세요.")
+        with self._lock:
+            if not self.info.connected:
+                raise ConnectionError("장비가 연결되어 있지 않습니다.")
+            if self.info.interface_type.startswith("SIMULATION"):
+                responses = {"*IDN?": self.info.idn_string, "OPER?": "1" if self._sim_oper_state else "0",
+                             "OUT?": self._sim_last_out, "ERR?": '0,"No error"', "*OPC?": "1"}
+                return responses.get(command.upper(), f"SIM_ACK ({command})")
+            try:
+                return self._query(command, timeout=self.operation_timeout if command.upper() == "*OPC?" else None)
+            except Exception as exc:
+                self._fail_control_session(f"조회 {command}", exc)
+                raise
+
+    def send_command(self, cmd):
+        command = self._validate_command(cmd)
+        with self._lock:
+            if not self.info.connected:
+                raise ConnectionError("장비가 연결되어 있지 않습니다.")
+            if "?" in command:
+                raise ValueError("조회 명령(?)은 조회 버튼 또는 query()를 사용하세요.")
+            # Reject invalid settings before any output command reaches any transport.
+            self.profile.validate_command(command)
+            if self.info.interface_type.startswith("SIMULATION"):
+                for part in command.upper().split(";"):
+                    part = part.strip()
+                    if part == "OPER":
+                        self._sim_oper_state = True
+                    elif part in ("STBY", "*RST"):
+                        self._sim_oper_state = False
+                    elif part.startswith("OUT "):
+                        self._sim_last_out = part[4:]
+                return
+            started = time.monotonic()
+            try:
+                if self.cancel_event.is_set():
+                    raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
+                self._write(command)
+                if self._query("*OPC?", timeout=self.operation_timeout) != "1":
+                    raise InstrumentProtocolError("명령 처리 완료를 확인하지 못했습니다.")
+                error = self._query("ERR?")
+                if not re.match(r"^\+?0\s*(?:,|$)", error):
+                    # A valid error reply means the stream is still synchronized.
+                    # Stop output and verify it, but retain a healthy connection.
+                    self._write("STBY")
+                    if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
+                        raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
+                    raise InstrumentCommandError(f"{self.profile.model} 오류: {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다.")
+                self.record_event(f"[명령 완료] {command} | {time.monotonic() - started:.3f}s", notify=True)
+            except InstrumentCommandError as exc:
+                self.last_error = str(exc)
+                self.record_event(str(exc), notify=True)
+                raise
+            except Exception as exc:
+                context = f"명령 [{command}] / {time.monotonic() - started:.3f}초 경과 / 완료 대기 한도 {self.operation_timeout:g}초"
+                self._fail_control_session(context, exc)
+                raise
+
+    def disconnect(self, standby=True):
+        with self._lock:
+            try:
+                self.cancel_event.clear()
+                if self.info.connected and standby:
+                    self.send_command("STBY")
+                    if self._transport is not None:
+                        self._transport.write("LOCAL")
+                        if self._transport.query("*OPC?") != "1":
+                            raise InstrumentProtocolError("LOCAL 완료 응답을 확인하지 못했습니다.")
+                    elif self._visa_inst is not None:
+                        try:
+                            self._visa_inst.control_ren(pyvisa.constants.RENLineOperation.deassert_gtl)
+                        except Exception:
+                            pass
+            finally:
+                self._drop_connection()
+

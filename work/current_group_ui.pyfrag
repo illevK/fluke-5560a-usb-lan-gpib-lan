@@ -1,0 +1,227 @@
+        def _build_current_group_panel(self, container):
+            self._group_high_only = False
+            self._group_basis = SequenceCurrentFilter.JOB
+            self._seq_active_indices = []
+            self.var_high_current_only = tk.BooleanVar(value=False)
+            self.var_current_group_basis = tk.StringVar(value=self._group_basis)
+            self.var_current_group_summary = tk.StringVar()
+            panel = tk.Frame(container, bg="#EFF6FF", padx=8, pady=5)
+            panel.pack(fill="x", pady=(0, 5))
+            row = tk.Frame(panel, bg="#EFF6FF")
+            row.pack(fill="x")
+            self.chk_high_current_only = tk.Checkbutton(row, text="큰 전류 그룹만 실행 (OFF: 작은 전류 / ON: 큰 전류)",
+                variable=self.var_high_current_only, command=self._on_current_group_changed,
+                bg="#EFF6FF", font=("Malgun Gothic", 9, "bold"))
+            self.chk_high_current_only.pack(side="left", padx=(0, 12))
+            ttk.Combobox(row, textvariable=self.var_current_group_basis,
+                         values=[SequenceCurrentFilter.JOB, SequenceCurrentFilter.POSTS],
+                         width=28, state="readonly").pack(side="left", padx=(0, 8))
+            # Bind the selection without a write trace: rejected changes must be reversible.
+            row.winfo_children()[-1].bind("<<ComboboxSelected>>", lambda _e: self._on_current_group_changed())
+            tk.Label(row, text="전류·전력 공통 / 코일 환산 후 실제 A 기준", bg="#EFF6FF", fg="#334155",
+                     font=("Malgun Gothic", 9)).pack(side="left")
+            tk.Label(panel, textvariable=self.var_current_group_summary, bg="#EFF6FF", fg="#1D4ED8",
+                     anchor="w", font=("Malgun Gothic", 9)).pack(fill="x")
+
+        def _step_in_current_group(self, step):
+            return SequenceCurrentFilter.includes(step, self._group_high_only, self._group_basis, self._selected_model())
+
+        def _current_group_label(self):
+            return SequenceCurrentFilter.label(self._group_high_only, self._group_basis, self._selected_model())
+
+        def _reorder_current_group_rows(self, restore=False):
+            if self._io_busy or self.seq_running:
+                self.var_active_row_banner.set("행 순서를 바꾸려면 실행을 일시중단하고 현재 응답이 끝날 때까지 기다리세요.")
+                return
+            if not self.seq_steps or (restore and self._original_row_positions is None):
+                return
+
+            grid = self.excel_grid
+            focus = grid.focus_get()
+            for row, widgets in enumerate(grid._row_widgets):
+                for column, entry in widgets["entries"].items():
+                    if entry is focus:
+                        grid._commit_cell(row, column)
+                        grid.focus_set()
+
+            # Original positions follow the row slots through cell edits and
+            # command rebuilds. Rows appended after a sort go at the end on restore.
+            count = len(self.seq_steps)
+            positions = self._original_row_positions or []
+            positions = positions + list(range(len(positions), count))
+            current_order = list(range(count))
+            original_order = sorted(current_order, key=positions.__getitem__)
+            order = original_order
+            if not restore:
+                included, excluded = [], []
+                try:
+                    for index in original_order:
+                        group = included if self._step_in_current_group(self.seq_steps[index]) else excluded
+                        group.append(index)
+                except ValueError as exc:
+                    self.var_active_row_banner.set(str(exc))
+                    return
+                order = included + excluded
+            if order == current_order:
+                self.var_active_row_banner.set("이미 선택한 그룹의 정렬 순서입니다.")
+                return
+
+            self._on_seq_stop_auto(silent=True)
+            new_indices = {old: new for new, old in enumerate(order)}
+            self.seq_steps = [self.seq_steps[index] for index in order]
+            for number, step in enumerate(self.seq_steps, 1):
+                step.step_no = number
+            positions = [positions[index] for index in order]
+            self._original_row_positions = None if positions == current_order else positions
+            self.seq_current_idx = new_indices.get(self.seq_current_idx, -1)
+            self.seq_paused_idx = -1
+            self._seq_active_indices = []
+            grid.selected_row_idx = new_indices.get(grid.selected_row_idx, 0)
+            self.var_seq_start_row.set("1")
+            self.var_seq_stop_row.set(str(count))
+            grid.render_steps(self.seq_steps, active_idx=self.seq_current_idx)
+            self._refresh_current_group_preview()
+            grid.canvas.yview_moveto(0)
+            if restore:
+                message = "원래 순서로 복원했습니다."
+            else:
+                message = f"현재 그룹 {len(included)}행은 위로, 다른 그룹 {len(excluded)}행은 아래로 정렬했습니다."
+            self.var_active_row_banner.set(f"{message} 실행 범위 1~{count}행")
+
+        def _refresh_current_group_preview(self):
+            if not hasattr(self, 'var_current_group_summary'):
+                return
+            self.btn_group_restore.state(["disabled"] if self._original_row_positions is None else ["!disabled"])
+            count = 0
+            for index, step in enumerate(self.seq_steps):
+                try:
+                    included = self._step_in_current_group(step)
+                except ValueError as exc:
+                    self.var_current_group_summary.set(str(exc))
+                    return
+                if included:
+                    count += 1
+                    if step.status == "⏭ 다른 전류 그룹":
+                        step.status = "대기"
+                    step.status = step.status.removesuffix(" · 제외")
+                elif step.status.startswith("✓ 완료"):
+                    step.status = "✓ 완료 · 제외"
+                else:
+                    step.status = "⏭ 다른 전류 그룹"
+                self.excel_grid._update_single_row_visual(index, step,
+                    is_active=included and index == self.seq_current_idx)
+            note = MODEL_PROFILES[self._selected_model()].terminal_note
+            self.var_current_group_summary.set(f"현재: {self._current_group_label()} | 시트 대상 {count}/{len(self.seq_steps)}행 | {note}")
+
+        def _on_current_group_changed(self):
+            high = self.var_high_current_only.get()
+            basis = self.var_current_group_basis.get()
+            # Display the committed selection until the change is accepted.
+            self.var_high_current_only.set(self._group_high_only)
+            self.var_current_group_basis.set(self._group_basis)
+            if high == self._group_high_only and basis == self._group_basis:
+                return
+            if self._io_busy or self.seq_running:
+                self._log("[그룹 변경 보류] 순차 실행을 일시중단하고 현재 응답이 끝난 뒤 변경하세요.")
+                return
+            def apply(_state=False):
+                if _state:
+                    self._log("[그룹 변경 실패] STBY 확인이 필요합니다.")
+                    return
+                self._group_high_only, self._group_basis = high, basis
+                self.var_high_current_only.set(high)
+                self.var_current_group_basis.set(basis)
+                self.seq_current_idx = self.seq_paused_idx = -1
+                self._seq_active_indices = []
+                self.var_seq_start_row.set("1")
+                self.var_seq_stop_row.set(str(max(1, len(self.seq_steps))))
+                self.progress_var.set(0)
+                self._refresh_current_group_preview()
+                self.var_active_row_banner.set(f"그룹 변경: {self._current_group_label()} — 본체 STBY와 케이블 연결 확인 후 시작 버튼을 누르세요.")
+                self._log(f"[그룹 변경] {self._current_group_label()} | 시작 범위 초기화, 자동 출력 없음")
+            if self.conn_mgr.info.connected:
+                self._send_and_log("STBY", on_done=apply)
+            else:
+                apply()
+
+        def _start_filtered_sequence(self, start_idx, stop_idx):
+            if self._io_busy:
+                return
+            try:
+                dwell = float(self.var_seq_dwell_sec.get())
+                if not math.isfinite(dwell) or dwell < .2:
+                    raise ValueError("유지시간은 0.2초 이상의 유한한 숫자여야 합니다.")
+                plan = [i for i in range(start_idx, stop_idx + 1) if self._step_in_current_group(self.seq_steps[i])]
+                for i in plan:
+                    step = self.seq_steps[i]
+                    if not step.scpi_cmd or step.func_type == "ERROR":
+                        raise ValueError(f"#{step.step_no}행 설정을 확인하세요: {step.actual_out_desc}")
+                    MODEL_PROFILES[self._selected_model()].validate_command(step.scpi_cmd)
+            except (ValueError, IndexError) as exc:
+                self._show_report("순차 실행 설정 확인", str(exc))
+                return
+            self._on_seq_stop_auto(silent=True)
+            self._seq_active_indices = plan
+            if not plan:
+                self.var_active_row_banner.set(f"지정 범위에 {self._current_group_label()} 대상이 없습니다.")
+                self._log("[실행 대상 없음] 그룹 또는 시작·중단 행 범위를 확인하세요. 출력 명령을 보내지 않았습니다.")
+                return
+            if not self._ensure_connected_or_sim():
+                return
+            for i in range(start_idx, stop_idx + 1):
+                if i in plan:
+                    self.seq_steps[i].status = "대기"
+            self._refresh_current_group_preview()
+            self.progress_var.set(0)
+            self.seq_running = True
+            self._log(f"[그룹 순차 시작] {self._current_group_label()} | 표의 실행 행: {', '.join(str(i + 1) for i in plan)} | 유지 {dwell:g}초")
+            self._run_next_auto_step(start_idx, stop_idx, int(dwell * 1000))
+
+        def _on_seq_start_from_selected_or_range(self):
+            if not self.seq_steps:
+                self._log("먼저 시트에 측정값을 넣으세요.")
+                return
+            self._start_filtered_sequence(*self._get_start_and_stop_indices())
+
+        def _on_seq_resume_from_paused(self):
+            if not self.seq_steps:
+                return
+            if self.seq_paused_idx < 0:
+                self._on_seq_start_from_selected_or_range()
+                return
+            _, stop_idx = self._get_start_and_stop_indices()
+            if self.seq_paused_idx > stop_idx:
+                stop_idx = len(self.seq_steps) - 1
+                self.var_seq_stop_row.set(str(stop_idx + 1))
+            self._start_filtered_sequence(self.seq_paused_idx, stop_idx)
+
+        def _on_seq_step_next(self):
+            if self._io_busy:
+                return
+            self._on_seq_stop_auto(silent=True)
+            try:
+                index = next((i for i in range(self.seq_current_idx + 1, len(self.seq_steps))
+                              if self._step_in_current_group(self.seq_steps[i])), None)
+                if index is None:
+                    self._log("현재 그룹의 마지막 행입니다. STBY를 요청합니다.")
+                    if self.conn_mgr.info.connected:
+                        self._on_stby_clicked()
+                    return
+                self._seq_active_indices = [index]
+                self._execute_sequence_step(index)
+            except ValueError as exc:
+                self._show_report("전류 그룹 확인", str(exc))
+
+        def _on_seq_step_prev(self):
+            if self._io_busy:
+                return
+            self._on_seq_stop_auto(silent=True)
+            try:
+                index = next((i for i in range(self.seq_current_idx - 1, -1, -1)
+                              if self._step_in_current_group(self.seq_steps[i])), None)
+                if index is not None:
+                    self._seq_active_indices = [index]
+                    self._execute_sequence_step(index)
+            except ValueError as exc:
+                self._show_report("전류 그룹 확인", str(exc))
+

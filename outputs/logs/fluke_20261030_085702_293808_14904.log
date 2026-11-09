@@ -1,0 +1,13 @@
+[2026-10-30T08:57:02.299] TX COMMAND >> OUT 1 V; OPER
+[2026-10-30T08:57:02.301] TX QUERY >> *OPC? | timeout=1
+[2026-10-30T08:57:02.304] RX << 1 | *OPC? | 0.003s
+[2026-10-30T08:57:02.307] TX QUERY >> ERR? | timeout=조회 설정
+[2026-10-30T08:57:02.309] RX << 4103,"Output settling timed out" | ERR? | 0.003s
+[2026-10-30T08:57:02.312] TX COMMAND >> STBY
+[2026-10-30T08:57:02.315] TX QUERY >> *OPC? | timeout=1
+[2026-10-30T08:57:02.317] RX << 1 | *OPC? | 0.003s
+[2026-10-30T08:57:02.318] TX QUERY >> OPER? | timeout=조회 설정
+[2026-10-30T08:57:02.321] RX << 0 | OPER? | 0.002s
+[2026-10-30T08:57:02.322] 5560A 오류: 4103,"Output settling timed out". STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다.
+[2026-10-30T08:57:02.323] TX QUERY >> OPER? | timeout=조회 설정
+[2026-10-30T08:57:02.325] RX << 0 | OPER? | 0.001s

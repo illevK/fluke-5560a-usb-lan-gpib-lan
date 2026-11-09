@@ -1,0 +1,144 @@
+@dataclass(frozen=True)
+class CalibratorProfile:
+    model: str
+    interfaces: tuple
+    max_current: float
+    max_resistance: float = 1.1e9
+
+    @property
+    def terminal_note(self):
+        return ("VI AUX ≤3.1 A / 30A >3.1 A" if self.model == "5560A"
+                else "AUX <3 A / 20A ≥3 A (고전류 출력 시간 제한은 본체 설명서 참조)")
+
+    def high_current(self, amps):
+        return abs(amps) > 3.1 if self.model == "5560A" else abs(amps) >= 3.0
+
+    def lcomp_allowed(self, amps, hz):
+        if self.model == "5560A" or hz <= 0:
+            return False
+        return hz < (65 if self.model == "5080A" else (440 if abs(amps) < .33 else 1000))
+
+    @staticmethod
+    def output_values(command):
+        """Parse the V/A/Hz/ohm OUT subset used by this application, in SI units."""
+        values = {}
+        scales = {"UV": ("V", 1e-6), "MV": ("V", .001), "V": ("V", 1), "KV": ("V", 1000),
+                  "UA": ("A", 1e-6), "MA": ("A", .001), "A": ("A", 1),
+                  "HZ": ("HZ", 1), "KHZ": ("HZ", 1000), "MHZ": ("HZ", 1e6),
+                  "OHM": ("OHM", 1), "KOHM": ("OHM", 1e3),
+                  "MOHM": ("OHM", 1e6), "GOHM": ("OHM", 1e9)}
+        for arg in command.split(None, 1)[1].split(","):
+            m = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)\s*([A-Z]+)\s*", arg, re.I)
+            if not m or m[2].upper() not in scales:
+                raise ValueError("OUT은 전압(V), 전류(A), 주파수(HZ), 저항(OHM)과 단위를 명시하세요.")
+            unit, scale = scales[m[2].upper()]
+            value = float(m[1]) * scale
+            if not math.isfinite(value) or unit in values:
+                raise ValueError("OUT의 수치 또는 중복 단위를 확인하세요.")
+            values[unit] = value
+        if "OHM" in values:
+            if len(values) != 1:
+                raise ValueError("저항 OUT에는 다른 출력값을 함께 지정할 수 없습니다.")
+        elif not (set(values) in ({"V", "HZ"}, {"A", "HZ"}, {"V", "A", "HZ"}, {"V"}, {"A"}, {"V", "A"}, {"HZ"})):
+            raise ValueError("지원하는 OUT 조합은 전압·전류·주파수 또는 저항입니다.")
+        return values
+
+    def validate_command(self, command):
+        parts = [p.strip().upper() for p in command.split(";") if p.strip()]
+        out_parts = [p for p in parts if re.match(r"^OUT(?:\s|$)", p)]
+        if len(out_parts) > 1:
+            raise ValueError("한 번에 OUT 한 개만 전송하세요.")
+        values = self.output_values(out_parts[0]) if out_parts else {}
+        if abs(values.get("V", 0)) > 1020:
+            raise ValueError(f"{self.model}: 최대 전압 1020 V를 초과합니다.")
+        if abs(values.get("A", 0)) > self.max_current:
+            raise ValueError(f"{self.model}: 코일 환산 후 실제 전류가 최대 {self.max_current:g} A를 초과합니다.")
+        if values.get("HZ", 0) < 0:
+            raise ValueError("주파수는 0 이상이어야 합니다.")
+        if values.get("HZ", 0) > 0 and any(values.get(u, 1) <= 0 for u in ("V", "A")):
+            raise ValueError("AC 전압·전류는 양수여야 합니다. 위상은 PHASE/DPF로 설정하세요.")
+        ohms = values.get("OHM")
+        if ohms is not None:
+            if not 0 <= ohms <= self.max_resistance:
+                raise ValueError(f"{self.model}: 저항 범위 0~{self.max_resistance / 1e6:g} MΩ를 벗어났습니다.")
+            if self.model == "5080A" and not any(math.isclose(ohms, r, rel_tol=1e-10, abs_tol=1e-12) for r in RESISTORS_5080A):
+                raise ValueError("5080A는 고정 저항만 출력합니다: 0, 1/1.9/10/19/100/190 Ω, "
+                                 "1/1.9/10/19/100/190 kΩ, 1/1.9/10/19/100/190 MΩ. 자동 반올림하지 않습니다.")
+        for part in parts:
+            if part.startswith("CUR_POST "):
+                post = part.split()[-1]
+                if self.model == "5560A":
+                    raise ValueError("5560A의 단자는 전류에 따라 자동 선택됩니다. CUR_POST 설정은 지원하지 않습니다.")
+                if post not in ("AUX", "A20"):
+                    raise ValueError("전류 단자는 AUX 또는 A20이어야 합니다.")
+                if post == "AUX" and self.high_current(values.get("A", 0)):
+                    raise ValueError(f"{self.model}: 3 A 이상은 A20 단자를 사용해야 합니다.")
+            if part.startswith("LCOMP "):
+                if self.model == "5560A":
+                    raise ValueError("5560A는 단독 턴코일용 LCOMP 명령을 지원하지 않습니다.")
+                if part not in ("LCOMP ON", "LCOMP OFF"):
+                    raise ValueError("LCOMP는 ON/OFF를 사용하세요.")
+                if part == "LCOMP ON" and values and not self.lcomp_allowed(values.get("A", 0), values.get("HZ", 0)):
+                    raise ValueError(f"{self.model}: 이 전류·주파수에서는 LCOMP ON을 지원하지 않습니다.")
+            if part.startswith("ZCOMP ") and ohms is not None and part != "ZCOMP NONE":
+                limit = 1e6 if self.model == "5080A" else (110000 if self.model != "5560A" else None)
+                if limit is not None and ohms >= limit:
+                    raise ValueError(f"{self.model}: 이 저항값에서는 ZCOMP NONE을 사용하세요.")
+        return command
+
+    def prepare_generated(self, command, use_coil=False):
+        parts = [p.strip() for p in command.split(";")]
+        out = next((p for p in parts if p.upper().startswith("OUT ")), None)
+        if out is None:
+            return self.validate_command(command)
+        values = self.output_values(out)
+        if "A" in values and self.model != "5560A":
+            if not any(p.upper().startswith("CUR_POST ") for p in parts):
+                parts.append("CUR_POST A20" if self.high_current(values["A"]) else "CUR_POST AUX")
+            if values.get("HZ", 0) > 0:
+                enabled = use_coil and self.lcomp_allowed(values["A"], values["HZ"])
+                parts.append("LCOMP ON" if enabled else "LCOMP OFF")
+        if "OHM" in values:
+            limit = 1e6 if self.model == "5080A" else (110000 if self.model != "5560A" else None)
+            if limit is not None and values["OHM"] >= limit:
+                parts = ["ZCOMP NONE" if p.upper().startswith("ZCOMP ") else p for p in parts]
+        return self.validate_command("; ".join(parts))
+
+
+RESISTORS_5080A = (0,) + tuple(v * scale for scale in (1, 1000, 1000000) for v in (1, 1.9, 10, 19, 100, 190))
+MODEL_PROFILES = {
+    "5560A": CalibratorProfile("5560A", ("LAN", "USB", "RS232", "GPIB"), 30),
+    "5522A": CalibratorProfile("5522A", ("RS232", "GPIB"), 20.5),
+    "5520A": CalibratorProfile("5520A", ("RS232", "GPIB"), 20.5),
+    "5080A": CalibratorProfile("5080A", ("LAN", "RS232"), 20.5, 190e6),
+}
+
+
+class CalibratorCommandBuilder:
+    """Model-specific facade; preserve original builders for external callers."""
+    def __init__(self, model="5560A"):
+        self.profile = MODEL_PROFILES[model]
+
+    def _build(self, method, *args, **kwargs):
+        # UI/parser pass keyword arguments, so coil intent remains explicit.
+        result = getattr(Fluke5560ACommandBuilder, method)(*args, **kwargs)
+        coil = kwargs.get("use_coil", False)
+        if isinstance(result, dict):
+            result = dict(result)
+            result["cmd"] = self.profile.prepare_generated(result["cmd"], coil)
+            return result
+        return (self.profile.prepare_generated(result[0], coil),) + result[1:]
+
+    def build_voltage_cmd(self, **kwargs):
+        return self._build("build_voltage_cmd", **kwargs)
+
+    def build_current_cmd(self, **kwargs):
+        return self._build("build_current_cmd", **kwargs)
+
+    def build_resistance_cmd(self, **kwargs):
+        return self._build("build_resistance_cmd", **kwargs)
+
+    def build_power_cmd(self, **kwargs):
+        return self._build("build_power_cmd", **kwargs)
+
+

@@ -1,0 +1,10 @@
+test_device_error_stops_rows_but_keeps_confirmed_standby (test_gui_async.AsyncGuiTests.test_device_error_stops_rows_but_keeps_confirmed_standby) ... ok
+test_pause_prevents_scheduling_next_row_after_late_reply (test_gui_async.AsyncGuiTests.test_pause_prevents_scheduling_next_row_after_late_reply) ... ok
+test_slow_sequence_keeps_gui_responsive_and_waits_before_next_row (test_gui_async.AsyncGuiTests.test_slow_sequence_keeps_gui_responsive_and_waits_before_next_row) ... ok
+test_standby_button_interrupts_pending_output_without_replay (test_gui_async.AsyncGuiTests.test_standby_button_interrupts_pending_output_without_replay) ... ok
+test_timeout_marks_failed_row_and_does_not_execute_next (test_gui_async.AsyncGuiTests.test_timeout_marks_failed_row_and_does_not_execute_next) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 32.038s
+
+OK

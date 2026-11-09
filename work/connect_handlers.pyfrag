@@ -1,0 +1,33 @@
+        def _on_connect_clicked(self):
+            try:
+                args = self._connection_arguments()
+                def connect():
+                    info = self.conn_mgr.scan_and_auto_connect(**args)
+                    state = self.conn_mgr.query("OPER?").strip()
+                    if state not in ("0", "1"):
+                        self.conn_mgr.disconnect(standby=False)
+                        raise InstrumentProtocolError(f"출력 상태 응답이 올바르지 않습니다: {state}")
+                    return info, state == "1"
+                def done(result):
+                    info, self.is_operating = result
+                    self._update_connection_ui(info)
+                    self._refresh_oper_badge()
+                    self._log(f"[연결 성공] {info.interface_type} | {info.idn_string} | PC 원본 IP: {self.conn_mgr.source_ip}")
+                self._start_io("장비 연결 및 식별 확인 중…", connect, done)
+            except Exception as exc:
+                messagebox.showerror("입력 확인", str(exc))
+
+        def _on_sim_connect_clicked(self):
+            if self._io_busy:
+                return
+            self.var_conn_mode.set("SIMULATION")
+            self._on_connect_clicked()
+
+        def _on_disconnect_clicked(self):
+            def done(_value):
+                self.is_operating = None
+                self._update_connection_ui(self.conn_mgr.info)
+                self._refresh_oper_badge()
+                self._log("[연결 해제] 연결을 종료했습니다.")
+            self._start_io("STBY 확인 후 연결 해제 중…", self.conn_mgr.disconnect, done)
+

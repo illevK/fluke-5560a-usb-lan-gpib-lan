@@ -1,0 +1,22 @@
+test_gpib_honors_address_and_never_sends_serial_remote (__main__.AdapterAndVisaTests.test_gpib_honors_address_and_never_sends_serial_remote) ... ok
+test_padded_ip_and_invalid_addresses (__main__.AdapterAndVisaTests.test_padded_ip_and_invalid_addresses) ... ok
+test_source_binding_uses_real_mask_and_rejects_down_adapter (__main__.AdapterAndVisaTests.test_source_binding_uses_real_mask_and_rejects_down_adapter) ... ok
+test_usb_failure_closes_each_handle_and_reports_error (__main__.AdapterAndVisaTests.test_usb_failure_closes_each_handle_and_reports_error) ... ok
+test_command_ack_and_error_queue (__main__.TransportTests.test_command_ack_and_error_queue) ... ok
+test_connect_fragmented_identity_then_repeated_queries (__main__.TransportTests.test_connect_fragmented_identity_then_repeated_queries) ... ok
+test_cr_lf_and_crlf_replies (__main__.TransportTests.test_cr_lf_and_crlf_replies) ... ok
+test_echo_prompt_and_delayed_line_termination (__main__.TransportTests.test_echo_prompt_and_delayed_line_termination) ... ok
+test_eof_and_partial_response_never_report_success (__main__.TransportTests.test_eof_and_partial_response_never_report_success) ... ok
+test_graceful_disconnect_and_reconnect (__main__.TransportTests.test_graceful_disconnect_and_reconnect) ... ok
+test_incremental_telnet_negotiation_and_subnegotiation (__main__.TransportTests.test_incremental_telnet_negotiation_and_subnegotiation) ... ok
+test_open_port_without_response_is_not_connected (__main__.TransportTests.test_open_port_without_response_is_not_connected) ... ok
+test_parallel_queries_remain_serialized (__main__.TransportTests.test_parallel_queries_remain_serialized) ... ok
+test_readonly_diagnosis_sends_only_identity (__main__.TransportTests.test_readonly_diagnosis_sends_only_identity) ... ok
+test_terminal_mode_changes_only_after_verified_identity (__main__.TransportTests.test_terminal_mode_changes_only_after_verified_identity) ... ok
+test_timeout_drops_session_to_prevent_stale_response (__main__.TransportTests.test_timeout_drops_session_to_prevent_stale_response) ... ok
+test_wrong_fluke_model_cannot_connect_or_receive_control (__main__.TransportTests.test_wrong_fluke_model_cannot_connect_or_receive_control) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 8.918s
+
+OK

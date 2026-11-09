@@ -1,0 +1,217 @@
+        _DUT_SEQUENCE_QUANTITIES = {
+            "ACV": ("voltage", "V"), "DCV": ("dc_voltage", "V"),
+            "ACI": ("current", "A"), "DCI": ("dc_current", "A"),
+            "ACP": ("power", "W"), "DCP": ("power", "W"), "PF": ("pf", ""),
+        }
+
+        def _sequence_dut_reserved(self):
+            return self._seq_dut_run or self._seq_dut_pending is not None
+
+        def _sequence_dut_enabled(self):
+            return (self.var_seq_dut_capture.get() and self.dut_session.connected
+                    and not self.dut_session.simulated
+                    and not self.conn_mgr.info.interface_type.startswith("SIMULATION"))
+
+        def _sequence_dut_failure(self, index, step, exc):
+            self._on_seq_stop_auto(silent=True)
+            self.seq_paused_idx = index
+            self._seq_dut_resume_required = True
+            step.status = "⚠ DUT 기록 실패"
+            if index < len(self.seq_steps) and self.seq_steps[index] is step:
+                self.excel_grid._update_single_row_visual(index, step, is_active=False)
+            self.var_active_row_banner.set(f"#{step.step_no}행 DUT 기록 중단 · {exc}")
+            self.lbl_active_row_banner.configure(bg="#FECACA", fg="#991B1B")
+            self._log(f"[#{step.step_no}행 DUT 기록 중단] {exc}")
+            if self.conn_mgr.info.connected and self.is_operating is not False:
+                self._on_stby_clicked()
+
+        def _execute_sequence_step(self, index, on_complete=None, *, dwell_ms=None):
+            if self._seq_dut_pending is not None or not (0 <= index < len(self.seq_steps)):
+                return False
+            step = self.seq_steps[index]
+            try:
+                if not self._step_in_current_group(step):
+                    self._log(f"[#{index + 1}행 제외] 현재 그룹: {self._current_group_label()}")
+                    return False
+            except ValueError as exc:
+                self._show_report("전류 그룹 확인", str(exc))
+                return False
+            if not self._ensure_connected_or_sim():
+                return False
+            if not step.scpi_cmd or step.func_type == "ERROR":
+                self._show_report("행 설정 확인", f"#{step.step_no}행: {step.actual_out_desc}")
+                return False
+            self.seq_current_idx = self.seq_paused_idx = index
+
+            quantity = self._DUT_SEQUENCE_QUANTITIES.get(step.func_type)
+            linked = quantity is not None and (
+                self._seq_dut_run if self.seq_running else self._sequence_dut_enabled()
+            )
+            token = None
+            if linked:
+                try:
+                    if not self.dut_session.connected or self.dut_session.simulated:
+                        raise ConnectionError("DUT 연결을 확인하고 같은 행부터 재개하세요.")
+                    if not self.dut_session.supports_fresh_capture:
+                        raise ValueError("이 DUT는 자동 기록을 지원하지 않습니다. 직접 측정하려면 DUT 자동 기록을 끄세요.")
+                    if self._dut_busy:
+                        raise RuntimeError("진행 중인 DUT 조회가 끝난 뒤 다시 시작하세요.")
+                    channel = int(self.var_dut_channel.get())
+                    if not 1 <= channel <= self.dut_session.profile.channels:
+                        raise ValueError("DUT 입력 채널을 확인하세요.")
+                    if dwell_ms is None:
+                        dwell = float(self.var_seq_dwell_sec.get())
+                        if not .2 <= dwell <= 86_400:
+                            raise ValueError("유지시간은 0.2~86400초 사이여야 합니다.")
+                        dwell_ms = int(dwell * 1000)
+                    MeasurementResolution.validate(step.resolution_raw, step.nominal_raw, step.func_type)
+                except (ValueError, ConnectionError, RuntimeError, OverflowError) as exc:
+                    self._sequence_dut_failure(index, step, exc)
+                    return False
+                identity = self.dut_session.identity
+                calibrator = self.conn_mgr.info
+                token = object()
+                self._seq_dut_pending = token
+                self._dut_sync_controls()
+
+            step.status = "… 출력 안정화 대기"
+            self.excel_grid._update_single_row_visual(index, step, is_active=True)
+            self.excel_grid.scroll_to_row(index)
+            self.var_active_row_banner.set(f"#{step.step_no}행 완료 응답 대기: {step.scpi_cmd}")
+            self.lbl_active_row_banner.configure(bg="#FEF3C7", fg="#92400E")
+            self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={step.scpi_cmd}")
+
+            def same_step():
+                return index < len(self.seq_steps) and self.seq_steps[index] is step
+
+            def current_capture():
+                return self._seq_dut_pending is token and same_step()
+
+            def publish_progress():
+                plan = self._seq_active_indices
+                self.progress_var.set((plan.index(index) + 1) / len(plan) * 100 if index in plan else 100)
+
+            def failed(exc):
+                if linked:
+                    if current_capture():
+                        self._sequence_dut_failure(index, step, exc)
+                    return
+                self.seq_running = False
+                self.seq_after_id = None
+                self._seq_dut_run = False
+                self._dut_sync_controls()
+                step.status = "⚠ 오류"
+                if same_step():
+                    self.excel_grid._update_single_row_visual(index, step, is_active=False)
+                self.var_active_row_banner.set(f"#{step.step_no}행 중단 — {step.scpi_cmd} / 출력 상태는 상단과 본체에서 확인하세요.")
+                self.lbl_active_row_banner.configure(bg="#FECACA", fg="#991B1B")
+                self._log(f"[#{step.step_no}행 실행 오류] 명령={step.scpi_cmd} | {exc}")
+
+            def record_after_oper_check(sample, error):
+                if not current_capture():
+                    return
+                if error:
+                    failed(error)
+                    return
+                if (sample is None or sample.simulated or sample.identity != identity or sample.channel != channel
+                        or self.conn_mgr.info is not calibrator or not self.dut_session.connected):
+                    failed("출력 또는 DUT 연결 상태가 변경됐습니다.")
+                    return
+                metric, unit = quantity
+                if sample.vi_modes and metric in ("voltage", "current"):
+                    mode = sample.vi_modes[0 if metric == "voltage" else 1]
+                    if mode != "RMS":
+                        failed("WT3000 계열의 해당 입력 측정 모드를 RMS로 설정하세요.")
+                        return
+                value = sample.values.get(metric)
+                if value is None or not math.isfinite(value):
+                    detail = ("해당 입력의 DC 측정 모드를 확인하세요." if metric.startswith("dc_")
+                              else "DUT 입력 범위와 배선을 확인하세요.")
+                    failed(f"유효한 DUT 측정값이 없습니다. {detail}")
+                    return
+                raw = f"{value:.16g}{' ' + unit if unit else ''}"
+
+                def record(state):
+                    if not current_capture():
+                        return
+                    if state not in ("0", "1"):
+                        failed(f"교정기 출력 상태 확인 실패: {state}")
+                        return
+                    self.is_operating = state == "1"
+                    self._refresh_oper_badge()
+                    if not self.is_operating or self.conn_mgr.info is not calibrator:
+                        failed("교정기의 OPER 상태를 확인하세요.")
+                        return
+                    try:
+                        MeasurementResolution.format_value(raw, step.resolution_raw, step.nominal_raw, step.func_type)
+                    except ValueError as exc:
+                        failed(exc)
+                        return
+                    step.measured_raw = raw
+                    self.excel_grid._refresh_resolution_value(index, force=True)
+                    step.status = "✓ 완료 · DUT"
+                    self.excel_grid._update_single_row_visual(index, step, is_active=True)
+                    publish_progress()
+                    self.var_active_row_banner.set(f"#{step.step_no}행 DUT 자동 기록 · CH{channel} · {raw}")
+                    self._log(f"[#{step.step_no}행 DUT 자동 기록] CH{channel} {raw}")
+                    self._seq_dut_pending = None
+                    self._seq_dut_resume_required = False
+                    self._dut_sync_controls()
+                    if on_complete:
+                        on_complete()
+
+                if not self._start_io(f"#{step.step_no}행 DUT 수신 후 OPER 상태 확인…",
+                                      lambda: self.conn_mgr.query("OPER?").strip(), record,
+                                      on_error=failed, stop_sequence=False):
+                    failed("교정기 출력 상태 확인을 시작할 수 없습니다.")
+
+            def capture_after_dwell():
+                self.seq_after_id = None
+                if not current_capture():
+                    return
+                if (self.is_operating is not True or self.conn_mgr.info is not calibrator
+                        or not self.dut_session.connected or self.dut_session.identity != identity):
+                    failed("교정기 출력 또는 DUT 연결을 확인하세요.")
+                    return
+                step.status = "… DUT 새 측정값 대기"
+                self.excel_grid._update_single_row_visual(index, step, is_active=True)
+                self.var_active_row_banner.set(f"#{step.step_no}행 DUT 새 측정값 대기 · CH{channel}")
+                include_dc = step.func_type in ("DCV", "DCI", "DCP")
+                if not self._dut_start("sequence_read", (channel, include_dc, record_after_oper_check)):
+                    failed("DUT 조회를 시작할 수 없습니다.")
+
+            def done(state):
+                if linked and not current_capture():
+                    return
+                if not same_step():
+                    self.seq_running = False
+                    return
+                for i, previous in enumerate(self.seq_steps):
+                    if i != index and previous.status == "▶ 측정 진행 중":
+                        previous.status = "✓ 완료"
+                        self.excel_grid._update_single_row_visual(i, previous, is_active=False)
+                if linked and not state:
+                    failed("교정기의 OPER 상태를 확인하세요.")
+                    return
+                step.status = "… 유지시간 대기" if linked else "▶ 측정 진행 중"
+                self.var_active_row_banner.set(f"[#{step.step_no}/{len(self.seq_steps)}행 출력 확인] {step.nominal_raw} → {step.actual_out_desc}")
+                self.lbl_active_row_banner.configure(bg="#DBEAFE", fg="#0F172A")
+                self.excel_grid._update_single_row_visual(index, step, is_active=True)
+                self._log(f"[#{step.step_no}행 완료 응답 확인] 유지시간 시작")
+                if linked:
+                    self.seq_after_id = self.after(dwell_ms, capture_after_dwell)
+                else:
+                    publish_progress()
+                    if on_complete:
+                        on_complete()
+
+            try:
+                started = self._send_and_log(step.scpi_cmd, auto_oper=self.var_seq_auto_oper.get(),
+                                             on_done=done, on_error=failed, stop_sequence=False)
+                if linked and not started:
+                    failed("교정기 출력 요청을 시작할 수 없습니다.")
+                return started
+            except Exception as exc:
+                failed(exc)
+                return False
+

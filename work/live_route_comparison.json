@@ -1,0 +1,38 @@
+[
+  {
+    "source_requested": null,
+    "error": "[WinError 10051] 연결할 수 없는 네트워크에서 소켓 작업을 시도했습니다"
+  },
+  {
+    "source_requested": [
+      "192.168.100.100",
+      0
+    ],
+    "source_actual": "192.168.100.100",
+    "idn": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+    "queries": {
+      "SUBNETMASK?": [
+        "255.255.0.0"
+      ],
+      "GWADDR?": [
+        "0.0.0.0"
+      ],
+      "ENETPORT?": [
+        "3490"
+      ],
+      "COMM_MODE? TELNET": [
+        "COMP"
+      ],
+      "EOLSTR? TELNET": [
+        "CRLF"
+      ],
+      "OPER?": [
+        "0"
+      ],
+      "ERR?": [
+        "8012,\"Zero adjustment is required every 14 days\"",
+        "-102,\"Syntax error\""
+      ]
+    }
+  }
+]

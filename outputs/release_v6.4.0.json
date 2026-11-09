@@ -1,0 +1,12 @@
+{
+  "version": "6.4.0",
+  "desktop_executable": "C:/Users/HCT-2714/Desktop/Fluke 교정기.exe",
+  "exe_sha256": "959C08B05FCD6244557B9313CF7681E235B18EBE2B34C6ECB6E45A789F53A428",
+  "source_sha256": "D1250737E9C641E937E4482798DBA1EABBE65223E44FB4A17FC8BD1D344FFA2F",
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\desktop_before_v6.4.0.exe",
+  "regression_tests": "100 passed",
+  "visa_ownership_tests": "6 passed",
+  "layout_check": "1280x900 and 1060x740; DUT collapsed and expanded",
+  "standalone_check": "passed; no console window; no instrument opened",
+  "hardware_tested": false
+}

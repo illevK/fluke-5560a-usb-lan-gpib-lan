@@ -1,0 +1,13 @@
+{
+  "version": "6.8.0",
+  "executable": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "9EB29426799281D06D2ED8589FA4BB5E57F0E4EFFDDE401291E76CA92BEC4FBB",
+  "source_sha256": "DCE2CFC8863F0AB537CFD1635C0A74268364115AA6B485CD061451046570D002",
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\desktop_before_v6.8.0.exe",
+  "dut_regression_tests": "35 passed on release source",
+  "standalone_check": "passed; no console; automatic DUT search trigger; no instrument commands",
+  "prior_hardware_test": "WT310E USB identification and manual numeric read succeeded on 2026-11-06",
+  "hardware_tested_on_release": false,
+  "desktop_replaced": true,
+  "desktop_executable": "C:\\Users\\HCT-2714\\Desktop\\Fluke 교정기.exe"
+}

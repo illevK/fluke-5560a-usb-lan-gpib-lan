@@ -1,0 +1,38 @@
+{
+  "connection": {
+    "connected": true,
+    "interface_type": "LAN (Ethernet Socket)",
+    "resource_name": "TCPIP::169.254.1.1::3490::SOCKET",
+    "idn_string": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+    "discovered_ip": "169.254.1.1",
+    "discovered_port": 3490
+  },
+  "source_ip": "192.168.100.100",
+  "queries": {
+    "*IDN?": [
+      "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+      "FLUKE,5560A,7165657,v4.00.07+v4.26.0001"
+    ],
+    "OPER?": [
+      "0"
+    ],
+    "IPADDR?": [
+      "169.254.1.1"
+    ],
+    "SUBNETMASK?": [
+      "255.255.0.0"
+    ],
+    "ENETPORT?": [
+      "3490"
+    ],
+    "COMM_MODE? TELNET": [
+      "COMP"
+    ],
+    "EOLSTR? TELNET": [
+      "CRLF"
+    ],
+    "ERR?": [
+      "0,\"No Error\""
+    ]
+  }
+}

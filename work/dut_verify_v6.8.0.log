@@ -1,0 +1,48 @@
+test_auto_refresh_failure_stops_and_removes_old_values (work.test_dut.DUTGuiTests.test_auto_refresh_failure_stops_and_removes_old_values) ... ok
+test_copy_header_and_row_to_bottom_preserve_blanks (work.test_dut.DUTGuiTests.test_copy_header_and_row_to_bottom_preserve_blanks) ... ok
+test_demo_reads_and_preserves_calibrator_and_measurement_table (work.test_dut.DUTGuiTests.test_demo_reads_and_preserves_calibrator_and_measurement_table) ... ok
+test_disconnect_during_worker_discards_late_sample (work.test_dut.DUTGuiTests.test_disconnect_during_worker_discards_late_sample) ... ok
+test_dut_cannot_open_the_connected_calibrator_endpoint (work.test_dut.DUTGuiTests.test_dut_cannot_open_the_connected_calibrator_endpoint) ... ok
+test_app_close_stops_calibrator_sequence_before_waiting_for_dut (work.test_dut.DUTProtocolTests.test_app_close_stops_calibrator_sequence_before_waiting_for_dut) ... ok
+test_bad_channel_sends_no_commands (work.test_dut.DUTProtocolTests.test_bad_channel_sends_no_commands) ... ok
+test_cancellation_does_not_retry (work.test_dut.DUTProtocolTests.test_cancellation_does_not_retry) ... ok
+test_identification_rejects_other_devices_before_configuration (work.test_dut.DUTProtocolTests.test_identification_rejects_other_devices_before_configuration) ... ok
+test_invalid_values_and_record_length (work.test_dut.DUTProtocolTests.test_invalid_values_and_record_length) ... ok
+test_mapping_failure_and_timeout_close_stream_and_clear_sample (work.test_dut.DUTProtocolTests.test_mapping_failure_and_timeout_close_stream_and_clear_sample) ... ok
+test_n4l_data_positions_are_not_confused_with_fundamentals (work.test_dut.DUTProtocolTests.test_n4l_data_positions_are_not_confused_with_fundamentals) ... ok
+test_ppa_linked_read_waits_for_new_data_without_trigger (work.test_dut.DUTProtocolTests.test_ppa_linked_read_waits_for_new_data_without_trigger) ... ok
+test_requested_and_related_model_identification (work.test_dut.DUTProtocolTests.test_requested_and_related_model_identification) ... ok
+test_serial_configuration_and_no_telnet_negotiation (work.test_dut.DUTProtocolTests.test_serial_configuration_and_no_telnet_negotiation) ... ok
+test_settings_and_demo_cannot_open_any_resource (work.test_dut.DUTProtocolTests.test_settings_and_demo_cannot_open_any_resource) ... ok
+test_tcp_fragmented_crlf_and_consecutive_queries (work.test_dut.DUTProtocolTests.test_tcp_fragmented_crlf_and_consecutive_queries) ... ok
+test_visa_vxi11_and_cleanup_on_failed_configuration (work.test_dut.DUTProtocolTests.test_visa_vxi11_and_cleanup_on_failed_configuration) ... ok
+test_wt3000_family_idn_suffixes_and_element_counts (work.test_dut.DUTProtocolTests.test_wt3000_family_idn_suffixes_and_element_counts) ... ok
+test_wt3000_reads_selected_element_modes_and_checks_total_order (work.test_dut.DUTProtocolTests.test_wt3000_reads_selected_element_modes_and_checks_total_order) ... ok
+test_wt3000_signed_dc_only_when_element_mode_is_dc (work.test_dut.DUTProtocolTests.test_wt3000_signed_dc_only_when_element_mode_is_dc) ... ok
+test_wt5000_seventh_element_uses_modern_rms_items (work.test_dut.DUTProtocolTests.test_wt5000_seventh_element_uses_modern_rms_items) ... ok
+test_wt5000_socket_uses_fixed_port_and_lf_and_rejects_other_models (work.test_dut.DUTProtocolTests.test_wt5000_socket_uses_fixed_port_and_lf_and_rejects_other_models) ... ok
+test_wt_linked_read_discards_old_event_and_keeps_signed_dc (work.test_dut.DUTProtocolTests.test_wt_linked_read_discards_old_event_and_keeps_signed_dc) ... ok
+test_wt_linked_read_refuses_held_data (work.test_dut.DUTProtocolTests.test_wt_linked_read_refuses_held_data) ... ok
+test_wt_mapping_readback_and_values (work.test_dut.DUTProtocolTests.test_wt_mapping_readback_and_values) ... ok
+test_only_verified_usb_or_lan_candidates_are_returned (work.test_dut_discovery.DiscoveryTests.test_only_verified_usb_or_lan_candidates_are_returned) ... ok
+test_vxi11_port_reply_checks_transaction_and_tcp_port (work.test_dut_discovery.DiscoveryTests.test_vxi11_port_reply_checks_transaction_and_tcp_port) ... ok
+test_first_dut_tab_visit_searches_and_connects_only_candidate (work.test_dut_discovery.DiscoveryUiTests.test_first_dut_tab_visit_searches_and_connects_only_candidate) ... ok
+test_multiple_devices_require_selection_then_recheck_identity (work.test_dut_discovery.DiscoveryUiTests.test_multiple_devices_require_selection_then_recheck_identity) ... ok
+test_dut_sequence (unittest.loader._FailedTest.test_dut_sequence) ... ERROR
+
+======================================================================
+ERROR: test_dut_sequence (unittest.loader._FailedTest.test_dut_sequence)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_dut_sequence
+Traceback (most recent call last):
+  File "C:\Users\HCT-2714\AppData\Local\Programs\Python\Python314\Lib\unittest\loader.py", line 137, in loadTestsFromName
+    module = __import__(module_name)
+  File "C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\test_dut_sequence.py", line 12, in <module>
+    import test_communications as local
+ModuleNotFoundError: No module named 'test_communications'
+
+
+----------------------------------------------------------------------
+Ran 31 tests in 45.370s
+
+FAILED (errors=1)

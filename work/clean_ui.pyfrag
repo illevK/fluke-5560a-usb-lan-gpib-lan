@@ -1,0 +1,412 @@
+        def _setup_styles(self):
+            style = ttk.Style(self)
+            try:
+                style.theme_use("clam")
+            except tk.TclError:
+                pass
+            self.option_add("*Font", ("Malgun Gothic", 9))
+            style.configure("TFrame", background="#F5F7FA")
+            style.configure("Card.TFrame", background="white", borderwidth=0)
+            style.configure("TLabel", background="white", foreground="#334155", font=("Malgun Gothic", 9))
+            style.configure("SubHeader.TLabel", background="white", foreground="#0F172A", font=("Malgun Gothic", 11, "bold"))
+            style.configure("TButton", font=("Malgun Gothic", 9), padding=(10, 5), background="#FFFFFF", foreground="#334155", bordercolor="#CBD5E1")
+            style.map("TButton", background=[("active", "#F1F5F9")], foreground=[("disabled", "#94A3B8")])
+            style.configure("Primary.TButton", background="#2563EB", foreground="white", bordercolor="#2563EB")
+            style.map("Primary.TButton", background=[("disabled", "#CBD5E1"), ("active", "#1D4ED8")], foreground=[("disabled", "#64748B"), ("!disabled", "white")])
+            style.configure("Stop.TButton", background="#B91C1C", foreground="white", bordercolor="#B91C1C")
+            style.map("Stop.TButton", background=[("active", "#991B1B")], foreground=[("!disabled", "white")])
+            style.configure("TCheckbutton", background="white", foreground="#334155", font=("Malgun Gothic", 9))
+            style.map("TCheckbutton", background=[("active", "white")])
+            style.configure("TEntry", padding=4)
+            style.configure("TCombobox", padding=4)
+            style.configure("TNotebook", background="#F5F7FA", borderwidth=0)
+            style.configure("TNotebook.Tab", padding=(22, 9), background="#F5F7FA", foreground="#64748B", font=("Malgun Gothic", 10))
+            style.map("TNotebook.Tab", background=[("selected", "white")], foreground=[("selected", "#1D4ED8")])
+            style.configure("Horizontal.TProgressbar", troughcolor="#E2E8F0", background="#2563EB", borderwidth=0, thickness=5)
+
+        def _build_ui(self):
+            self.configure(bg="#F5F7FA")
+            width = min(1280, max(1060, self.winfo_screenwidth() - 80))
+            height = min(900, max(740, self.winfo_screenheight() - 100))
+            self.geometry(f"{width}x{height}")
+            self.minsize(1060, 740)
+            header = tk.Frame(self, bg="#F5F7FA", padx=20, pady=12)
+            header.pack(fill="x")
+            tk.Label(header, text="Fluke Controller", bg="#F5F7FA", fg="#0F172A",
+                     font=("Segoe UI", 18, "bold")).pack(side="left")
+            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.1.0", bg="#F5F7FA",
+                     fg="#64748B", font=("Segoe UI", 9)).pack(side="left", padx=16)
+            self.lbl_conn_badge = tk.Label(header, text="연결 안 됨", bg="#E2E8F0", fg="#64748B", padx=12, pady=5)
+            self.lbl_conn_badge.pack(side="right")
+            self._build_connection_panel()
+            self._build_safety_bar()
+            # Reserve the footer before the expanding work area.
+            self._build_console_panel()
+            self.notebook = ttk.Notebook(self)
+            self.notebook.pack(fill="both", expand=True, padx=16, pady=(8, 8))
+            for name, title in (("sequence", "측정표"), ("voltage", "전압"), ("current", "전류"),
+                                ("resistance", "저항"), ("power", "전력")):
+                tab = ttk.Frame(self.notebook, style="Card.TFrame")
+                setattr(self, "tab_" + name, tab)
+                self.notebook.add(tab, text=title)
+                getattr(self, "_build_" + name + "_tab")()
+            self._polish_manual_tabs()
+            self._sync_model_controls()
+            self._sync_connection_view()
+
+            self.bind("<F8>", lambda _e: self._on_seq_step_next())
+            self.bind("<F9>", lambda _e: self._on_seq_toggle_breakpoint(self.excel_grid.selected_row_idx))
+
+        def _ui_label(self, parent, text):
+            label = ttk.Label(parent, text=text)
+            label.pack(side="left", padx=(0, 6))
+            return label
+
+        def _ui_entry(self, parent, variable, width):
+            entry = ttk.Entry(parent, textvariable=variable, width=width)
+            entry.pack(side="left", padx=(0, 12))
+            return entry
+
+        def _ui_combo(self, parent, variable, choices, width):
+            combo = ttk.Combobox(parent, textvariable=variable, values=choices, width=width, state="readonly")
+            combo.pack(side="left", padx=(0, 12))
+            return combo
+
+        def _ui_button(self, parent, text, action, style="TButton", side="left"):
+            button = ttk.Button(parent, text=text, command=action, style=style)
+            button.pack(side=side, padx=(0, 6))
+            return button
+
+        def _build_connection_panel(self):
+            card = tk.Frame(self, bg="white", padx=14, pady=10, highlightbackground="#E2E8F0", highlightthickness=1)
+            card.pack(fill="x", padx=16)
+            self._io_busy = False
+            self._pending_standby = False
+            self._io_results = queue.Queue()
+            self._last_report = ""
+            self._connection_buttons = []
+            self._configured_model = "5560A"
+            for name, value in (("model", "5560A"), ("conn_mode", "LAN"), ("lan_ip", "169.254.1.1"),
+                                ("lan_port", "3490"), ("gpib_addr", "1"), ("timeout", "3"),
+                                ("operation_timeout", "60"), ("eol", "CRLF"), ("visa_resource", ""),
+                                ("adapter_choice", ""), ("serial_port", ""), ("baudrate", "9600"),
+                                ("data_bits", "8"), ("parity", "N"), ("stop_bits", "1"),
+                                ("flow_control", "XON/XOFF"), ("model_note", "")):
+                setattr(self, "var_" + name, tk.StringVar(value=value))
+            row = tk.Frame(card, bg="white")
+            row.pack(fill="x")
+            self._ui_label(row, "모델")
+            self.combo_model = self._ui_combo(row, self.var_model, list(MODEL_PROFILES), 8)
+            self.combo_model.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
+            self._ui_label(row, "연결")
+            self.combo_conn_mode = self._ui_combo(row, self.var_conn_mode, (), 9)
+            actions = tk.Frame(row, bg="white")
+            actions.pack(side="right")
+            self.btn_connect = self._ui_button(actions, "연결", self._on_connect_clicked, "Primary.TButton")
+            self.btn_disconnect = self._ui_button(actions, "해제", self._on_disconnect_clicked)
+            self.btn_connection_details = self._ui_button(actions, "상세 설정 ▾", self._toggle_connection_details)
+            self._connection_buttons.extend((self.btn_connect, self.btn_disconnect))
+            self.connection_endpoints = {}
+            for key in ("LAN", "RS232", "GPIB", "USB", "AUTO", "SIMULATION"):
+                self.connection_endpoints[key] = tk.Frame(row, bg="white")
+            endpoint = self.connection_endpoints["LAN"]
+            self._ui_label(endpoint, "IP")
+            self._ui_entry(endpoint, self.var_lan_ip, 16)
+            self._ui_label(endpoint, "포트")
+            self._ui_entry(endpoint, self.var_lan_port, 5)
+            endpoint = self.connection_endpoints["RS232"]
+            self._ui_label(endpoint, "COM")
+            self.combo_serial_port = ttk.Combobox(endpoint, textvariable=self.var_serial_port, width=22)
+            self.combo_serial_port.pack(side="left", padx=(0, 6))
+            self._connection_buttons.append(self._ui_button(endpoint, "찾기", self._on_refresh_serial_ports))
+            endpoint = self.connection_endpoints["GPIB"]
+            self._ui_label(endpoint, "장비 주소")
+            self._ui_entry(endpoint, self.var_gpib_addr, 4)
+            self._ui_label(self.connection_endpoints["USB"], "후면 USB Device · USBTMC")
+            self._ui_label(self.connection_endpoints["AUTO"], "상세 설정의 주소·포트로 검색")
+            self._ui_label(self.connection_endpoints["SIMULATION"], "가상 장비 · 실제 출력 없음")
+
+            self.connection_details = tk.Frame(card, bg="white", pady=8)
+            self._connection_details_open = False
+            ttk.Separator(self.connection_details).pack(fill="x", pady=(2, 10))
+            common = tk.Frame(self.connection_details, bg="white")
+            common.pack(fill="x", pady=(0, 7))
+            self._ui_label(common, "조회 대기(초)")
+            self._ui_entry(common, self.var_timeout, 5)
+            self._ui_label(common, "출력 완료 대기(초)")
+            self._ui_entry(common, self.var_operation_timeout, 5)
+            self._ui_label(common, "줄 끝 문자")
+            self._ui_combo(common, self.var_eol, ("CRLF", "LF", "CR"), 7)
+            self._connection_buttons.append(self._ui_button(common, "시뮬레이션", self._on_sim_connect_clicked))
+            self._connection_buttons.append(self._ui_button(common, "진단 저장", self._on_save_report))
+            self.connection_detail_rows = {}
+            for key in ("LAN", "RS232", "VISA", "AUTO"):
+                self.connection_detail_rows[key] = tk.Frame(self.connection_details, bg="white")
+            lan = self.connection_detail_rows["LAN"]
+            self._ui_label(lan, "랜카드")
+            self.combo_adapter = self._ui_combo(lan, self.var_adapter_choice, (), 32)
+            self._connection_buttons.append(self._ui_button(lan, "새로고침", self._on_refresh_adapters))
+            self._connection_buttons.append(self._ui_button(lan, "LAN 진단", self._on_lan_diagnose))
+            serial_row = self.connection_detail_rows["RS232"]
+            self.serial_settings_controls = []
+            for title, name, values, width in (("속도", "baudrate", (9600,), 8), ("데이터", "data_bits", (7, 8), 3),
+                    ("패리티", "parity", ("N", "E", "O"), 3), ("정지", "stop_bits", (1, 2), 3),
+                    ("흐름", "flow_control", ("XON/XOFF", "NONE", "RTS/CTS"), 10)):
+                self._ui_label(serial_row, title)
+                self.serial_settings_controls.append(self._ui_combo(serial_row, getattr(self, "var_" + name), values, width))
+            visa = self.connection_detail_rows["VISA"]
+            self._ui_label(visa, "VISA 리소스 (선택)")
+            self._ui_entry(visa, self.var_visa_resource, 40)
+            self._ui_label(visa, "USB–GPIB는 GPIB, USB–RS232는 RS232 선택")
+            auto = self.connection_detail_rows["AUTO"]
+            for title, name, width in (("IP", "lan_ip", 16), ("포트", "lan_port", 5),
+                                       ("COM", "serial_port", 12), ("GPIB 주소", "gpib_addr", 4)):
+                self._ui_label(auto, title)
+                self._ui_entry(auto, getattr(self, "var_" + name), width)
+            ttk.Label(self.connection_details, textvariable=self.var_model_note, foreground="#64748B").pack(side="bottom", anchor="w", pady=(8, 0))
+            self.var_idn_display = tk.StringVar(value="모델과 연결 방식을 선택하세요.")
+            self.connection_status = tk.Label(card, textvariable=self.var_idn_display, bg="white", fg="#64748B",
+                                              anchor="w", justify="left", wraplength=1100)
+            self.connection_status.pack(fill="x", pady=(7, 0))
+            card.bind("<Configure>", lambda e: self.connection_status.configure(wraplength=max(400, e.width - 32)))
+            self._set_adapter_choices(self.adapters)
+            self.var_conn_mode.trace_add("write", lambda *_: self._sync_connection_view())
+            self._sync_model_controls()
+            self._sync_connection_view()
+            self._poll_after_id = self.after(100, self._poll_io_result)
+
+        def _sync_connection_view(self):
+            if not hasattr(self, "connection_endpoints"):
+                return
+            mode = self.var_conn_mode.get()
+            for key, frame in self.connection_endpoints.items():
+                frame.pack_forget()
+                if key == mode:
+                    frame.pack(side="left", fill="x", expand=True)
+            for key, frame in self.connection_detail_rows.items():
+                frame.pack_forget()
+                visible = key == mode or (key == "VISA" and mode in ("USB", "GPIB"))
+                if mode == "AUTO":
+                    supported = MODEL_PROFILES[self._configured_model].interfaces
+                    visible = key in ("AUTO", "RS232") or (key == "LAN" and "LAN" in supported) or (key == "VISA" and "GPIB" in supported)
+                if visible:
+                    frame.pack(fill="x", pady=4)
+
+        def _toggle_connection_details(self):
+            self._connection_details_open = not self._connection_details_open
+            if self._connection_details_open:
+                self.connection_details.pack(fill="x", before=self.connection_status)
+            else:
+                self.connection_details.pack_forget()
+            self.btn_connection_details.configure(text="상세 설정 ▴" if self._connection_details_open else "상세 설정 ▾")
+
+        def _refresh_connection_controls(self):
+            connected = self.conn_mgr.info.connected
+            locked = self._io_busy or connected
+            self.combo_model.configure(state="disabled" if locked else "readonly")
+            self.combo_conn_mode.configure(state="disabled" if locked else "readonly")
+            self.btn_connect.configure(state="disabled" if locked else "normal")
+            self.btn_disconnect.configure(state="normal" if connected and not self._io_busy else "disabled")
+
+        def _build_safety_bar(self):
+            bar = tk.Frame(self, bg="#F5F7FA", padx=2, pady=8)
+            bar.pack(fill="x", padx=16)
+            self.lbl_output_state = tk.Label(bar, text="출력 상태 미확인", bg="#E2E8F0", fg="#475569",
+                                             padx=10, pady=6, font=("Malgun Gothic", 9, "bold"))
+            self.lbl_output_state.pack(side="left", padx=(0, 10))
+            self._ui_button(bar, "출력 켜기 · OPER", self._on_oper_clicked)
+            self.btn_standby = self._ui_button(bar, "출력 끄기 · STBY", self._on_stby_clicked, "Stop.TButton")
+            self._ui_button(bar, "장비 초기화", self._on_reset_clicked, side="right")
+            self.var_active_cmd_summary = tk.StringVar(value="전송 명령 없음")
+
+        def _build_sequence_tab(self):
+            container = tk.Frame(self.tab_sequence, bg="white", padx=14, pady=12)
+            container.pack(fill="both", expand=True)
+            toolbar = tk.Frame(container, bg="white")
+            toolbar.pack(fill="x", pady=(0, 10))
+            self._ui_button(toolbar, "붙여넣기  Ctrl+V", lambda: self._on_paste_into_sheet_button(replace_all=False))
+            edit = ttk.Menubutton(toolbar, text="표 편집 ▾")
+            edit.pack(side="left", padx=(0, 12))
+            menu = tk.Menu(edit, tearoff=False)
+            menu.add_command(label="전체 새로 붙여넣기", command=lambda: self._on_paste_into_sheet_button(replace_all=True))
+            menu.add_command(label="빈 행 추가", command=self._on_add_blank_row)
+            menu.add_command(label="시트 비우기", command=self._on_clear_sheet)
+            menu.add_separator()
+            samples = tk.Menu(menu, tearoff=False)
+            for name, sample in (("AC 전력 · 63행", SAMPLE_POWER_TABLE), ("AC 전압", SAMPLE_ACV_TABLE),
+                                 ("AC 전류", SAMPLE_ACI_TABLE), ("DC 전압", SAMPLE_DCV_TABLE)):
+                samples.add_command(label=name, command=lambda value=sample: self._load_sample_into_sheet(value, silent=False))
+            menu.add_cascade(label="예제 불러오기", menu=samples)
+            edit.configure(menu=menu)
+            self.var_seq_use_coil = tk.BooleanVar(value=False)
+            ttk.Checkbutton(toolbar, text="턴코일", variable=self.var_seq_use_coil,
+                            command=self._recalculate_all_grid_steps).pack(side="left", padx=(0, 6))
+            self.var_seq_coil_turns = tk.StringVar(value="50")
+            turns = self._ui_combo(toolbar, self.var_seq_coil_turns, ("1", "2", "10", "25", "50"), 5)
+            turns.configure(state="normal")
+            turns.bind("<<ComboboxSelected>>", lambda _e: self._recalculate_all_grid_steps())
+            turns.bind("<KeyRelease>", lambda _e: self._recalculate_all_grid_steps())
+            self._ui_label(toolbar, "턴")
+            self.btn_sequence_details = self._ui_button(toolbar, "범위·그룹 설정 ▾", self._toggle_sequence_details, side="right")
+            self.var_show_measurements = tk.BooleanVar(value=True)
+            ttk.Checkbutton(toolbar, text="측정값 입력", variable=self.var_show_measurements,
+                            command=lambda: self.excel_grid.set_measurement_visibility(self.var_show_measurements.get())).pack(side="right", padx=8)
+            self.sequence_details = tk.Frame(container, bg="white", pady=8)
+            self._sequence_details_open = False
+            self.var_seq_start_row = tk.StringVar(value="1")
+            self.var_seq_stop_row = tk.StringVar(value="63")
+            self.var_seq_dwell_sec = tk.StringVar(value="3.0")
+            self.var_seq_auto_oper = tk.BooleanVar(value=True)
+            range_row = tk.Frame(self.sequence_details, bg="white")
+            range_row.pack(fill="x", pady=(0, 5))
+            self._ui_label(range_row, "실행 범위")
+            self._ui_entry(range_row, self.var_seq_start_row, 5)
+            self._ui_label(range_row, "~")
+            self._ui_entry(range_row, self.var_seq_stop_row, 5)
+            self._ui_label(range_row, "행")
+            self._ui_button(range_row, "선택 행 중단점 · F9", lambda: self._on_seq_toggle_breakpoint(self.excel_grid.selected_row_idx))
+            self.var_show_commands = tk.BooleanVar(value=False)
+            ttk.Checkbutton(range_row, text="명령어 열 표시", variable=self.var_show_commands,
+                            command=lambda: self.excel_grid.set_command_visibility(self.var_show_commands.get())).pack(side="right")
+            self._build_current_group_panel(container)
+            status = tk.Frame(container, bg="#F8FAFC", padx=10, pady=8)
+            status.pack(fill="x", pady=(4, 8))
+            self.var_active_row_banner = tk.StringVar(value="측정값을 붙여넣고 시작하세요.")
+            self.lbl_active_row_banner = tk.Label(status, textvariable=self.var_active_row_banner, bg="#F8FAFC", fg="#475569",
+                                                  anchor="w", justify="left", wraplength=1000)
+            self.lbl_active_row_banner.pack(fill="x")
+            status.bind("<Configure>", lambda e: self.lbl_active_row_banner.configure(wraplength=max(400, e.width - 24)))
+            self.progress_var = tk.DoubleVar(value=0)
+            self.progress_bar = ttk.Progressbar(status, variable=self.progress_var, maximum=100)
+            self.progress_bar.pack(fill="x", pady=(6, 0))
+            controls = tk.Frame(container, bg="white", pady=4)
+            controls.pack(side="bottom", fill="x")
+            self._ui_button(controls, "시작", self._on_seq_start_from_selected_or_range, "Primary.TButton")
+            self._ui_button(controls, "일시정지", lambda: self._on_seq_stop_auto(silent=False))
+            self._ui_button(controls, "재개", self._on_seq_resume_from_paused)
+            self._ui_label(controls, "  유지")
+            self._ui_entry(controls, self.var_seq_dwell_sec, 5)
+            self._ui_label(controls, "초")
+            ttk.Checkbutton(controls, text="자동 출력", variable=self.var_seq_auto_oper).pack(side="left", padx=6)
+            self._ui_button(controls, "선택 행 출력", self._on_seq_output_selected, side="right")
+            self._ui_button(controls, "다음 · F8", self._on_seq_step_next, side="right")
+            self._ui_button(controls, "이전", self._on_seq_step_prev, side="right")
+            self.excel_grid = ExcelSheetGrid(container,
+                on_paste_text_callback=self._handle_excel_paste_at_cell, on_cell_edited_callback=self._handle_excel_cell_edited,
+                on_row_start_callback=self._handle_row_direct_start, on_row_breakpoint_callback=self._on_seq_toggle_breakpoint,
+                on_row_select_callback=self._handle_row_selected)
+            self.excel_grid.pack(fill="both", expand=True, pady=(0, 8))
+
+        def _build_current_group_panel(self, container):
+            self._group_high_only = False
+            self._group_basis = SequenceCurrentFilter.JOB
+            self._seq_active_indices = []
+            self._original_row_positions = None
+            self.var_high_current_only = tk.BooleanVar(value=False)
+            self.var_current_group_basis = tk.StringVar(value=self._group_basis)
+            self.var_current_group_summary = tk.StringVar()
+            self.group_panel = tk.Frame(container, bg="white")
+            self.group_panel.pack(fill="x", pady=(0, 4))
+            self.chk_high_current_only = ttk.Checkbutton(self.group_panel, text="큰 전류 그룹만 실행", variable=self.var_high_current_only,
+                                                        command=self._on_current_group_changed)
+            self.chk_high_current_only.pack(side="left", padx=(0, 12))
+            self.btn_group_restore = self._ui_button(self.group_panel, "원래 순서", lambda: self._reorder_current_group_rows(restore=True), side="right")
+            self.btn_group_restore.state(["disabled"])
+            self.btn_group_sort = self._ui_button(self.group_panel, "현재 그룹 위로", self._reorder_current_group_rows, side="right")
+            self.group_summary_label = ttk.Label(self.group_panel, textvariable=self.var_current_group_summary,
+                                                 foreground="#64748B", wraplength=600)
+            self.group_summary_label.pack(side="left", fill="x", expand=True)
+            self.group_summary_label.bind("<Configure>", lambda e: self.group_summary_label.configure(wraplength=max(100, e.width)))
+            row = tk.Frame(self.sequence_details, bg="white")
+            row.pack(fill="x")
+            self._ui_label(row, "전류 분리 기준")
+            combo = self._ui_combo(row, self.var_current_group_basis, (SequenceCurrentFilter.JOB, SequenceCurrentFilter.POSTS), 28)
+            combo.bind("<<ComboboxSelected>>", lambda _e: self._on_current_group_changed())
+            self._ui_label(row, "전류·전력 공통 / 코일 환산 후 실제 A 기준")
+
+        def _toggle_sequence_details(self):
+            self._sequence_details_open = not self._sequence_details_open
+            if self._sequence_details_open:
+                self.sequence_details.pack(fill="x", before=self.group_panel)
+            else:
+                self.sequence_details.pack_forget()
+            self.btn_sequence_details.configure(text="범위·그룹 설정 ▴" if self._sequence_details_open else "범위·그룹 설정 ▾")
+
+        def _build_console_panel(self):
+            frame = tk.Frame(self, bg="#F5F7FA", padx=16, pady=6)
+            frame.pack(side="bottom", fill="x")
+            row = tk.Frame(frame, bg="#F5F7FA")
+            row.pack(fill="x")
+            self.btn_console = self._ui_button(row, "통신 기록·수동 명령 ▾", self._toggle_console)
+            tk.Label(row, text="기록 자동 저장", bg="#F5F7FA", fg="#64748B").pack(side="right")
+            self.console_details = tk.Frame(frame, bg="white", padx=10, pady=8)
+            self._console_open = False
+            command_row = tk.Frame(self.console_details, bg="white")
+            command_row.pack(fill="x", pady=(0, 6))
+            self.var_manual_cmd = tk.StringVar(value="*IDN?")
+            entry = self._ui_entry(command_row, self.var_manual_cmd, 42)
+            entry.bind("<Return>", lambda _e: self._on_manual_send(is_query=False))
+            self._ui_button(command_row, "전송", lambda: self._on_manual_send(is_query=False))
+            self._ui_button(command_row, "조회", lambda: self._on_manual_send(is_query=True))
+            self._ui_button(command_row, "장비 오류 확인", self._on_check_err)
+            self.txt_log = tk.Text(self.console_details, height=5, bg="#F8FAFC", fg="#334155", font=("Consolas", 9),
+                                    wrap="word", relief="flat", padx=8, pady=6)
+            self.txt_log.pack(fill="both", expand=True)
+            # The detailed command remains available without occupying the safety bar.
+            self.after_idle(self._attach_command_summary)
+
+        def _attach_command_summary(self):
+            ttk.Label(self.console_details, textvariable=self.var_active_cmd_summary, foreground="#64748B",
+                      wraplength=1050).pack(fill="x", pady=(5, 0))
+
+        def _toggle_console(self):
+            self._console_open = not self._console_open
+            if self._console_open:
+                self.console_details.pack(fill="x", pady=(6, 0))
+            else:
+                self.console_details.pack_forget()
+            self.btn_console.configure(text="통신 기록·수동 명령 ▴" if self._console_open else "통신 기록·수동 명령 ▾")
+
+        def _update_connection_ui(self, info):
+            if info.connected:
+                simulation = info.interface_type.startswith("SIMULATION")
+                self.lbl_conn_badge.configure(text="시뮬레이션" if simulation else f"{self.conn_mgr.profile.model} 연결됨",
+                                               bg="#E0E7FF" if simulation else "#DCFCE7", fg="#3730A3" if simulation else "#166534")
+                self.var_idn_display.set(f"{info.interface_type}  ·  {info.resource_name}  ·  {info.idn_string}")
+            else:
+                self.lbl_conn_badge.configure(text="연결 안 됨", bg="#E2E8F0", fg="#64748B")
+                self.var_idn_display.set("모델과 연결 방식을 선택하세요.")
+            self._refresh_connection_controls()
+
+        def _refresh_oper_badge(self):
+            if self.is_operating is None:
+                text, bg, fg = "출력 상태 미확인 · 본체 확인", "#FEF3C7", "#92400E"
+            elif self.is_operating:
+                text, bg, fg = "OPER · 출력 중", "#FEE2E2", "#991B1B"
+            else:
+                text, bg, fg = "STBY · 출력 대기", "#DCFCE7", "#166534"
+            self.lbl_output_state.configure(text=text, bg=bg, fg=fg)
+
+        def _polish_manual_tabs(self):
+            def walk(widget, tab):
+                for child in widget.winfo_children():
+                    if isinstance(child, tk.Button):
+                        text = str(child.cget("text"))
+                        if "전송 후" in text:
+                            child.configure(text="설정 후 출력", bg="#2563EB", fg="white")
+                        elif "전송" in text:
+                            child.configure(text="설정만 전송", bg="#F1F5F9", fg="#334155")
+                        else:
+                            child.configure(bg="#F1F5F9", fg="#334155")
+                        child.configure(font=("Malgun Gothic", 9), padx=10, pady=5, relief="flat")
+                    elif isinstance(child, (tk.Label, tk.LabelFrame, tk.Checkbutton)):
+                        value = str(child.cget("text"))
+                        value = re.sub(r"[⚡📤🧲🔋💡⚠📊]+\s*", "", value)
+                        child.configure(text=value)
+                        if isinstance(child, tk.Label) and child.cget("textvariable"):
+                            child.configure(font=("Malgun Gothic", 9), fg="#475569", justify="left", wraplength=1000)
+                            tab.bind("<Configure>", lambda e, label=child: label.configure(wraplength=max(400, e.width - 64)), add="+")
+                    walk(child, tab)
+            for tab in (self.tab_voltage, self.tab_current, self.tab_resistance, self.tab_power):
+                walk(tab, tab)
+

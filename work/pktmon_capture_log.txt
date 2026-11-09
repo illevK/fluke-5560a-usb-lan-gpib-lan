@@ -1,0 +1,32 @@
+﻿패킷 필터:
+    없음
+필터가 추가되었습니다.
+
+로거 매개 변수:
+    로거 이름:        PktMon
+    로깅 모드:       순환
+    로그 파일:           C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\fluke_target.etl
+    최대 파일 크기:      8MB
+    사용된 메모리:        384MB
+
+수집된 데이터:
+    패킷 카운터, 패킷 캡처
+
+캡처 형식:
+    모든 패킷
+
+모니터링되는 구성 요소:
+    모두
+
+패킷 필터:
+     # 이름            IP 주소       
+     - --            -----       
+     1 Fluke5560Task 169.254.1.1 
+로그를 플러시하는 중...
+메타데이터를 구문 분석하는 중...
+로그 파일: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\fluke_target.etl(손실된 이벤트 없음)
+처리하는 중...
+
+형식화된 이벤트:    33
+서식 있는 파일:      C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\fluke_target_trace.txt
+모든 필터가 제거되었습니다.

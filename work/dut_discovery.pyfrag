@@ -1,0 +1,229 @@
+import select
+import struct
+from contextlib import ExitStack
+from dataclasses import replace
+
+
+@dataclass(frozen=True)
+class DUTDiscoveryCandidate:
+    settings: DUTSettings
+    profile: DUTProfile
+    identity: str
+
+
+def _dut_discovery_check_cancel(cancel):
+    if cancel.is_set():
+        raise InterruptedError("DUT 자동 검색을 중지했습니다.")
+
+
+def _dut_vxi11_port_reply(data, xid):
+    if len(data) < 28:
+        return False
+    received_xid, message_type, reply_state, _verifier_type, verifier_length = struct.unpack_from("!5I", data)
+    if (received_xid, message_type, reply_state) != (xid, 1, 0) or verifier_length > 400:
+        return False
+    offset = 20 + ((verifier_length + 3) & ~3)
+    if len(data) != offset + 8:
+        return False
+    accepted, port = struct.unpack_from("!2I", data, offset)
+    return accepted == 0 and 1 <= port <= 65535
+
+
+def _dut_discover_vxi11(cancel, adapters, diagnostics):
+    # LXI VXI-11 Discovery and Identification Extended Function §10.1.
+    # RFC 1057 Appendix A: portmapper v2 GETPORT, TCP device core v1.
+    interfaces = {}
+    for adapter in adapters:
+        if adapter.get("state") != "Up" or not adapter.get("hardware", True):
+            continue
+        for address in adapter.get("addresses") or ():
+            try:
+                interface = ipaddress.IPv4Interface(f"{address['ip']}/{address['prefix']}")
+            except (KeyError, ValueError):
+                continue
+            if (1 <= interface.network.prefixlen < 31 and not interface.ip.is_loopback
+                    and not interface.ip.is_unspecified and not interface.ip.is_multicast
+                    and interface.ip not in (interface.network.network_address, interface.network.broadcast_address)):
+                interfaces.setdefault(str(interface.ip), interface.network)
+
+    if not interfaces:
+        diagnostics.append("LAN 자동 검색에 사용할 활성 IPv4 어댑터가 없습니다.")
+        return []
+
+    xid = int.from_bytes(os.urandom(4), "big")
+    request = struct.pack("!14I", xid, 0, 2, 100000, 2, 3, 0, 0, 0, 0, 0x0607AF, 1, 6, 0)
+    hosts = set()
+    with ExitStack() as stack:
+        receivers = {}
+        for source, network in list(interfaces.items())[:8]:
+            _dut_discovery_check_cancel(cancel)
+            try:
+                sock = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.settimeout(.2)
+                sock.bind((source, 0))
+                sock.sendto(request, (str(network.broadcast_address), 111))
+                receivers[sock] = network
+            except OSError as exc:
+                diagnostics.append(f"LAN 검색 요청 실패 ({source}): {exc}")
+
+        deadline = time.monotonic() + 1.2
+        while receivers and len(hosts) < 12:
+            _dut_discovery_check_cancel(cancel)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                readable, _, _ = select.select(list(receivers), [], [], min(.1, remaining))
+            except OSError as exc:
+                diagnostics.append(f"LAN 검색 수신 실패: {exc}")
+                break
+            for sock in readable:
+                try:
+                    data, (source, port) = sock.recvfrom(512)
+                except OSError:
+                    continue
+                if port != 111 or source in interfaces or not _dut_vxi11_port_reply(data, xid):
+                    continue
+                host, network = ipaddress.IPv4Address(source), receivers[sock]
+                if host in network and host not in (network.network_address, network.broadcast_address):
+                    hosts.add(source)
+    _dut_discovery_check_cancel(cancel)
+    diagnostics.append(f"같은 네트워크에서 VXI-11 응답 {len(hosts)}개를 받았습니다.")
+    return sorted(hosts, key=ipaddress.IPv4Address)
+
+
+def _dut_discovery_usb_key(resource):
+    match = re.fullmatch(r"USB\d*::(0X[0-9A-F]+|\d+)::(0X[0-9A-F]+|\d+)::([^:]+)(?:::\d+)?::INSTR", resource.upper())
+    if not match:
+        return None
+    vendor, product, serial_no = match.groups()
+    return (int(vendor, 16 if vendor.startswith("0X") else 10),
+            int(product, 16 if product.startswith("0X") else 10), serial_no)
+
+
+def _dut_discovery_ipv4(address):
+    try:
+        ip = ipaddress.IPv4Address(AutoNetworkAligner.normalize_ipv4(address))
+    except ValueError:
+        return None
+    return None if ip.is_loopback or ip.is_reserved else str(ip)
+
+
+def _dut_discovery_resource_ip(resource):
+    kind, delimiter, rest = resource.upper().partition("::")
+    if delimiter and re.fullmatch(r"TCPIP\d*", kind):
+        return _dut_discovery_ipv4(rest.split("::", 1)[0])
+    return None
+
+
+def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=True, include_lan=True, adapters=None):
+    """Return all recognized, closed probe sessions and discovery diagnostics.
+
+    Discovery never needs network configuration changes or address-range scans.
+    Literal IPv4 VISA resources avoid probing DNS aliases for the calibrator.
+    Raw PPA/WT5000 sockets are considered only when explicitly listed in VISA.
+    """
+    _dut_discovery_check_cancel(cancel)
+    diagnostics, candidates = [], []
+    if not (include_usb or include_lan):
+        return candidates, diagnostics
+    if not HAS_PYVISA:
+        diagnostics.append(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
+        return candidates, diagnostics
+
+    manager = None
+    try:
+        manager = SharedVisaManager()
+        try:
+            resources = manager.list_resources("?*")
+        finally:
+            manager.close()
+    except Exception as exc:
+        resources = ()
+        diagnostics.append(f"VISA 장치 목록을 읽지 못했습니다: {exc}")
+        if manager is None:
+            diagnostics.append("VISA 드라이버를 시작할 수 없습니다. NI-VISA 설치 상태를 확인하세요.")
+            return candidates, diagnostics
+
+    _dut_discovery_check_cancel(cancel)
+    excluded_resource = excluded_resource.strip().upper()
+    excluded_usb = _dut_discovery_usb_key(excluded_resource)
+    excluded_hosts = {_dut_discovery_ipv4(excluded_ip), _dut_discovery_resource_ip(excluded_resource)}
+
+    targets = {}
+    listed_lan = {}
+    for resource in resources:
+        resource = resource.strip()
+        upper = resource.upper()
+        if upper == excluded_resource:
+            continue
+        usb_key = _dut_discovery_usb_key(resource) if include_usb else None
+        if usb_key is not None and usb_key != excluded_usb and usb_key[0] != 0x0F7E:
+            targets.setdefault(("VISA", usb_key), DUTSettings(mode="VISA", address=resource, eol="LF"))
+        if not include_lan:
+            continue
+        match = re.fullmatch(r"TCPIP\d*::([^:]+)(?:::([^:]+))?::(INSTR|SOCKET)", upper)
+        if not match:
+            continue
+        host, endpoint, kind = match.groups()
+        host = _dut_discovery_ipv4(host)
+        if host is None or host in excluded_hosts:
+            continue
+        if kind == "INSTR" and endpoint in (None, "INST0"):
+            settings = DUTSettings(mode="WT_LAN", address=host, eol="LF")
+        elif kind == "SOCKET" and endpoint == "10001":
+            settings = DUTSettings(mode="PPA_LAN", address=host)
+        elif kind == "SOCKET" and endpoint == "10002":
+            settings = DUTSettings(mode="WT5000_TCP", address=host, port=10002, eol="LF")
+        else:
+            continue
+        listed_lan.setdefault((settings.mode, host), settings)
+
+    usb_count = len(targets)
+    if include_usb:
+        diagnostics.append(f"VISA USB-TMC 후보 {usb_count}개를 확인했습니다.")
+    if include_lan:
+        if adapters is None:
+            adapters = AutoNetworkAligner.list_ethernet_interfaces()
+            if AutoNetworkAligner.last_error:
+                diagnostics.append(AutoNetworkAligner.last_error)
+        for host in _dut_discover_vxi11(cancel, adapters, diagnostics):
+            if host not in excluded_hosts:
+                targets.setdefault(("WT_LAN", host), DUTSettings(mode="WT_LAN", address=host, eol="LF"))
+        for key, settings in listed_lan.items():
+            targets.setdefault(key, settings)
+
+    deadline = time.monotonic() + 8.0
+    for index, settings in enumerate(targets.values()):
+        _dut_discovery_check_cancel(cancel)
+        if index >= 12 or time.monotonic() >= deadline:
+            diagnostics.append("자동 확인 범위에 도달했습니다. 표시되지 않은 장비는 주소를 직접 입력하세요.")
+            break
+        probe = DUTSession()
+        probe.cancel = cancel
+        try:
+            identity = probe.connect(replace(settings, timeout=1.0))
+            candidates.append(DUTDiscoveryCandidate(settings, probe.profile, identity))
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            diagnostics.append(f"{settings.address}: {str(exc).splitlines()[0][:160] if str(exc) else type(exc).__name__}")
+        finally:
+            probe.disconnect()
+
+    _dut_discovery_check_cancel(cancel)
+    if candidates:
+        diagnostics.append(f"식별이 확인된 DUT {len(candidates)}대가 있습니다.")
+    else:
+        message = ""
+        if include_usb:
+            message = ("USB 계측기는 목록에 있지만 지원 DUT로 식별되지 않았습니다. 본체의 USB 원격 설정과 통신 기록을 확인하세요."
+                       if usb_count else
+                       "VISA 목록에 USB DUT가 없습니다. 케이블과 본체의 USB 원격 설정을 확인하세요.")
+        if include_lan:
+            message += (" " if message else "") + "LAN에서 찾지 못한 DUT는 연결 방식을 선택해 IP를 직접 입력하세요."
+        diagnostics.append(message)
+    return candidates, diagnostics
+
+

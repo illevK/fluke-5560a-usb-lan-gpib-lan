@@ -1,0 +1,14 @@
+﻿{
+    "addresses":  [
+                      {
+                          "IPAddress":  "192.168.100.100",
+                          "PrefixLength":  24,
+                          "PrefixOrigin":  1,
+                          "SkipAsSource":  false
+                      }
+                  ],
+    "addedAddress":  "169.254.1.100",
+    "addedPrefix":  16,
+    "adapterGuid":  "{A86017AC-4FFD-4CA1-A2A0-803022EBBE2A}",
+    "interfaceIndex":  17
+}

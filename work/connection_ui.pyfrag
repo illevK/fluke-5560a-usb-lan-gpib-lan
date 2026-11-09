@@ -1,0 +1,254 @@
+        def _build_connection_panel(self):
+            frame = tk.LabelFrame(self, text=" 1. 모델 및 연결 설정 — USB 컨버터는 RS232 또는 GPIB 선택 ",
+                                  bg="#FFFFFF", font=("Malgun Gothic", 9, "bold"), padx=10, pady=6)
+            frame.pack(fill="x", padx=14, pady=(4, 2))
+            model_row = tk.Frame(frame, bg="white")
+            model_row.pack(fill="x", pady=(0, 4))
+            self._configured_model = "5560A"
+            self.var_model = tk.StringVar(value="5560A")
+            tk.Label(model_row, text="장비 모델", bg="white").pack(side="left")
+            self.combo_model = ttk.Combobox(model_row, textvariable=self.var_model,
+                                          values=list(MODEL_PROFILES), state="readonly", width=9)
+            self.combo_model.pack(side="left", padx=6)
+            self.combo_model.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
+            self.var_model_note = tk.StringVar()
+            tk.Label(model_row, textvariable=self.var_model_note, bg="white", fg="#1D4ED8").pack(side="left")
+            row1 = tk.Frame(frame, bg="white")
+            row1.pack(fill="x")
+            row2 = tk.Frame(frame, bg="white")
+            row2.pack(fill="x", pady=5)
+            self._connection_buttons = []
+            self._io_busy = False
+            self._pending_standby = False
+            self._io_results = queue.Queue()
+            self._last_report = ""
+            self.var_conn_mode = tk.StringVar(value="LAN")
+            self.var_lan_ip = tk.StringVar(value="169.254.1.1")
+            self.var_lan_port = tk.StringVar(value="3490")
+            self.var_gpib_addr = tk.StringVar(value="1")
+            self.var_timeout = tk.StringVar(value="3")
+            self.var_operation_timeout = tk.StringVar(value="60")
+            self.var_eol = tk.StringVar(value="CRLF")
+            self.var_visa_resource = tk.StringVar(value="")
+            self.var_adapter_choice = tk.StringVar()
+
+            def label(row, text):
+                tk.Label(row, text=text, bg="white", font=("Malgun Gothic", 9)).pack(side="left", padx=(0, 4))
+
+            def entry(row, variable, width):
+                ttk.Entry(row, textvariable=variable, width=width).pack(side="left", padx=(0, 8))
+
+            label(row1, "모드")
+            self.combo_conn_mode = ttk.Combobox(row1, textvariable=self.var_conn_mode, width=10, state="readonly")
+            self.combo_conn_mode.pack(side="left", padx=(0, 8))
+            label(row1, "실제 랜카드")
+            self.combo_adapter = ttk.Combobox(row1, textvariable=self.var_adapter_choice, width=29, state="readonly")
+            self.combo_adapter.pack(side="left", padx=(0, 8))
+            label(row1, "장비 IP")
+            entry(row1, self.var_lan_ip, 16)
+            label(row1, "포트")
+            entry(row1, self.var_lan_port, 6)
+            label(row1, "조회(초)")
+            entry(row1, self.var_timeout, 4)
+            label(row1, "EOL")
+            ttk.Combobox(row1, textvariable=self.var_eol, values=["CRLF", "LF", "CR"], width=6,
+                         state="readonly").pack(side="left", padx=(0, 8))
+            label(row1, "GPIB 주소")
+            entry(row1, self.var_gpib_addr, 3)
+
+            for title, action in [("연결", self._on_connect_clicked), ("LAN 진단", self._on_lan_diagnose),
+                                  ("랜카드 새로고침", self._on_refresh_adapters),
+                                  ("진단 저장", self._on_save_report), ("해제", self._on_disconnect_clicked),
+                                  ("시뮬레이션", self._on_sim_connect_clicked)]:
+                button = ttk.Button(row2, text=title, command=action)
+                button.pack(side="left", padx=(0, 6))
+                self._connection_buttons.append(button)
+            label(row2, "VISA 리소스(선택)")
+            entry(row2, self.var_visa_resource, 22)
+            label(row2, "출력 완료 대기(초)")
+            entry(row2, self.var_operation_timeout, 5)
+            row3 = tk.Frame(frame, bg="white")
+            row3.pack(fill="x", pady=(0, 4))
+            self.var_serial_port = tk.StringVar()
+            self.var_baudrate = tk.StringVar(value="9600")
+            self.var_data_bits = tk.StringVar(value="8")
+            self.var_parity = tk.StringVar(value="N")
+            self.var_stop_bits = tk.StringVar(value="1")
+            self.var_flow_control = tk.StringVar(value="XON/XOFF")
+            label(row3, "RS232 / USB–RS-232")
+            self.combo_serial_port = ttk.Combobox(row3, textvariable=self.var_serial_port, width=23)
+            self.combo_serial_port.pack(side="left", padx=(0, 6))
+            button = ttk.Button(row3, text="COM 찾기", command=self._on_refresh_serial_ports)
+            button.pack(side="left", padx=(0, 8))
+            self._connection_buttons.append(button)
+            self.serial_settings_controls = []
+            for title, variable, choices, width in [
+                ("속도", self.var_baudrate, (300,600,1200,2400,4800,9600,19200,38400,57600,115200), 8),
+                ("데이터", self.var_data_bits, (7,8), 3), ("패리티", self.var_parity, ("N","E","O"), 3),
+                ("정지", self.var_stop_bits, (1,2), 3), ("흐름", self.var_flow_control, ("XON/XOFF","NONE","RTS/CTS"), 10)]:
+                label(row3, title)
+                control = ttk.Combobox(row3, textvariable=variable, values=choices, width=width, state="readonly")
+                control.pack(side="left", padx=(0, 8))
+                self.serial_settings_controls.append(control)
+            self.var_idn_display = tk.StringVar(value="장비 IP를 입력한 뒤 LAN 진단 또는 연결을 누르세요.")
+            tk.Label(frame, textvariable=self.var_idn_display, bg="white", fg="#475569", anchor="w",
+                     justify="left", wraplength=1180, font=("Malgun Gothic", 9)).pack(fill="x")
+            self._set_adapter_choices(self.adapters)
+            self._sync_model_controls()
+            self._poll_after_id = self.after(100, self._poll_io_result)
+
+        def _set_adapter_choices(self, adapters):
+            current = self.var_adapter_choice.get().split(":", 1)[0]
+            choices = [f"{a['idx']}: {a['name']} [{a['state']}]" for a in adapters]
+            choices.append("자동: Windows 경로 사용")
+            self.combo_adapter.configure(values=choices)
+            self.var_adapter_choice.set(next((v for v in choices if v.split(":", 1)[0] == current), choices[0]))
+
+        def _get_selected_adapter_id(self):
+            value = self.var_adapter_choice.get().split(":", 1)[0]
+            return value if value.isdigit() else ""
+
+        def _connection_arguments(self):
+            timeout = float(self.var_timeout.get())
+            if not math.isfinite(timeout) or not 0.2 <= timeout <= 60:
+                raise ValueError("제한 시간은 0.2~60초 사이여야 합니다.")
+            operation_timeout = self._get_operation_timeout()
+            mode = self.var_conn_mode.get()
+            return dict(preferred_mode=mode, lan_ip=self.var_lan_ip.get(), model=self._selected_model(),
+                        lan_port=int(self.var_lan_port.get()) if mode in ("AUTO", "LAN") else 3490,
+                        gpib_addr=int(self.var_gpib_addr.get()) if mode in ("AUTO", "GPIB") else 1,
+                        timeout_sec=timeout, eol=self.var_eol.get(), adapter_idx=self._get_selected_adapter_id(),
+                        visa_resource=self.var_visa_resource.get(), operation_timeout_sec=operation_timeout,
+                        serial_port=self.var_serial_port.get().split(" | ", 1)[0].strip(),
+                        baudrate=int(self.var_baudrate.get()), data_bits=int(self.var_data_bits.get()),
+                        parity=self.var_parity.get(), stop_bits=int(self.var_stop_bits.get()),
+                        flow_control=self.var_flow_control.get())
+
+        def _get_operation_timeout(self):
+            value = float(self.var_operation_timeout.get())
+            if not math.isfinite(value) or not 1 <= value <= 300:
+                raise ValueError("출력 완료 대기는 1~300초 사이여야 합니다.")
+            return value
+
+        def _start_io(self, label, operation, complete, on_error=None, stop_sequence=True):
+            if self._io_busy:
+                return False
+            if stop_sequence:
+                self._on_seq_stop_auto(silent=True)
+            self._io_busy = True
+            self._refresh_connection_controls()
+            self.conn_mgr.cancel_event.clear()
+            self.conn_mgr.last_error = ""
+            for button in self._connection_buttons:
+                button.configure(state="disabled")
+            self.var_idn_display.set(label)
+            self._log(label)
+            def worker():
+                try:
+                    self._io_results.put((complete, operation(), None, on_error))
+                except Exception as exc:
+                    self._io_results.put((complete, None, exc, on_error))
+            threading.Thread(target=worker, daemon=True).start()
+            return True
+
+        def _poll_io_result(self):
+            while True:
+                try:
+                    event = self.conn_mgr.events.get_nowait()
+                except queue.Empty:
+                    break
+                self._log(event)
+                if event.startswith("[출력 안정화 대기]"):
+                    self.var_idn_display.set(event)
+            try:
+                complete, value, error, on_error = self._io_results.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self._io_busy = False
+                for button in self._connection_buttons:
+                    button.configure(state="normal")
+                if error:
+                    self.is_operating = False if isinstance(error, InstrumentCommandError) else None
+                    self._update_connection_ui(self.conn_mgr.info)
+                    self._refresh_oper_badge()
+                    self._last_report = self.conn_mgr.last_error or str(error)
+                    self._log(f"[오류] {self._last_report}")
+                    if on_error:
+                        on_error(error)
+                    elif not isinstance(error, OperationCancelled):
+                        self._show_report("통신 안내", self._last_report)
+                else:
+                    complete(value)
+                if self._pending_standby:
+                    self._pending_standby = False
+                    if self.conn_mgr.info.connected:
+                        self._on_stby_clicked()
+            if not self._io_busy and not self.conn_mgr.info.connected:
+                if self.is_operating is not None:
+                    self.is_operating = None
+                    self._refresh_oper_badge()
+                self.lbl_conn_badge.configure(text="● DISCONNECTED", bg="#334155", fg="#E2E8F0")
+            self._refresh_connection_controls()
+            self._poll_after_id = self.after(100, self._poll_io_result)
+
+        def _on_refresh_adapters(self):
+            def done(adapters):
+                self.adapters = adapters
+                self._set_adapter_choices(adapters)
+                self.var_idn_display.set(AutoNetworkAligner.describe())
+            self._start_io("실제 랜카드의 연결 상태를 확인하고 있습니다…",
+                           lambda: AutoNetworkAligner.list_ethernet_interfaces(refresh=True), done)
+
+        def _on_lan_diagnose(self):
+            try:
+                args = self._connection_arguments()
+                if "LAN" not in MODEL_PROFILES[self._selected_model()].interfaces:
+                    raise ValueError("선택한 모델에는 LAN 포트가 없습니다. RS232 또는 GPIB를 사용하세요.")
+                def diagnose():
+                    self.conn_mgr.expected_model = args['model']
+                    self.conn_mgr.profile = MODEL_PROFILES[args['model']]
+                    return self.conn_mgr.diagnose_lan(args['lan_ip'], args['lan_port'], args['timeout_sec'],
+                                                      eol=args['eol'], adapter_idx=args['adapter_idx'])
+                def done(report):
+                    self._last_report = report
+                    self.var_idn_display.set(self.conn_mgr.last_error)
+                    self._log(report)
+                    self._show_report("LAN 진단 결과", report)
+                self._start_io("LAN 진단 중: PC 주소 → TCP 연결 → 선택 모델 식별 응답…", diagnose, done)
+            except Exception as exc:
+                messagebox.showerror("입력 확인", str(exc))
+
+        def _show_report(self, title, report):
+            window = tk.Toplevel(self)
+            window.title(title)
+            window.geometry("830x560")
+            body = tk.Text(window, wrap="word", font=("Malgun Gothic", 10), padx=12, pady=12)
+            body.pack(fill="both", expand=True)
+            body.insert("1.0", report)
+            body.configure(state="disabled")
+            ttk.Button(window, text="닫기", command=window.destroy).pack(pady=8)
+
+        def _on_save_report(self):
+            if not self._last_report:
+                messagebox.showinfo("진단 저장", "LAN 진단을 먼저 실행하세요.")
+                return
+            filename = filedialog.asksaveasfilename(title="LAN 진단 저장", defaultextension=".txt",
+                         initialfile="fluke_5560a_lan_diagnostic.txt", filetypes=[("Text", "*.txt")])
+            if filename:
+                with open(filename, "w", encoding="utf-8-sig") as output:
+                    output.write(self._last_report)
+
+        def _on_close(self):
+            if self._io_busy:
+                self.conn_mgr.request_abort()
+                self.after(200, self._on_close)
+                return
+            self._on_seq_stop_auto(silent=True)
+            try:
+                self.conn_mgr.disconnect()
+            except Exception:
+                pass
+            self.after_cancel(self._poll_after_id)
+            self.destroy()
+

@@ -1,0 +1,7 @@
+﻿{
+    "address":  "169.254.1.100",
+    "state":  "Preferred",
+    "prefix":  16,
+    "success":  true,
+    "adapter":  "이더넷"
+}

@@ -1,0 +1,4 @@
+[2026-11-06T08:38:35.229] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\standalone_v6.6.0\logs\fluke_20261106_083830_433820_16336.log
+[2026-11-06T08:38:35.269] 실행 Python: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\standalone_v6.6.0\Fluke 교정기.exe | PyVISA=True | pyserial=True
+[2026-11-06T08:38:35.297] 시스템 준비 완료 (현재 내 PC IP: 감지 안 됨). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.
+[2026-11-06T08:38:35.382] EXE package verification: no instrument connection

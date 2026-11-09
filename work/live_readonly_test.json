@@ -1,0 +1,14 @@
+{
+  "source_ip": "192.168.100.100",
+  "queries": [
+    {
+      "command": "*IDN?",
+      "response": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001"
+    },
+    {
+      "command": "IPADDR?",
+      "response": "169.254.1.1"
+    }
+  ],
+  "error": "NETMASK?: 응답 시간 초과. EOL/Remote Interface/다른 제어 프로그램을 확인하세요."
+}

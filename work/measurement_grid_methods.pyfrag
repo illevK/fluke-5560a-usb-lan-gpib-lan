@@ -1,0 +1,260 @@
+        MEASUREMENT_COLUMN = 9
+
+        @staticmethod
+        def _display_column(index):
+            return 6 if index == 9 else (index + 1 if index >= 6 else index)
+
+        def set_measurement_visibility(self, visible):
+            self.show_measurements = bool(visible)
+            if not visible:
+                self._reset_measurement_selection()
+            self._apply_optional_columns()
+            if not visible and self.selected_col_idx == self.MEASUREMENT_COLUMN:
+                self.selected_col_idx = 5
+                if 0 <= self.selected_row_idx < len(self._row_widgets):
+                    self._row_widgets[self.selected_row_idx]["entries"][5].focus_set()
+
+        def set_command_visibility(self, visible):
+            self.show_commands = bool(visible)
+            self._apply_optional_columns()
+
+        def _apply_optional_columns(self):
+            for column, visible in ((7, self.show_commands), (9, self.show_measurements)):
+                cells = [self.header_frame.winfo_children()[column]] + [row["frames"][column] for row in self._row_widgets]
+                for cell in cells:
+                    if visible:
+                        cell.grid()
+                    else:
+                        cell.grid_remove()
+            self.header_frame.update_idletasks()
+            self.cells_frame.update_idletasks()
+            self._resize_columns()
+            self._on_frame_configure()
+
+        def _resize_columns(self, _event=None):
+            base = sum(spec[1] for index, spec in enumerate(self.COL_SPECS)
+                       if (index != 7 or self.show_commands) and (index != 9 or self.show_measurements))
+            width = max(base, self.canvas.winfo_width())
+            self.canvas.itemconfigure(self.canvas_window, width=width)
+            self.header_canvas.itemconfigure(self.header_window, width=width)
+
+        def _measurement_changed(self, row):
+            if self._rendering_measurements or not 0 <= row < len(self._steps):
+                return
+            self._steps[row].measured_raw = self._row_widgets[row]["measurement_var"].get()
+
+        def _init_measurement_selection(self):
+            self._measurement_anchor = self._measurement_end = None
+            self._measurement_drag_active = self._measurement_dragging = False
+            self._measurement_scroll_after = None
+            self._measurement_pointer_y = 0
+            self._measurement_menu = tk.Menu(self, tearoff=False)
+            self._measurement_menu.add_command(label="선택한 측정값 복사  Ctrl+C",
+                                               command=lambda: self._copy_measurements(force_cells=True))
+            self._measurement_menu.add_command(label="현재 행부터 끝까지 복사", command=self._copy_measurements_to_end)
+            self._measurement_menu.add_command(label="측정값 전체 복사", command=self._copy_all_measurements)
+            self.bind("<Destroy>", self._measurement_destroyed, add="+")
+
+        def _bind_measurement_header(self):
+            header = self.header_frame.winfo_children()[self.MEASUREMENT_COLUMN]
+            for widget in [header] + header.winfo_children():
+                widget.configure(cursor="hand2")
+                widget.bind("<Button-1>", self._copy_all_measurements)
+            for label in header.winfo_children():
+                label.configure(text="측정값 · 전체 복사")
+
+        def _copy_all_measurements(self, _event=None):
+            if self._steps:
+                self._stop_measurement_drag()
+                self._set_measurement_selection(0, len(self._steps) - 1)
+                self._copy_measurements(force_cells=True)
+            return "break"
+
+        def _copy_measurements_to_end(self):
+            if self._steps:
+                self._stop_measurement_drag()
+                self._set_measurement_selection(self.selected_row_idx, len(self._steps) - 1)
+                self._copy_measurements(force_cells=True)
+            return "break"
+
+        def _measurement_destroyed(self, event):
+            if event.widget is self:
+                self._stop_measurement_drag()
+
+        def _bind_measurement_selection(self, row):
+            entry = self._row_widgets[row]["entries"][9]
+            entry.configure(exportselection=False)
+            for widget in (entry, self._row_widgets[row]["frames"][9]):
+                widget.bind("<ButtonPress-1>", lambda event, r=row: self._measurement_press(event, r))
+                widget.bind("<B1-Motion>", self._measurement_motion)
+                widget.bind("<ButtonRelease-1>", self._measurement_release)
+                widget.bind("<Button-3>", lambda event, r=row: self._measurement_context(event, r))
+            entry.bind("<<Copy>>", lambda _event, r=row: self._copy_measurements(r))
+            entry.bind("<Shift-Up>", lambda _event, r=row: self._measurement_extend_key(r, -1))
+            entry.bind("<Shift-Down>", lambda _event, r=row: self._measurement_extend_key(r, 1))
+            entry.bind("<Escape>", lambda _event: self._reset_measurement_selection())
+
+        def _measurement_bounds(self):
+            if self._measurement_anchor is None or self._measurement_end is None or not self._steps:
+                return None
+            lo, hi = sorted((self._measurement_anchor, self._measurement_end))
+            return (lo, hi) if 0 <= lo <= hi < len(self._steps) else None
+
+        def _measurement_contains(self, row):
+            bounds = self._measurement_bounds()
+            return bounds is not None and bounds[0] <= row <= bounds[1]
+
+        def _set_measurement_selection(self, anchor, end):
+            if not self._steps:
+                return
+            last = len(self._steps) - 1
+            self._measurement_anchor = max(0, min(last, anchor))
+            self._measurement_end = max(0, min(last, end))
+            self._paint_measurement_selection()
+
+        def _paint_measurement_selection(self):
+            for row in range(len(self._row_widgets)):
+                self._paint_measurement_cell(row)
+
+        def _paint_measurement_cell(self, row):
+            widgets = self._row_widgets[row]
+            bg, fg, border = widgets.get("measurement_base_colors", ("white", "#0F172A", "#CBD5E1"))
+            if self._measurement_contains(row):
+                bg, fg, border = "#DBEAFE", "#1E3A8A", "#2563EB"
+            widgets["entries"][9].configure(bg=bg, fg=fg)
+            widgets["frames"][9].configure(bg=bg, highlightbackground=border)
+
+        def _stop_measurement_drag(self):
+            self._measurement_drag_active = self._measurement_dragging = False
+            if self._measurement_scroll_after is not None:
+                self.after_cancel(self._measurement_scroll_after)
+                self._measurement_scroll_after = None
+
+        def _reset_measurement_selection(self):
+            self._stop_measurement_drag()
+            self._measurement_anchor = self._measurement_end = None
+            self._paint_measurement_selection()
+            return "break"
+
+        def _measurement_press(self, event, row):
+            self._stop_measurement_drag()
+            extend = bool(event.state & 1) and self._measurement_bounds() is not None
+            anchor = self._measurement_anchor if extend else row
+            self._set_measurement_selection(anchor, row)
+            self._measurement_drag_active = True
+            self._measurement_dragging = extend
+            self._measurement_pointer_y = event.y_root
+            self.selected_row_idx, self.selected_col_idx = row, self.MEASUREMENT_COLUMN
+            self._row_widgets[row]["entries"][9].focus_set()
+            if extend:
+                self._clear_measurement_text_selection()
+                return "break"
+            # Keep Tk's normal cursor placement and horizontal text selection in one cell.
+            return None
+
+        def _measurement_row_at(self, root_y):
+            position = self.canvas.canvasy(root_y - self.canvas.winfo_rooty())
+            for row, widgets in enumerate(self._row_widgets):
+                frame = widgets["frames"][9]
+                if position < frame.winfo_y() + frame.winfo_height():
+                    return row
+            return max(0, len(self._row_widgets) - 1)
+
+        def _clear_measurement_text_selection(self):
+            for widgets in self._row_widgets:
+                widgets["entries"][9].selection_clear()
+
+        def _measurement_motion(self, event):
+            if not self._measurement_drag_active or not self._steps:
+                return None
+            self._measurement_pointer_y = event.y_root
+            row = self._measurement_row_at(event.y_root)
+            if not self._measurement_dragging and row == self._measurement_anchor:
+                return None
+            self._measurement_dragging = True
+            self._clear_measurement_text_selection()
+            self._set_measurement_selection(self._measurement_anchor, row)
+            if self._measurement_scroll_after is None:
+                self._measurement_autoscroll()
+            return "break"
+
+        def _measurement_autoscroll(self):
+            self._measurement_scroll_after = None
+            if not self._measurement_drag_active or not self.show_measurements or not self._steps:
+                return
+            y = self._measurement_pointer_y - self.canvas.winfo_rooty()
+            height = self.canvas.winfo_height()
+            direction = -1 if y < 16 else (1 if y >= height - 16 else 0)
+            before = self.canvas.yview()
+            if direction:
+                self.canvas.yview_scroll(direction, "units")
+                row = self._measurement_row_at(self._measurement_pointer_y)
+                self._set_measurement_selection(self._measurement_anchor, row)
+            if direction and self.canvas.yview() != before:
+                self._measurement_scroll_after = self.after(60, self._measurement_autoscroll)
+
+        def _measurement_release(self, _event):
+            self._stop_measurement_drag()
+            # Tk's Entry class must also cancel its own horizontal-selection repeat timer.
+            return None
+
+        def _measurement_extend_key(self, row, direction):
+            bounds = self._measurement_bounds()
+            anchor = self._measurement_anchor if bounds else row
+            end = self._measurement_end if bounds else row
+            self._set_measurement_selection(anchor, end + direction)
+            self._clear_measurement_text_selection()
+            self.scroll_to_row(self._measurement_end)
+            return "break"
+
+        def measurement_selection_text(self):
+            bounds = self._measurement_bounds()
+            if bounds is None:
+                return None
+            lo, hi = bounds
+            # Include empty rows and a final record separator, including a trailing empty cell.
+            return "\r\n".join(step.measured_raw for step in self._steps[lo:hi + 1]) + "\r\n"
+
+        def _copy_measurements(self, row=None, force_cells=False):
+            bounds = self._measurement_bounds()
+            if row is None:
+                row = self.selected_row_idx
+            if not 0 <= row < len(self._row_widgets):
+                return "break"
+            if not force_cells and (bounds is None or bounds[0] == bounds[1]):
+                if self._row_widgets[row]["entries"][9].selection_present():
+                    return None  # Let Tk copy a substring selected inside one cell.
+            if bounds is None:
+                self._set_measurement_selection(row, row)
+            text = self.measurement_selection_text()
+            if text is not None:
+                self.clipboard_clear()
+                self.clipboard_append(text)
+            return "break"
+
+        def _measurement_context(self, event, row):
+            self._stop_measurement_drag()
+            if not self._measurement_contains(row):
+                self._set_measurement_selection(row, row)
+            self.selected_row_idx, self.selected_col_idx = row, self.MEASUREMENT_COLUMN
+            self._row_widgets[row]["entries"][9].focus_set()
+            try:
+                self._measurement_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self._measurement_menu.grab_release()
+            return "break"
+
+        def _paste_measurements(self, text, start_row):
+            values = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            if values and values[-1] == "":
+                values.pop()
+            if any("\t" in value for value in values):
+                return False  # Only one result column; never reinterpret results as output rows.
+            for offset, value in enumerate(values):
+                row = start_row + offset
+                if not 0 <= row < len(self._row_widgets):
+                    break
+                self._row_widgets[row]["measurement_var"].set(value)
+            return True
+
+

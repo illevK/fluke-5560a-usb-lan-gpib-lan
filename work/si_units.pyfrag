@@ -1,0 +1,69 @@
+class SIUnits:
+    """User-facing SI notation. Prefix case is significant, especially m versus M."""
+    PREFIXES = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "m": 1e-3,
+                "": 1.0, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+    BASES = ("V", "A", "W", "OHM", "HZ")
+    NUMBER = r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    UNIT = r"[a-zA-ZμµΩΩ가-힣]+"
+    TOKEN = re.compile(r"(?<![\w.,+\-])(" + NUMBER + r")\s*(" + UNIT + r")(?![\w.])")
+    VALUE = re.compile(r"\s*(" + NUMBER + r")\s*(" + UNIT + r")\s*")
+    VI = re.compile(r"(?<![\w.,+\-])(" + NUMBER + r")\s*(" + UNIT + r")\s*/\s*(" + NUMBER + r")\s*(" + UNIT + r")(?![\w.])")
+
+    @staticmethod
+    def clean(text):
+        return str(text).replace("−", "-").replace("μ", "u").replace("µ", "u")
+
+    @staticmethod
+    def number(text):
+        value = float(str(text).replace(",", ""))
+        if not math.isfinite(value):
+            raise ValueError("유한한 수치를 입력하세요.")
+        return value
+
+    @classmethod
+    def normalize(cls, unit):
+        text = cls.clean(unit).strip().replace("Ω", "OHM").replace("Ω", "OHM")
+        aliases = {"ohms": "OHM", "ohm": "OHM", "hz": "HZ", "v": "V", "a": "A", "w": "W",
+                   "볼트": "V", "암페어": "A", "와트": "W", "옴": "OHM", "헤르츠": "HZ"}
+        names = {"pico": "p", "nano": "n", "micro": "u", "milli": "m", "kilo": "k", "mega": "M", "giga": "G", "tera": "T",
+                 "피코": "p", "나노": "n", "마이크로": "u", "밀리": "m", "킬로": "k", "메가": "M", "기가": "G", "테라": "T"}
+        for suffix, base in aliases.items():
+            if not text.lower().endswith(suffix):
+                continue
+            prefix = text[:-len(suffix)]
+            prefix = names.get(prefix.lower(), {"U": "u", "K": "k"}.get(prefix, prefix))
+            if prefix in cls.PREFIXES:
+                return prefix + base
+        raise ValueError(f"지원하지 않는 단위: {unit}. 접두어 p/n/u(µ)/m/k/M/G/T를 사용하세요. m과 M은 서로 다릅니다.")
+
+    @classmethod
+    def split(cls, unit):
+        normalized = cls.normalize(unit)
+        for base in cls.BASES:
+            if normalized.endswith(base):
+                return base, cls.PREFIXES[normalized[:-len(base)]]
+        raise ValueError(f"지원하지 않는 단위: {unit}")
+
+    @classmethod
+    def units(cls, base):
+        return tuple(prefix + base for prefix in cls.PREFIXES)
+
+    @classmethod
+    def to_base(cls, value, unit, expected):
+        base, scale = cls.split(unit)
+        if base != expected:
+            raise ValueError(f"{expected} 계열의 단위를 입력하세요: {unit}")
+        return cls.number(cls.number(value) * scale)
+
+    @classmethod
+    def input_value(cls, text, default_unit):
+        """Manual input fields accept either a number or a complete quantity."""
+        cleaned = cls.clean(text).strip()
+        match = cls.VALUE.fullmatch(cleaned)
+        if match:
+            return cls.to_base(cls.number(match[1]), match[2], default_unit)
+        if not re.fullmatch(cls.NUMBER, cleaned):
+            raise ValueError(f"수치 또는 단위가 붙은 값을 입력하세요: {text}")
+        return cls.number(cleaned)
+
+

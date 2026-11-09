@@ -1,0 +1,9 @@
+[2026-11-05T17:41:35.559] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\logs\fluke_20261105_174131_768515_6164.log
+[2026-11-05T17:41:35.594] 실행 Python: C:\Users\HCT-2714\AppData\Local\Programs\Python\Python314\python.exe | PyVISA=True | pyserial=True
+[2026-11-05T17:41:35.616] 시스템 준비 완료 (현재 내 PC IP: 127.0.0.1). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.
+[2026-11-05T17:41:37.024] 장비 연결 및 식별 확인 중…
+[2026-11-05T17:41:37.034] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-05T17:41:37.035] RX << 0 | OPER? | 0.001s
+[2026-11-05T17:41:37.139] [연결 성공] LAN (Ethernet Socket) | FLUKE,5560A,TEST-1234,4.0 | PC 원본 IP: 127.0.0.1
+[2026-11-05T17:41:37.166] TX >> STBY | 완료 대기 최대 2초
+[2026-11-05T17:41:37.261] [오류] STBY 확인 실패

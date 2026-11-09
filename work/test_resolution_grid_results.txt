@@ -1,0 +1,15 @@
+test_commit_rounds_display_and_header_range_copies_but_retains_raw (test_resolution_grid.ResolutionGridTests.test_commit_rounds_display_and_header_range_copies_but_retains_raw) ... ok
+test_invalid_resolution_paste_is_atomic_and_reports_error (test_resolution_grid.ResolutionGridTests.test_invalid_resolution_paste_is_atomic_and_reports_error) ... ok
+test_invalid_resolution_with_blank_measurement_blocks_header_and_range_copy (test_resolution_grid.ResolutionGridTests.test_invalid_resolution_with_blank_measurement_blocks_header_and_range_copy) ... ok
+test_manual_vi_edit_infers_dc_power_and_invalid_zero_voltage_clears_command (test_resolution_grid.ResolutionGridTests.test_manual_vi_edit_infers_dc_power_and_invalid_zero_voltage_clears_command) ... ok
+test_model_and_coil_rebuild_preserve_resolution_and_raw_readings (test_resolution_grid.ResolutionGridTests.test_model_and_coil_rebuild_preserve_resolution_and_raw_readings) ... ok
+test_paired_target_resolution_columns_import_without_target_confusion (test_resolution_grid.ResolutionGridTests.test_paired_target_resolution_columns_import_without_target_confusion) ... ok
+test_pf_and_si_voltage_resolution_rules (test_resolution_grid.ResolutionGridTests.test_pf_and_si_voltage_resolution_rules) ... ok
+test_resolution_changes_reround_original_and_clear_restores_input (test_resolution_grid.ResolutionGridTests.test_resolution_changes_reround_original_and_clear_restores_input) ... ok
+test_resolution_enter_moves_down_and_dimension_error_keeps_clipboard (test_resolution_grid.ResolutionGridTests.test_resolution_enter_moves_down_and_dimension_error_keeps_clipboard) ... ok
+test_six_user_dc_points_and_resolution_column_paste (test_resolution_grid.ResolutionGridTests.test_six_user_dc_points_and_resolution_column_paste) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 16.931s
+
+OK

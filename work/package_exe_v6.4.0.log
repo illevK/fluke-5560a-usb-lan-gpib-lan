@@ -1,0 +1,93 @@
+265 INFO: PyInstaller: 6.22.3, contrib hooks: 2026.9
+265 INFO: Python: 3.14.2
+329 INFO: Platform: Windows-11-10.0.26200-SP0
+329 INFO: Python environment: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv
+253 WARNING: Failed to collect submodules for 'pyvisa.testsuite' because importing 'pyvisa.testsuite' raised: ModuleNotFoundError: No module named 'pytest'
+1490 INFO: Module search paths (PYTHONPATH):
+['C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan',
+ 'C:\\Users\\HCT-2714\\AppData\\Local\\Programs\\Python\\Python314\\python314.zip',
+ 'C:\\Users\\HCT-2714\\AppData\\Local\\Programs\\Python\\Python314\\DLLs',
+ 'C:\\Users\\HCT-2714\\AppData\\Local\\Programs\\Python\\Python314\\Lib',
+ 'C:\\Users\\HCT-2714\\AppData\\Local\\Programs\\Python\\Python314',
+ 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv',
+ 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages',
+ 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work',
+ 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs']
+2043 INFO: Appending 'datas' from .spec
+2044 INFO: checking Analysis
+2061 INFO: Building because C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\exe_entry.py changed
+2061 INFO: Looking for Python shared library...
+2061 INFO: Using Python shared library: C:\Users\HCT-2714\AppData\Local\Programs\Python\Python314\python314.dll
+2061 INFO: Running Analysis Analysis-00.toc
+2061 INFO: Target bytecode optimization level: 0
+2061 INFO: Initializing module dependency graph...
+2062 INFO: Initializing module graph hook caches...
+2099 INFO: Analyzing modules for base_library.zip ...
+3767 INFO: Processing standard module hook 'hook-encodings.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+5957 INFO: Processing standard module hook 'hook-math.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+8800 INFO: Processing standard module hook 'hook-difflib.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+8831 INFO: Processing standard module hook 'hook-heapq.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+9056 INFO: Processing standard module hook 'hook-pickle.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+12557 INFO: Caching module dependency graph...
+12609 INFO: Analyzing C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\exe_entry.py
+13332 INFO: Processing pre-find-module-path hook 'hook-tkinter.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+13338 INFO: TclTkInfo: initializing cached Tcl/Tk info...
+14311 INFO: Processing standard module hook 'hook-_tkinter.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+14569 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+14572 INFO: SetuptoolsInfo: initializing cached setuptools info...
+16112 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+16378 INFO: Processing standard module hook 'hook-xml.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+16982 INFO: Processing standard module hook 'hook-sysconfig.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+16994 INFO: Processing standard module hook 'hook-_ctypes.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+18066 INFO: Processing standard module hook 'hook-platform.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+19137 INFO: Analyzing hidden import 'pyvisa.cmd_line_tools'
+19518 INFO: Analyzing hidden import 'pyvisa.version'
+19521 INFO: Analyzing hidden import 'serial.__main__'
+19607 INFO: Analyzing hidden import 'serial.rfc2217'
+19692 INFO: Analyzing hidden import 'serial.rs485'
+19699 INFO: Analyzing hidden import 'serial.threaded'
+19717 INFO: Analyzing hidden import 'serial.urlhandler'
+19719 INFO: Analyzing hidden import 'serial.urlhandler.protocol_alt'
+19724 INFO: Analyzing hidden import 'serial.urlhandler.protocol_cp2110'
+19742 INFO: Analyzing hidden import 'serial.urlhandler.protocol_hwgrep'
+19748 INFO: Analyzing hidden import 'serial.urlhandler.protocol_loop'
+19768 INFO: Analyzing hidden import 'serial.urlhandler.protocol_rfc2217'
+19770 INFO: Analyzing hidden import 'serial.urlhandler.protocol_socket'
+19795 INFO: Analyzing hidden import 'serial.urlhandler.protocol_spy'
+19821 INFO: Processing module hooks (post-graph stage)...
+19943 INFO: Processing standard module hook 'hook-_tkinter.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks'
+19963 INFO: Performing binary vs. data reclassification (936 entries)
+20683 INFO: Looking for ctypes DLLs
+20734 WARNING: Ignoring /System/Library/Frameworks/CoreFoundation.framework/CoreFoundation imported from C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv\Lib\site-packages\serial\tools\list_ports_osx.py - only basenames are supported with ctypes imports!
+20734 WARNING: Ignoring /System/Library/Frameworks/IOKit.framework/IOKit imported from C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv\Lib\site-packages\serial\tools\list_ports_osx.py - only basenames are supported with ctypes imports!
+20761 INFO: Analyzing run-time hooks ...
+20763 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+20771 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+20776 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+20783 INFO: Including run-time hook 'pyi_rth__tkinter.py' from 'C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\packaging_venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+20831 INFO: Creating base_library.zip...
+20872 INFO: Looking for dynamic libraries
+21347 INFO: Extra DLL search directories (AddDllDirectory): []
+21347 INFO: Extra DLL search directories (PATH): []
+22248 INFO: Warnings written to C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\exe_build\Fluke ������\warn-Fluke ������.txt
+22292 INFO: Graph cross-reference written to C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\exe_build\Fluke ������\xref-Fluke ������.html
+22370 INFO: checking PYZ
+22376 INFO: Building because C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\fluke_5560a_controller.py changed
+22376 INFO: Building PYZ (ZlibArchive) C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\exe_build\Fluke ������\PYZ-00.pyz
+22729 INFO: Building PYZ (ZlibArchive) C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\exe_build\Fluke ������\PYZ-00.pyz completed successfully.
+22768 INFO: checking PKG
+22787 INFO: Building because toc changed
+22787 INFO: Building PKG (CArchive) Fluke ������.pkg
+25989 INFO: Building PKG (CArchive) Fluke ������.pkg completed successfully.
+26027 INFO: Bootloader C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+26027 INFO: checking EXE
+26046 INFO: Building because toc changed
+26046 INFO: Building EXE from EXE-00.toc
+26048 INFO: Copying bootloader EXE to C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\Fluke ������.exe
+26072 INFO: Copying icon to EXE
+26085 INFO: Copying 0 resources to EXE
+26085 INFO: Embedding manifest in EXE
+26097 INFO: Appending PKG archive to EXE
+26121 INFO: Fixing EXE headers
+26527 INFO: Building EXE from EXE-00.toc completed successfully.
+26568 INFO: Build complete! The results are available in: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs

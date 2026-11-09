@@ -1,0 +1,43 @@
+{
+  "time": "2026-10-29T14:16:00.070200+09:00",
+  "test": "After operator-confirmed instrument restart; no OPER or OUT commands",
+  "cycles": [
+    {
+      "cycle": 1,
+      "source_ip": "192.168.100.100",
+      "idn": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+      "operate": "0",
+      "idn_repeat": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+      "errors_read": [
+        "8012,\"Zero adjustment is required every 14 days\"",
+        "0,\"No Error\""
+      ],
+      "disconnect": "STBY acknowledged, LOCAL acknowledged, TCP closed",
+      "success": true
+    },
+    {
+      "cycle": 2,
+      "source_ip": "192.168.100.100",
+      "idn": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+      "operate": "0",
+      "idn_repeat": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+      "errors_read": [
+        "0,\"No Error\""
+      ],
+      "disconnect": "STBY acknowledged, LOCAL acknowledged, TCP closed",
+      "success": true
+    },
+    {
+      "cycle": 3,
+      "source_ip": "192.168.100.100",
+      "idn": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+      "operate": "0",
+      "idn_repeat": "FLUKE,5560A,7165657,v4.00.07+v4.26.0001",
+      "errors_read": [
+        "0,\"No Error\""
+      ],
+      "disconnect": "STBY acknowledged, LOCAL acknowledged, TCP closed",
+      "success": true
+    }
+  ]
+}

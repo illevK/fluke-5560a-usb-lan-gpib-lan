@@ -1,0 +1,12 @@
+[2026-10-30T09:22:33.254] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\logs\fluke_20261030_092227_117086_12204.log
+[2026-10-30T09:22:33.283] 실행 Python: C:\Users\HCT-2714\AppData\Local\Python\pythoncore-3.14-64\python.exe | PyVISA=True | pyserial=True
+[2026-10-30T09:22:33.305] 시스템 준비 완료 (현재 내 PC IP: 127.0.0.1). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.
+[2026-10-30T09:22:36.396] 장비 연결 및 식별 확인 중…
+[2026-10-30T09:22:36.416] TX QUERY >> OPER? | timeout=조회 설정
+[2026-10-30T09:22:36.418] TX COMMAND >> STBY
+[2026-10-30T09:22:36.420] 조회 OPER?: OperationCancelled: 사용자가 현재 작업을 중단했습니다.
+STBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요.
+[2026-10-30T09:22:36.520] 조회 OPER?: OperationCancelled: 사용자가 현재 작업을 중단했습니다.
+STBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요.
+[2026-10-30T09:22:36.564] [오류] 조회 OPER?: OperationCancelled: 사용자가 현재 작업을 중단했습니다.
+STBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요.

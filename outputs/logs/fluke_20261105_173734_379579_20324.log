@@ -1,0 +1,3 @@
+[2026-11-05T17:37:35.108] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\logs\fluke_20261105_173734_379579_20324.log
+[2026-11-05T17:37:35.150] 실행 Python: C:\Users\HCT-2714\AppData\Local\Programs\Python\Python314\python.exe | PyVISA=True | pyserial=True
+[2026-11-05T17:37:35.166] 시스템 준비 완료 (현재 내 PC IP: 감지 안 됨). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.

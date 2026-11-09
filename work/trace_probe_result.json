@@ -1,0 +1,12 @@
+﻿[
+    {
+        "tcpError":  "TCP timeout",
+        "source":  "169.254.1.100",
+        "ping":  "\nPinging 169.254.1.1 from 169.254.1.100 with 32 bytes of data:\nRequest timed out.\n\nPing statistics for 169.254.1.1:\n    Packets: Sent = 1, Received = 0, Lost = 1 (100% loss),"
+    },
+    {
+        "tcpError":  "\"1\"개의 인수가 있는 \"Wait\"을(를) 호출하는 동안 예외가 발생했습니다. \"하나 이상의 오류가 발생했습니다.\"",
+        "source":  "192.168.100.100",
+        "ping":  "\nPinging 169.254.1.1 from 192.168.100.100 with 32 bytes of data:\nReply from 169.254.1.1: bytes=32 time=2ms TTL=64\n\nPing statistics for 169.254.1.1:\n    Packets: Sent = 1, Received = 1, Lost = 0 (0% loss),\nApproximate round trip times in milli-seconds:\n    Minimum = 2ms, Maximum = 2ms, Average = 2ms"
+    }
+]

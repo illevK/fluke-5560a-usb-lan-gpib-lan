@@ -1,0 +1,99 @@
+PYVISA_IMPORT_ERROR = ""
+try:
+    import pyvisa
+    HAS_PYVISA = True
+except ImportError as exc:
+    pyvisa = None
+    HAS_PYVISA = False
+    PYVISA_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+def dependency_import_message(package, display_name, import_error):
+    """Target the interpreter running this app, independent of PATH/py defaults."""
+    if getattr(sys, "frozen", False):
+        return (f"프로그램에 포함된 {display_name}를 불러오지 못했습니다.\n"
+                f"원인: {import_error or '모듈을 사용할 수 없음'}\n"
+                "최신 Fluke 교정기.exe 파일로 교체한 뒤 다시 실행하세요.")
+    executable = sys.executable
+    if os.path.basename(executable).lower() == "pythonw.exe":
+        console_python = os.path.join(os.path.dirname(executable), "python.exe")
+        if os.path.isfile(console_python):
+            executable = console_python
+    return (
+        f"현재 프로그램의 Python에서 {display_name}를 불러올 수 없습니다.\n"
+        f"실행 Python: {sys.executable}\n"
+        f"원인: {import_error or '모듈을 사용할 수 없음'}\n\n"
+        "Python이 여러 개이면 CMD에서 설치한 환경과 다를 수 있습니다.\n"
+        "CMD(명령 프롬프트)에서 아래 명령을 실행하세요:\n"
+        f'"{executable}" -m pip install {package}\n\n'
+        "설치를 마쳤다면 이 프로그램을 완전히 종료한 뒤 다시 실행하세요."
+    )
+
+
+_VISA_POOL_LOCK = threading.RLock()
+_VISA_POOL_MANAGER = None
+_VISA_POOL_USERS = 0
+
+
+class SharedVisaManager:
+    """Own one lease on PyVISA's cached, process-wide resource manager.
+
+    Closing a raw ResourceManager closes every resource it created, including
+    other connections. Each lease owns its resources; only the last lease may
+    close the shared manager. Device queries remain on separate VISA sessions.
+    """
+    def __init__(self):
+        global _VISA_POOL_MANAGER, _VISA_POOL_USERS
+        self._manager = None
+        self._resources = []
+        with _VISA_POOL_LOCK:
+            if _VISA_POOL_MANAGER is None:
+                _VISA_POOL_MANAGER = pyvisa.ResourceManager()
+            self._manager = _VISA_POOL_MANAGER
+            _VISA_POOL_USERS += 1
+
+    def _require_open(self):
+        if self._manager is None:
+            raise ConnectionError("VISA 관리자 사용이 끝났습니다.")
+        return self._manager
+
+    @property
+    def visalib(self):
+        with _VISA_POOL_LOCK:
+            return self._require_open().visalib
+
+    def list_resources(self, *args, **kwargs):
+        with _VISA_POOL_LOCK:
+            return self._require_open().list_resources(*args, **kwargs)
+
+    def open_resource(self, *args, **kwargs):
+        with _VISA_POOL_LOCK:
+            resource = self._require_open().open_resource(*args, **kwargs)
+            self._resources.append(resource)
+            return resource
+
+    def close_resource(self, resource):
+        with _VISA_POOL_LOCK:
+            for index, owned in enumerate(self._resources):
+                if owned is resource:
+                    self._resources.pop(index)
+                    try:
+                        resource.close()
+                    except Exception:
+                        pass
+                    return
+
+    def close(self):
+        global _VISA_POOL_MANAGER, _VISA_POOL_USERS
+        with _VISA_POOL_LOCK:
+            if self._manager is None:
+                return
+            for resource in list(self._resources):
+                self.close_resource(resource)
+            manager, self._manager = self._manager, None
+            _VISA_POOL_USERS -= 1
+            if _VISA_POOL_USERS == 0:
+                _VISA_POOL_MANAGER = None
+                manager.close()
+
+

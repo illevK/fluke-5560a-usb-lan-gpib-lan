@@ -1,0 +1,5 @@
+[2026-10-30T15:04:54.344] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\logs\fluke_20261030_150436_981849_21592.log
+[2026-10-30T15:04:54.472] 실행 Python: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv\Scripts\python.exe | PyVISA=True | pyserial=True
+[2026-10-30T15:04:54.592] 시스템 준비 완료 (현재 내 PC IP: 127.0.0.1). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.
+[2026-10-30T15:05:00.589] [그룹 변경 보류] 순차 실행을 일시중단하고 현재 응답이 끝난 뒤 변경하세요.
+[2026-10-30T15:05:00.621] [그룹 변경 보류] 순차 실행을 일시중단하고 현재 응답이 끝난 뒤 변경하세요.

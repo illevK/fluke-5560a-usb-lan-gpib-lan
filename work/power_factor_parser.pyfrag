@@ -1,0 +1,95 @@
+    @classmethod
+    def parse_dc_power_row(cls, line):
+        """A complete V/A pair without a frequency is a DC power point.
+
+        Match the whole row so a following nominal value, frequency, or
+        resolution stays available to the existing table-specific parsers.
+        """
+        text = SIUnits.clean(line).strip()
+        match = cls.VI_SLASH_PATTERN.fullmatch(text)
+        if match is None:
+            return None
+        volts = SIUnits.to_base(SIUnits.number(match[1]), match[2], "V")
+        amps = SIUnits.to_base(SIUnits.number(match[3]), match[4], "A")
+        if volts == 0:
+            raise ValueError("DC 전력 조건의 전압은 0이 아닌 값으로 입력하세요.")
+        watts = SIUnits.number(volts * amps)
+        voltage = f"{match[1]} {match[2]}"
+        current = f"{match[3]} {match[4]}"
+        return (f"{voltage} / {current}", "DC", "1", f"{watts:.12g} W")
+
+    @staticmethod
+    def parse_power_factor(text):
+        value_text = SIUnits.clean(text).strip()
+        number = SIUnits.NUMBER
+        # Accept the old signed display as well as 0.5 Lead / Lag 0.5 / 1lead.
+        legacy = re.fullmatch(rf"({number})\s*\(\s*({number})\s+(LEAD|LAG)\s*\)", value_text, re.I)
+        if legacy:
+            if not math.isclose(abs(SIUnits.number(legacy[1])), abs(SIUnits.number(legacy[2]))):
+                raise ValueError(f"역률 표시값이 서로 다릅니다: {text}")
+            value_text = f"{legacy[2]} {legacy[3]}"
+        match = re.fullmatch(rf"(?:(LEAD|LAG)\s*({number})|({number})\s*(LEAD|LAG)?)", value_text, re.I)
+        if not match:
+            raise ValueError(f"역률은 0.5 Lead, 0.5 Lag, 1처럼 입력하세요: {text}")
+        signed = SIUnits.number(match[2] if match[1] else match[3])
+        explicit = match[1] or match[4]
+        value, direction, _ = Fluke5560ACommandBuilder.decode_signed_pf(signed)
+        if explicit:
+            direction = explicit.upper()
+        if value == 1:
+            direction = "LEAD"
+        return value, direction, f"{value:g} {direction}"
+
+    @classmethod
+    def parse_power_factor_row(cls, line):
+        """Read separate Hz/V/A columns, ignoring reference numbers without units."""
+        quantities = {}
+        end = 0
+        for match in cls.TOKEN_FINDER.finditer(line):
+            try:
+                base, _ = SIUnits.split(match[2])
+            except ValueError:
+                continue
+            if base not in ("HZ", "V", "A") or base in quantities:
+                return None
+            quantities[base] = f"{match[1]} {match[2]}"
+            end = match.end()
+        if set(quantities) != {"HZ", "V", "A"}:
+            return None
+        tail = line[end:].strip()
+        if not tail:
+            return None
+        # Direction may be in the first column or next to the final PF value.
+        directions = set(re.findall(r"(?<![A-Za-z])(LEAD|LAG)(?![A-Za-z])", line.upper()))
+        if len(directions) > 1:
+            raise ValueError("한 역률 행에 Lead와 Lag를 동시에 지정할 수 없습니다.")
+        if directions and not re.search(r"LEAD|LAG", tail, re.I):
+            tail += " " + next(iter(directions))
+        _, _, display = cls.parse_power_factor(tail)
+        return (f"{quantities['V']} / {quantities['A']}", quantities['HZ'], display, display)
+
+    @classmethod
+    def build_power_factor_step(cls, step_no, vi_cond_raw, freq_cond_raw, nominal_raw,
+                                use_coil, coil_turns, breakpoint, model):
+        vi = cls.VI_SLASH_PATTERN.fullmatch(vi_cond_raw.strip())
+        if not vi:
+            raise ValueError("역률 출력에는 전압/전류 조건이 필요합니다. 예: 120 V / 10 A")
+        volts = SIUnits.to_base(SIUnits.number(vi[1]), vi[2], "V")
+        amps = SIUnits.to_base(SIUnits.number(vi[3]), vi[4], "A")
+        frequency = cls.parse_value_and_unit(freq_cond_raw)
+        if frequency is None:
+            raise ValueError("역률 출력에는 AC 주파수가 필요합니다. 예: 60 Hz")
+        hz = SIUnits.to_base(*frequency, "HZ")
+        value, direction, display = cls.parse_power_factor(nominal_raw)
+        result = CalibratorCommandBuilder(model).build_power_cmd(
+            mode="ACP", calc_method="VI", voltage_v=volts, current_or_power_val=amps,
+            power_unit="A", freq_hz=hz, phase_mode="DPF", dpf_val=value,
+            dpf_lead_lag=direction, use_coil=use_coil, coil_turns=coil_turns)
+        actual = result["actual_current_a"]
+        desc = f"{volts:g} V, {actual:g} A, {hz:g} Hz, PF {display}"
+        if use_coil and coil_turns != 1:
+            desc += f" (코일 {coil_turns:g}턴 → {result['effective_current_a']:g} A)"
+        return SequenceStep(step_no, vi_cond_raw.strip(), freq_cond_raw.strip(), display,
+                            display, "PF", result["cmd"], desc, breakpoint=breakpoint)
+
+

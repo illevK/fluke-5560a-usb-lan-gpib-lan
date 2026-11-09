@@ -1,0 +1,16 @@
+{
+  "frozen": true,
+  "console_window": 0,
+  "pyvisa": "1.16.1",
+  "pyserial": "3.5",
+  "visa_backend": "Visa Library at C:\\WINDOWS\\system32\\visa32.dll",
+  "title": "Fluke 교정기 통합 제어 프로그램 v6.8.0 (USB / LAN / RS232 / GPIB)",
+  "log_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\work\\standalone_v6.8.0\\logs\\fluke_20261109_085447_644601_18332.log",
+  "measurement_range_copy": true,
+  "measurement_header_copy": true,
+  "dc_power_resolution": true,
+  "raw_measurements_retained": true,
+  "current_group_order_restore": true,
+  "passed": false,
+  "error": "Traceback (most recent call last):\n  File \"exe_entry.py\", line 101, in check_bundle\nAssertionError\n"
+}

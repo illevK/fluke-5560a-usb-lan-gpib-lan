@@ -1,0 +1,1 @@
+{"measurements": [{"size": "1280x900", "table_height": 388, "table_width": 1216}, {"size": "1060x740", "table_height": 228, "table_width": 996}], "clipped_controls": [], "folding_preserves_settings_and_commands": true}

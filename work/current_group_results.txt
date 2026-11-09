@@ -1,0 +1,18 @@
+test_empty_range_does_not_send_commands (__main__.GroupGuiTests.test_empty_range_does_not_send_commands) ... ok
+test_excluded_breakpoint_does_not_interrupt_remaining_normal_rows (__main__.GroupGuiTests.test_excluded_breakpoint_does_not_interrupt_remaining_normal_rows) ... ok
+test_excluded_direct_row_is_blocked_and_next_prev_skip_it (__main__.GroupGuiTests.test_excluded_direct_row_is_blocked_and_next_prev_skip_it) ... ok
+test_group_change_during_pending_or_running_is_rejected (__main__.GroupGuiTests.test_group_change_during_pending_or_running_is_rejected) ... ok
+test_low_then_high_current_runs_once_each_and_switch_starts_at_top (__main__.GroupGuiTests.test_low_then_high_current_runs_once_each_and_switch_starts_at_top) ... ok
+test_same_filter_controls_power_rows (__main__.GroupGuiTests.test_same_filter_controls_power_rows) ... ok
+test_switch_does_not_commit_if_standby_fails (__main__.GroupGuiTests.test_switch_does_not_commit_if_standby_fails) ... ok
+test_coil_current_and_power_use_actual_output (__main__.GroupPolicyTests.test_coil_current_and_power_use_actual_output) ... ok
+test_noncurrent_runs_in_normal_group_only_and_invalid_current_is_rejected (__main__.GroupPolicyTests.test_noncurrent_runs_in_normal_group_only_and_invalid_current_is_rejected) ... ok
+test_physical_terminal_boundary_is_strictly_above_3_1 (__main__.GroupPolicyTests.test_physical_terminal_boundary_is_strictly_above_3_1) ... ok
+test_power_uses_current_not_watts_and_includes_pf_calculation (__main__.GroupPolicyTests.test_power_uses_current_not_watts_and_includes_pf_calculation) ... ok
+test_requested_order_and_inclusive_three_amp_boundary (__main__.GroupPolicyTests.test_requested_order_and_inclusive_three_amp_boundary) ... ok
+test_units_signs_and_scientific_notation (__main__.GroupPolicyTests.test_units_signs_and_scientific_notation) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 31.043s
+
+OK

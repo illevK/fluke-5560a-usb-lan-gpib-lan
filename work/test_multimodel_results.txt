@@ -1,0 +1,25 @@
+test_coil_and_lcomp_current_and_power_for_all_models (test_multimodel.ModelCommandTests.test_coil_and_lcomp_current_and_power_for_all_models) ... ok
+test_fixed_resistors_and_model_compensation_limits (test_multimodel.ModelCommandTests.test_fixed_resistors_and_model_compensation_limits) ... ok
+test_lcomp_frequency_edges_and_noncoil_switch_off (test_multimodel.ModelCommandTests.test_lcomp_frequency_edges_and_noncoil_switch_off) ... ok
+test_model_current_caps_and_terminal_selection (test_multimodel.ModelCommandTests.test_model_current_caps_and_terminal_selection) ... ok
+test_nonfinite_and_invalid_output_rejected (test_multimodel.ModelCommandTests.test_nonfinite_and_invalid_output_rejected) ... ok
+test_parser_applies_coil_and_three_amp_groups_for_older_models (test_multimodel.ModelCommandTests.test_parser_applies_coil_and_three_amp_groups_for_older_models) ... ok
+test_model_change_invalidates_unsupported_old_rows (test_multimodel.ModelGuiTests.test_model_change_invalidates_unsupported_old_rows) ... ok
+test_model_selection_changes_interfaces_rebuilds_and_rejects_connected_change (test_multimodel.ModelGuiTests.test_model_selection_changes_interfaces_rebuilds_and_rejects_connected_change) ... ok
+test_5080_lan_does_not_send_5560_comm_mode (test_multimodel.ModelTransportTests.test_5080_lan_does_not_send_5560_comm_mode) ... ok
+test_simulation_all_models_and_limits_before_output (test_multimodel.ModelTransportTests.test_simulation_all_models_and_limits_before_output) ... ok
+test_supported_native_visa_paths_assert_gpib_remote_without_serial_commands (test_multimodel.ModelTransportTests.test_supported_native_visa_paths_assert_gpib_remote_without_serial_commands) ... ok
+test_unsupported_interfaces_rejected_before_open (test_multimodel.ModelTransportTests.test_unsupported_interfaces_rejected_before_open) ... ok
+test_wrong_selected_model_over_lan_receives_only_idn (test_multimodel.ModelTransportTests.test_wrong_selected_model_over_lan_receives_only_idn) ... ok
+test_all_models_serial_identification_echo_fragmentation_and_output (test_multimodel.SerialTests.test_all_models_serial_identification_echo_fragmentation_and_output) ... ok
+test_missing_library_and_invalid_baud_explain_connection_failure (test_multimodel.SerialTests.test_missing_library_and_invalid_baud_explain_connection_failure) ... ok
+test_output_timeout_attempts_standby_closes_and_never_replays (test_multimodel.SerialTests.test_output_timeout_attempts_standby_closes_and_never_replays) ... ok
+test_serial_device_error_preserves_confirmed_standby_connection (test_multimodel.SerialTests.test_serial_device_error_preserves_confirmed_standby_connection) ... ok
+test_serial_settings_pass_through_without_modifying_instrument (test_multimodel.SerialTests.test_serial_settings_pass_through_without_modifying_instrument) ... ok
+test_serial_wait_can_be_cancelled (test_multimodel.SerialTests.test_serial_wait_can_be_cancelled) ... ok
+test_wrong_model_is_closed_without_remote_or_output (test_multimodel.SerialTests.test_wrong_model_is_closed_without_remote_or_output) ... ok
+
+----------------------------------------------------------------------
+Ran 20 tests in 11.848s
+
+OK

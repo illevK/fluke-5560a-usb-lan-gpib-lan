@@ -1,0 +1,168 @@
+        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True):
+            if not self._ensure_connected_or_sim():
+                return False
+            self.conn_mgr.operation_timeout = self._get_operation_timeout()
+            full_cmd = f"{cmd}; OPER" if auto_oper else cmd
+            self.conn_mgr.profile.validate_command(full_cmd)
+            self.var_active_cmd_summary.set(f"전송 요청: {full_cmd}")
+            self.is_operating = None
+            self._refresh_oper_badge()
+            def operation():
+                self.conn_mgr.send_command(full_cmd)
+                state = self.conn_mgr.query("OPER?").strip()
+                if state not in ("0", "1"):
+                    self.conn_mgr.disconnect(standby=False)
+                    raise InstrumentProtocolError(f"출력 상태 확인 실패: {state}")
+                return state == "1"
+            def done(state):
+                self.is_operating = state
+                self._update_connection_ui(self.conn_mgr.info)
+                self._refresh_oper_badge()
+                self.var_active_cmd_summary.set(f"처리 완료: {full_cmd}")
+                self._log(f"[완료 확인] {full_cmd} | 출력={'OPER' if state else 'STBY'}")
+                if on_done:
+                    on_done(state)
+            return self._start_io(f"TX >> {full_cmd} | 완료 대기 최대 {self.conn_mgr.operation_timeout:g}초",
+                                  operation, done, on_error=on_error, stop_sequence=stop_sequence)
+
+        def _execute_sequence_step(self, index, on_complete=None):
+            if not (0 <= index < len(self.seq_steps)):
+                return False
+            try:
+                if not self._step_in_current_group(self.seq_steps[index]):
+                    self._log(f"[#{index + 1}행 제외] 현재 그룹: {self._current_group_label()}")
+                    return False
+            except ValueError as exc:
+                self._show_report("전류 그룹 확인", str(exc))
+                return False
+            if not self._ensure_connected_or_sim():
+                return False
+            self.seq_current_idx = self.seq_paused_idx = index
+            step = self.seq_steps[index]
+            if not step.scpi_cmd or step.func_type == "ERROR":
+                self._show_report("행 설정 확인", f"#{step.step_no}행: {step.actual_out_desc}")
+                return False
+            step.status = "… 출력 안정화 대기"
+            self.excel_grid._update_single_row_visual(index, step, is_active=True)
+            self.excel_grid.scroll_to_row(index)
+            self.var_active_row_banner.set(f"#{step.step_no}행 완료 응답 대기: {step.scpi_cmd}")
+            self.lbl_active_row_banner.configure(bg="#FEF3C7", fg="#92400E")
+            self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={step.scpi_cmd}")
+            def same_step():
+                return index < len(self.seq_steps) and self.seq_steps[index] is step
+            def done(_state):
+                if not same_step():
+                    self.seq_running = False
+                    return
+                for i, previous in enumerate(self.seq_steps):
+                    if i != index and previous.status == "▶ 측정 진행 중":
+                        previous.status = "✓ 완료"
+                        self.excel_grid._update_single_row_visual(i, previous, is_active=False)
+                step.status = "▶ 측정 진행 중"
+                plan = self._seq_active_indices
+                self.progress_var.set((plan.index(index) + 1) / len(plan) * 100 if index in plan else 100)
+                self.var_active_row_banner.set(f"[#{step.step_no}/{len(self.seq_steps)}행 출력 확인] {step.nominal_raw} → {step.actual_out_desc}")
+                self.lbl_active_row_banner.configure(bg="#FDE047", fg="#0F172A")
+                self.excel_grid._update_single_row_visual(index, step, is_active=True)
+                self._log(f"[#{step.step_no}행 완료 응답 확인] 유지시간 시작")
+                if on_complete:
+                    on_complete()
+            def failed(exc):
+                self.seq_running = False
+                self.seq_after_id = None
+                step.status = "⚠ 오류"
+                if same_step():
+                    self.excel_grid._update_single_row_visual(index, step, is_active=False)
+                self.var_active_row_banner.set(f"#{step.step_no}행 중단 — {step.scpi_cmd} / 출력 상태는 상단과 본체에서 확인하세요.")
+                self.lbl_active_row_banner.configure(bg="#FECACA", fg="#991B1B")
+                self._log(f"[#{step.step_no}행 실행 오류] 명령={step.scpi_cmd} | {exc}")
+            try:
+                return self._send_and_log(step.scpi_cmd, auto_oper=self.var_seq_auto_oper.get(),
+                                          on_done=done, on_error=failed, stop_sequence=False)
+            except Exception as exc:
+                failed(exc)
+                return False
+
+        def _run_next_auto_step(self, idx, stop_idx, dwell_ms):
+            self.seq_after_id = None
+            if not self.seq_running or self._io_busy:
+                return
+            try:
+                while idx <= stop_idx and idx < len(self.seq_steps) and not self._step_in_current_group(self.seq_steps[idx]):
+                    self._log(f"[#{idx + 1}행 건너뜀] 다른 전류 그룹")
+                    idx += 1
+            except ValueError as exc:
+                self.seq_running = False
+                self._show_report("전류 그룹 확인", str(exc))
+                return
+            if idx > stop_idx or idx >= len(self.seq_steps):
+                self.seq_running = False
+                def finished(_state):
+                    for r_i, step in enumerate(self.seq_steps):
+                        if step.status == "▶ 측정 진행 중":
+                            step.status = "✓ 완료"
+                            self.excel_grid._update_single_row_visual(r_i, step, is_active=False)
+                    self.progress_var.set(100)
+                    self.var_active_row_banner.set(f"{self._current_group_label()} 완료 — STBY 확인 완료. 케이블 변경 후 다른 그룹을 선택하세요.")
+                    self.lbl_active_row_banner.configure(bg="#DCFCE7", fg="#166534")
+                self._send_and_log("STBY", on_done=finished)
+                return
+            def completed():
+                if not self.seq_running:
+                    return
+                if self.seq_steps[idx].breakpoint:
+                    self.seq_steps[idx].status = "🛑 중단점 도달"
+                    self.seq_running = False
+                    self.seq_paused_idx = min(len(self.seq_steps) - 1, idx + 1)
+                    self.var_active_row_banner.set(f"#{idx + 1}행 중단점 도달 — 다음 행부터 재개 가능")
+                    self.excel_grid._update_single_row_visual(idx, self.seq_steps[idx], is_active=False)
+                    return
+                self.seq_after_id = self.after(dwell_ms, lambda: self._run_next_auto_step(idx + 1, stop_idx, dwell_ms))
+            if not self._execute_sequence_step(idx, on_complete=completed):
+                self.seq_running = False
+
+        def _on_oper_clicked(self):
+            try:
+                self._send_and_log("OPER")
+            except Exception as exc:
+                messagebox.showerror("출력 요청 오류", str(exc))
+
+        def _on_stby_clicked(self):
+            self._on_seq_stop_auto(silent=True)
+            if self._io_busy:
+                self._pending_standby = True
+                self.conn_mgr.request_abort()
+                self.is_operating = None
+                self._refresh_oper_badge()
+                self._log("[중지 요청] 현재 대기를 중단하고 STBY 전송을 시도합니다. 본체에서 출력 차단을 확인하세요.")
+                return
+            try:
+                self._send_and_log("STBY")
+            except Exception as exc:
+                messagebox.showerror("STBY 요청 오류", str(exc))
+
+        def _on_reset_clicked(self):
+            self._on_seq_stop_auto(silent=True)
+            try:
+                self._send_and_log("*RST; *CLS; STBY")
+            except Exception as exc:
+                messagebox.showerror("초기화 요청 오류", str(exc))
+
+        def _on_manual_send(self, is_query):
+            if not self._ensure_connected_or_sim():
+                return
+            cmd = self.var_manual_cmd.get().strip()
+            if not cmd:
+                return
+            try:
+                if is_query or "?" in cmd:
+                    self.conn_mgr.operation_timeout = self._get_operation_timeout()
+                    def done(response):
+                        self._log(f"RX << {response}")
+                        self._update_connection_ui(self.conn_mgr.info)
+                    self._start_io(f"TX QUERY >> {cmd}", lambda: self.conn_mgr.query(cmd), done)
+                else:
+                    self._send_and_log(cmd)
+            except Exception as exc:
+                self._log(f"[명령 오류] {exc}")
+

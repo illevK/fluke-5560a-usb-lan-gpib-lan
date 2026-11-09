@@ -1,0 +1,11 @@
+﻿{
+    "addresses":  [
+                      {
+                          "IPAddress":  "192.168.100.100",
+                          "PrefixLength":  24,
+                          "SkipAsSource":  false
+                      }
+                  ],
+    "removed":  "169.254.1.100",
+    "success":  true
+}

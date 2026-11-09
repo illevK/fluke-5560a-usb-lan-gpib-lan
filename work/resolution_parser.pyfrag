@@ -1,0 +1,31 @@
+    @classmethod
+    def parse_input_row(cls, raw_line):
+        # An explicit two-column target/resolution paste is unambiguous when
+        # both units describe the same quantity. Hz + V legacy rows stay intact.
+        cells = [value.strip() for value in raw_line.strip().split('\t')]
+        if len(cells) == 2 and all(cells):
+            fields = cls.parse_line_to_fields(cells[0])
+            if fields:
+                nominal = cls.parse_value_and_unit(fields[3])
+                resolution = cls.parse_value_and_unit(cells[1])
+                if nominal and resolution and SIUnits.split(nominal[1])[0] == SIUnits.split(resolution[1])[0]:
+                    MeasurementResolution.validate(cells[1], fields[3])
+                    return fields, cells[1]
+        return cls.parse_line_to_fields(raw_line), ""
+
+    @classmethod
+    def build_sequence_steps(cls, raw_text, use_coil=False, coil_turns=1.0,
+                             default_zcomp="WIRE4", current_post="AUTO", model="5560A"):
+        steps = []
+        for raw_line in raw_text.splitlines():
+            fields, resolution = cls.parse_input_row(raw_line)
+            if fields is None:
+                continue
+            vi, freq, pf, nominal = fields
+            step = cls.build_Single_step_from_fields(len(steps) + 1, vi, freq, pf, nominal,
+                use_coil=use_coil, coil_turns=coil_turns, default_zcomp=default_zcomp,
+                current_post=current_post, model=model)
+            step.resolution_raw = resolution
+            steps.append(step)
+        return steps
+
