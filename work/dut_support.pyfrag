@@ -415,14 +415,31 @@ class DUTSession:
                 # Readback prevents unsupported firmware from returning older,
                 # differently ordered values after silently rejecting a setting.
                 for index, item in enumerate(items, 1):
-                    reply = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").upper().replace(' ', '')
+                    raw_reply = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
+                    reply = raw_reply.split()[-1].replace(' ', '') if raw_reply else ""
                     if reply.startswith("LAMB,"):
                         reply = reply.replace("LAMB,", "LAMBDA,", 1)
                     if reply.endswith(",TOT"):
                         reply = reply.removesuffix(",TOT") + ",TOTAL"
-                    if reply != item:
-                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {item} / {reply[:100]}")
-                self.transport.write(":NUMERIC:HOLD OFF")
+                    if reply != item and self.profile.model.startswith(("WT310", "WT332", "WT333")):
+                        fallback = item.replace("URMS,", "U,", 1).replace("IRMS,", "I,", 1)
+                        if fallback != item:
+                            self.transport.write(":INPUT:MODE RMS")
+                            self.transport.write(f":NUMERIC:NORMAL:ITEM{index} {fallback}")
+                            raw_reply2 = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
+                            reply2 = raw_reply2.split()[-1].replace(' ', '') if raw_reply2 else ""
+                            if reply2 == fallback:
+                                items[index - 1] = fallback
+                                reply = fallback
+                    if reply != items[index - 1]:
+                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {items[index - 1]} / {reply[:100]}")
+                if self.profile.model.startswith(("WT310", "WT332", "WT333", "WT500")) and self.profile.model != "WT5000":
+                    if type(self.transport) is DUTTransport:
+                        self.transport.write(":HOLD OFF")
+                    else:
+                        self.transport.write(":NUMERIC:HOLD OFF")
+                else:
+                    self.transport.write(":NUMERIC:HOLD OFF")
                 numbers = self._read_wt_numbers(count, fresh)
                 values = dict(zip((m[0] for m in DUT_METRICS), numbers))
                 if count == 9:

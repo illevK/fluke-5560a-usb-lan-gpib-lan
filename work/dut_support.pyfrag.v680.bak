@@ -1,0 +1,456 @@
+# DUT acquisition owns its own connection; linked sequences request fresh samples.
+# Command references and supported families: outputs/DUT_연결_안내.md.
+DUT_METRICS = (
+    ("voltage", "전압 · RMS", "V"), ("current", "전류 · RMS", "A"),
+    ("power", "유효전력", "W"), ("apparent", "피상전력", "VA"),
+    ("reactive", "무효전력", "var"), ("pf", "역률", ""),
+    ("frequency", "주파수", "Hz"),
+)
+
+
+@dataclass(frozen=True)
+class DUTProfile:
+    family: str
+    model: str
+    channels: int
+    wt3000_numeric: bool = False
+
+
+def identify_dut(identity):
+    parts = [part.strip().strip('"').upper() for part in identity.split(',')]
+    if len(parts) < 2:
+        raise ValueError(f"DUT 식별 응답을 확인할 수 없습니다: {identity[:160]}")
+    maker = re.sub(r"[^A-Z0-9]", "", parts[0])
+    model = re.sub(r"[\s-]", "", parts[1])
+    if maker in ("NEWTONS4TH", "NEWTONS4THLTD", "N4L"):
+        number = model.removeprefix("PPA")
+        # These families document the same POWER/RMS and POWER/WATTS records.
+        if re.fullmatch(r"(?:5\d{2}|(?:15|25|26|35|45|55)\d{2})[A-Z]?", number):
+            return DUTProfile("PPA", "PPA" + number, 6 if number.startswith("35") else 3)
+    if maker.startswith("YOKOGAWA"):
+        # WT3000(E) includes the option suffix in the model field of *IDN?.
+        model_code = parts[1].split("-", 1)[0].strip()
+        if re.fullmatch(r"76030[1-4]", model_code):
+            return DUTProfile("WT", f"WT3000 ({model_code})", int(model_code[-1]), wt3000_numeric=True)
+        if re.fullmatch(r"WT300[1-4]E", model_code):
+            return DUTProfile("WT", model_code, int(model_code[-2]), wt3000_numeric=True)
+        if model == "WT5000":
+            return DUTProfile("WT", model, 7)
+        if re.fullmatch(r"WT(?:310(?:HC|EH|E)?|332E?|333E?)", model):
+            channels = 2 if model.startswith("WT332") else 3 if model.startswith("WT333") else 1
+            return DUTProfile("WT", model, channels)
+        if re.fullmatch(r"WT180[1-6]E?", model):
+            return DUTProfile("WT", model, int(model[5]))
+        if model in ("WT1800", "WT1800E"):
+            return DUTProfile("WT", model, 6)
+        if re.fullmatch(r"76020[1-3]", model):
+            return DUTProfile("WT", "WT500 (" + model + ")", int(model[-1]))
+        if model == "WT500":
+            return DUTProfile("WT", model, 3)
+    raise ValueError(f"아직 등록되지 않은 DUT입니다: {identity[:160]}\n"
+                     "PPA 5xx/15xx/25xx/26xx/35xx/45xx/55xx, WT300/300E/500/1800/3000/3000E/5000 계열을 지원합니다. "
+                     "다른 모델은 해당 통신 명령 확인 후 추가할 수 있습니다.")
+
+
+def dut_numbers(reply, count):
+    # A bad response must never be silently shifted into another measurement.
+    tokens = reply.strip().split(',')
+    if len(tokens) != count:
+        raise ValueError(f"DUT 응답 항목 수가 다릅니다 (예상 {count}, 수신 {len(tokens)}): {reply[:160]}")
+    values = []
+    for token in tokens:
+        token = token.strip().upper()
+        if token in ("NAN", "INF", "+INF", "-INF", "OVLD", "OVER", "OVERLOAD", "---", "----"):
+            values.append(None)
+            continue
+        try:
+            value = float(token)
+        except ValueError as exc:
+            raise ValueError(f"DUT의 숫자 응답을 해석할 수 없습니다: {token[:80]}") from exc
+        values.append(value if math.isfinite(value) and abs(value) < 9e36 else None)
+    return values
+
+
+@dataclass(frozen=True)
+class DUTSample:
+    identity: str
+    channel: int
+    received_at: str
+    values: dict
+    note: str
+    simulated: bool = False
+    vi_modes: tuple[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class DUTSettings:
+    mode: str = "VISA"
+    address: str = ""
+    port: int = 10001
+    timeout: float = 10.0
+    eol: str = "CRLF"
+    baudrate: int = 9600
+    data_bits: int = 8
+    parity: str = "N"
+    stop_bits: int = 1
+    flow: str = "NONE"
+
+    def validate(self):
+        if self.mode not in ("VISA", "WT_LAN", "WT5000_TCP", "PPA_LAN", "SERIAL", "DEMO"):
+            raise ValueError("DUT 연결 방식을 선택하세요.")
+        if not math.isfinite(self.timeout) or not 1 <= self.timeout <= 60:
+            raise ValueError("DUT 응답 대기는 1~60초로 입력하세요.")
+        if self.eol not in ("LF", "CRLF", "CR"):
+            raise ValueError("줄 끝 문자를 확인하세요.")
+        if self.mode == "DEMO":
+            return
+        if not self.address.strip() or any(c in self.address for c in '\r\n\x00'):
+            raise ValueError("DUT 주소 또는 COM/VISA 리소스를 입력하세요.")
+        if self.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN"):
+            AutoNetworkAligner.normalize_ipv4(self.address)
+        if self.mode == "PPA_LAN" and not 1 <= self.port <= 65535:
+            raise ValueError("PPA 본체의 TCP 포트 번호를 입력하세요 (1~65535).")
+        if self.mode == "SERIAL":
+            if not re.fullmatch(r"COM[1-9]\d*", self.address, re.I):
+                raise ValueError("COM 포트 형식으로 입력하세요. 예: COM5")
+            if self.baudrate not in (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200):
+                raise ValueError("RS232 통신 속도를 확인하세요.")
+            if self.data_bits not in (7, 8) or self.parity not in ("N", "E", "O") or self.stop_bits not in (1, 2) or self.flow not in ("NONE", "RTS/CTS", "XON/XOFF"):
+                raise ValueError("RS232 통신 설정을 확인하세요.")
+        if self.mode == "VISA" and not re.fullmatch(r"(?:USB|GPIB|TCPIP)\d*::[^\r\n]+::(?:INSTR|SOCKET)", self.address, re.I):
+            raise ValueError("USB/GPIB/TCPIP VISA 리소스를 선택하세요. COM 포트는 RS232 방식을 사용하세요.")
+
+
+class DUTTransport:
+    """A bounded ASCII transport. No calibrator commands, reset, or retries."""
+    def __init__(self, settings, cancel):
+        self.settings, self.cancel = settings, cancel
+        self.resource = self.manager = self.sock = self.serial_port = None
+        self.buffer = bytearray()
+        self.eol = "\n" if settings.mode == "WT5000_TCP" else {"LF": "\n", "CRLF": "\r\n", "CR": "\r"}[settings.eol]
+
+    def _check_cancel(self):
+        if self.cancel.is_set():
+            raise InterruptedError("DUT 조회를 중지했습니다.")
+
+    def open(self):
+        s = self.settings
+        self._check_cancel()
+        try:
+            if s.mode in ("VISA", "WT_LAN"):
+                if not HAS_PYVISA:
+                    raise RuntimeError(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
+                self.manager = SharedVisaManager()
+                address = f"TCPIP0::{s.address}::inst0::INSTR" if s.mode == "WT_LAN" else s.address
+                self.resource = self.manager.open_resource(address, open_timeout=int(s.timeout * 1000))
+                self.resource.timeout = int(s.timeout * 1000)
+                self.resource.write_termination = self.eol
+                self.resource.read_termination = self.eol[-1]
+                self.resource.encoding = "ascii"
+            elif s.mode in ("PPA_LAN", "WT5000_TCP"):
+                port = 10002 if s.mode == "WT5000_TCP" else s.port
+                self.sock = socket.create_connection((s.address, port), timeout=s.timeout)
+            elif s.mode == "SERIAL":
+                if not HAS_PYSERIAL:
+                    raise RuntimeError(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
+                self.serial_port = serial.Serial(s.address, baudrate=s.baudrate, bytesize=s.data_bits,
+                    parity=s.parity, stopbits=s.stop_bits, timeout=.2, write_timeout=s.timeout,
+                    rtscts=s.flow == "RTS/CTS", xonxoff=s.flow == "XON/XOFF")
+            else:
+                raise ValueError("지원하지 않는 실제 연결 방식입니다.")
+            self._check_cancel()
+        except Exception:
+            self.close()
+            raise
+
+    def write(self, command):
+        self._check_cancel()
+        if '\n' in command or '\r' in command:
+            raise ValueError("DUT 명령은 한 줄이어야 합니다.")
+        if self.resource is not None:
+            self.resource.write(command)
+        else:
+            data = (command + self.eol).encode('ascii')
+            if self.sock is not None:
+                self.sock.settimeout(self.settings.timeout)
+                self.sock.sendall(data)
+            elif self.serial_port is not None:
+                if self.serial_port.write(data) != len(data):
+                    raise IOError("DUT 명령 일부만 전송되었습니다.")
+            else:
+                raise ConnectionError("DUT가 연결되지 않았습니다.")
+
+    def query(self, command):
+        self.write(command)
+        if self.resource is not None:
+            reply = self.resource.read()
+            self._check_cancel()
+            if len(reply) > 65536:
+                raise ValueError("DUT 응답이 너무 큽니다.")
+            return reply.strip()
+        deadline = time.monotonic() + self.settings.timeout
+        while True:
+            self._check_cancel()
+            for index, byte in enumerate(self.buffer):
+                if byte in (10, 13):
+                    line = bytes(self.buffer[:index])
+                    del self.buffer[:index + 1]
+                    if line.strip():
+                        return line.decode('ascii').strip()
+                    break
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"DUT 응답 시간 초과: {command}")
+                if self.sock is not None:
+                    self.sock.settimeout(min(.2, remaining))
+                    try:
+                        data = self.sock.recv(4096)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        raise ConnectionError("DUT가 연결을 종료했습니다.")
+                else:
+                    data = self.serial_port.read(min(4096, max(1, self.serial_port.in_waiting)))
+                self.buffer.extend(data)
+                if len(self.buffer) > 65536:
+                    raise ValueError("DUT 응답이 너무 큽니다.")
+
+    def close(self):
+        self.resource = None  # Its manager lease closes this session only.
+        for name in ("sock", "serial_port", "manager"):
+            obj = getattr(self, name)
+            setattr(self, name, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        self.buffer.clear()
+
+
+class DUTSession:
+    def __init__(self, transport_factory=DUTTransport):
+        self.transport_factory = transport_factory
+        self.cancel = threading.Event()
+        self.transport = self.profile = self.sample = None
+        self.identity = ""
+        self.simulated = False
+
+    @property
+    def connected(self):
+        return self.profile is not None
+
+    @property
+    def supports_fresh_capture(self):
+        return self.connected and self.profile.family in ("WT", "PPA")
+
+    def connect(self, settings):
+        settings.validate()
+        self.disconnect()
+        if self.cancel.is_set():
+            raise InterruptedError("DUT 연결을 중지했습니다.")
+        if settings.mode == "DEMO":
+            self.profile = DUTProfile("DEMO", "가상 DUT", 3)
+            self.identity = "가상 DUT · 실제 측정값 아님"
+            self.simulated = True
+            return self.identity
+        try:
+            self.transport = self.transport_factory(settings, self.cancel)
+            self.transport.open()
+            self.identity = self.transport.query("*IDN?")
+            self.profile = identify_dut(self.identity)
+            if settings.mode in ("PPA_LAN", "WT_LAN") and self.profile.family != settings.mode.split('_')[0]:
+                raise ValueError("선택한 LAN 방식과 DUT 제조사가 다릅니다.")
+            if settings.mode == "WT5000_TCP" and self.profile.model != "WT5000":
+                raise ValueError("이 TCP 연결은 WT5000용입니다. 본체 Remote Control의 Command Type을 WT5000으로 확인하세요.")
+            return self.identity
+        except Exception:
+            self.disconnect()
+            raise
+
+    def _wait_data_flag(self, command, mask, timeout_message):
+        deadline = time.monotonic() + self.transport.settings.timeout
+        while True:
+            if self.cancel.is_set():
+                raise InterruptedError("DUT 조회를 중지했습니다.")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(timeout_message)
+            reply = self.transport.query(command).strip()
+            if not re.fullmatch(r"\+?[0-9]{1,10}", reply):
+                raise ValueError(f"DUT 데이터 갱신 상태를 확인할 수 없습니다: {reply[:80]}")
+            if (int(reply) & mask) == mask:
+                return
+            if self.cancel.wait(min(.1, max(0, deadline - time.monotonic()))):
+                raise InterruptedError("DUT 조회를 중지했습니다.")
+
+    def _require_wt_live_reading(self):
+        t = self.transport
+        hold = t.query(":HOLD?").strip().upper()
+        if hold not in ("0", "OFF"):
+            raise ValueError("WT 본체의 HOLD를 해제한 뒤 다시 실행하세요.")
+        if self.profile.model.startswith(("WT310", "WT332", "WT333")):
+            if t.query(":MEASURE:MHOLD?").strip().upper() not in ("0", "OFF"):
+                raise ValueError("WT 본체의 MAX HOLD를 해제한 뒤 다시 실행하세요.")
+
+    def _read_wt_numbers(self, count, fresh):
+        command = ":NUMERIC:NORMAL:VALUE?"
+        if not fresh:
+            return dut_numbers(self.transport.query(command), count)
+        t = self.transport
+        self._require_wt_live_reading()
+        original_filter = t.query(":STATUS:FILTER1?").strip().upper()
+        if original_filter not in {"RISE", "FALL", "BOTH", "NEVER"}:
+            raise ValueError("WT 데이터 갱신 이벤트 설정을 확인할 수 없습니다.")
+        changed_filter = original_filter != "FALL"
+        failed = True
+        try:
+            if changed_filter:
+                t.write(":STATUS:FILTER1 FALL")
+                if t.query(":STATUS:FILTER1?").strip().upper() != "FALL":
+                    raise ValueError("WT 데이터 갱신 이벤트 설정이 적용되지 않았습니다.")
+            # EESR is cleared on read. Discard events before the stabilized
+            # output, then wait through a complete post-output update interval.
+            t.query(":STATUS:EESR?")
+            for _ in range(2):
+                self._wait_data_flag(":STATUS:EESR?", 1,
+                    "WT 새 측정값 대기 시간 초과: 본체 HOLD·갱신 주기와 DUT 응답 대기 시간을 확인하세요.")
+            self._require_wt_live_reading()
+            values = dut_numbers(t.query(command), count)
+            failed = False
+            return values
+        finally:
+            if changed_filter and not self.cancel.is_set():
+                try:
+                    t.write(f":STATUS:FILTER1 {original_filter}")
+                except Exception:
+                    if not failed:
+                        raise
+
+    def _ppa_range_overloaded(self, input_channel):
+        reply = self.transport.query(f"STATUS,CH{input_channel}?").strip().upper().split(",")
+        if len(reply) != 3 or reply[2].strip() not in {"OVER", "LOW", "OK"}:
+            raise ValueError("PPA 입력 범위 상태를 확인할 수 없습니다.")
+        return reply[2].strip() == "OVER"
+
+    def read(self, channel=1, include_dc=False, fresh=False):
+        self.sample = None
+        if not self.connected:
+            raise ConnectionError("DUT를 먼저 연결하세요.")
+        if self.cancel.is_set():
+            self.disconnect()
+            raise InterruptedError("DUT 조회를 중지했습니다.")
+        if not 1 <= channel <= self.profile.channels:
+            raise ValueError(f"{self.profile.model}: 입력 채널은 1~{self.profile.channels} 중 선택하세요.")
+        try:
+            vi_modes = None
+            if self.simulated:
+                if fresh:
+                    raise ValueError("미리보기 값을 실제 측정표에 자동 기록할 수 없습니다.")
+                values = dict(zip((m[0] for m in DUT_METRICS), (120., 1., 60., 120., 103.923048, .5, 60.)))
+                note = "미리보기 · 실제 측정값이 아닙니다."
+            elif self.profile.family == "PPA":
+                # A POWER result read clears DAV bit 0. Discard the current
+                # result and the next update so neither can predate the dwell.
+                # This avoids *TRG, which restarts ranging and smoothing.
+                if include_dc and fresh:
+                    coupling = self.transport.query(f"COUPLI,PHASE{channel}?").strip()
+                    if coupling not in ("0", "2"):
+                        raise ValueError("PPA의 DC 측정에는 해당 입력의 커플링을 AC+DC 또는 DC로 설정하세요.")
+                self.transport.write("RESOLU,HIGH")
+                rms_command = f"POWER,PHASE{channel},RMS?"
+                if fresh:
+                    dut_numbers(self.transport.query(rms_command), 5)
+                    for index in range(2):
+                        self._wait_data_flag("DAV?", 3,
+                            "PPA 새 측정값 대기 시간 초과: 본체 측정 상태·갱신 주기와 DUT 응답 대기 시간을 확인하세요.")
+                        if index == 0:
+                            dut_numbers(self.transport.query(rms_command), 5)
+                rms = dut_numbers(self.transport.query(rms_command), 5)
+                power = dut_numbers(self.transport.query(f"POWER,PHASE{channel},WATTS?"), 11)
+                values = dict(zip((m[0] for m in DUT_METRICS),
+                    (rms[1], rms[3], power[1], power[3], power[5], power[7], power[0])))
+                if include_dc:
+                    values.update(dc_voltage=rms[2], dc_current=rms[4])
+                if fresh and channel <= 3:
+                    voltage_over = self._ppa_range_overloaded(2 * channel - 1)
+                    current_over = self._ppa_range_overloaded(2 * channel)
+                    for overloaded, keys in ((voltage_over, ("voltage", "dc_voltage", "frequency")),
+                                             (current_over, ("current", "dc_current"))):
+                        if overloaded:
+                            for key in keys:
+                                if key in values:
+                                    values[key] = None
+                    if voltage_over or current_over:
+                        values.update(power=None, apparent=None, reactive=None, pf=None)
+                note = ("PPA 새 데이터 갱신 확인 · RMS·전력 순차 조회" if fresh
+                        else "PPA RMS·전력 순차 조회 (동시 샘플 아님) · 역률 부호는 본체 설정 기준")
+            else:
+                # Mapping affects communication output items only, not ranges or
+                # scale factors. Reapply per read so another panel cannot silently
+                # change which quantity a numeric position represents.
+                self.transport.write(":COMMUNICATE:HEADER OFF")
+                self.transport.write(":NUMERIC:FORMAT ASCII")
+                count = 9 if include_dc and not self.profile.wt3000_numeric else 7
+                self.transport.write(f":NUMERIC:NORMAL:NUMBER {count}")
+                if self.profile.wt3000_numeric:
+                    # Legacy U/I follows the element's measurement mode.
+                    voltage_mode = self.transport.query(f":INPUT:VOLTAGE:MODE:ELEMENT{channel}?").strip().upper()
+                    current_mode = self.transport.query(f":INPUT:CURRENT:MODE:ELEMENT{channel}?").strip().upper()
+                    valid_modes = {"RMS", "MEAN", "DC", "RMEAN"}
+                    if voltage_mode not in valid_modes or current_mode not in valid_modes:
+                        raise ValueError("WT3000 계열의 전압·전류 측정 모드를 확인할 수 없습니다.")
+                    vi_modes = (voltage_mode, current_mode)
+                    functions = ("U", "I", "P", "S", "Q", "LAMBDA", "FU")
+                else:
+                    functions = ("URMS", "IRMS", "P", "S", "Q", "LAMBDA", "FU")
+                    if include_dc:
+                        functions += ("UDC", "IDC")
+                items = []
+                for function in functions:
+                    order = ",TOTAL" if self.profile.wt3000_numeric and function != "FU" else ""
+                    items.append(f"{function},{channel}{order}")
+                for index, item in enumerate(items, 1):
+                    self.transport.write(f":NUMERIC:NORMAL:ITEM{index} {item}")
+                # Readback prevents unsupported firmware from returning older,
+                # differently ordered values after silently rejecting a setting.
+                for index, item in enumerate(items, 1):
+                    reply = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").upper().replace(' ', '')
+                    if reply.startswith("LAMB,"):
+                        reply = reply.replace("LAMB,", "LAMBDA,", 1)
+                    if reply.endswith(",TOT"):
+                        reply = reply.removesuffix(",TOT") + ",TOTAL"
+                    if reply != item:
+                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {item} / {reply[:100]}")
+                self.transport.write(":NUMERIC:HOLD OFF")
+                numbers = self._read_wt_numbers(count, fresh)
+                values = dict(zip((m[0] for m in DUT_METRICS), numbers))
+                if count == 9:
+                    values.update(dc_voltage=numbers[7], dc_current=numbers[8])
+                elif include_dc and vi_modes:
+                    if vi_modes[0] == "DC":
+                        values["dc_voltage"] = numbers[0]
+                    if vi_modes[1] == "DC":
+                        values["dc_current"] = numbers[1]
+                note = ("WT 새 데이터 갱신 확인 · 본체 배율 적용값" if fresh
+                        else "WT 통신 출력 7항목 · 주파수는 전압 기준 · 본체 배율 적용값")
+            if self.cancel.is_set():
+                raise InterruptedError("DUT 조회를 중지했습니다.")
+            if values["pf"] is not None and abs(values["pf"]) > 1.000001:
+                values["pf"] = None
+            self.sample = DUTSample(self.identity, channel, datetime.datetime.now().isoformat(timespec='seconds'),
+                                    values, note, self.simulated, vi_modes)
+            return self.sample
+        except Exception:
+            # A late response cannot become the next query's result.
+            self.disconnect()
+            raise
+
+    def disconnect(self):
+        if self.transport is not None:
+            self.transport.close()
+        self.transport = self.profile = self.sample = None
+        self.identity = ""
+        self.simulated = False
+
+

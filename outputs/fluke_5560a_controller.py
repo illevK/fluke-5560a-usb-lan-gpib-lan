@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fluke 5560A / 5522A / 5520A / 5080A Controller v6.8.1
+Fluke 5560A / 5522A / 5520A / 5080A Controller v6.9.0
 LAN: verified physical adapter, source-IP binding, Telnet stream framing,
 strict *IDN? validation, read-only diagnosis, background connection tasks.
 USB/GPIB: PyVISA with backend diagnostics and correct interface handling.
@@ -1374,9 +1374,23 @@ class AutoNetworkAligner:
 
     @classmethod
     def select_source_ip(cls, adapter_idx: str, target_ip: str) -> str:
-        if not adapter_idx:
-            return ""
         target = ipaddress.IPv4Address(cls.normalize_ipv4(target_ip))
+        if not adapter_idx:
+            # [PATCH v6.9.0] '자동' 선택 시 Wi-Fi로 빠지지 않도록 Up 상태인 유선 랜카드를 우선 선택
+            interfaces = cls.list_ethernet_interfaces(refresh=True)
+            for adapter in interfaces:
+                if adapter.get("state") != "Up":
+                    continue
+                for item in adapter.get("addresses") or []:
+                    network = ipaddress.IPv4Interface(f"{item['ip']}/{item['prefix']}").network
+                    if target in network and str(target) != item["ip"]:
+                        return item["ip"]
+            for adapter in interfaces:
+                if adapter.get("wired") and adapter.get("state") == "Up":
+                    addrs = adapter.get("addresses") or []
+                    if addrs:
+                        return addrs[0]["ip"]
+            return "" 
         for adapter in cls.list_ethernet_interfaces(refresh=True):
             if adapter["idx"] != str(adapter_idx):
                 continue
@@ -2005,14 +2019,31 @@ class DUTSession:
                 # Readback prevents unsupported firmware from returning older,
                 # differently ordered values after silently rejecting a setting.
                 for index, item in enumerate(items, 1):
-                    reply = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").upper().replace(' ', '')
+                    raw_reply = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
+                    reply = raw_reply.split()[-1].replace(' ', '') if raw_reply else ""
                     if reply.startswith("LAMB,"):
                         reply = reply.replace("LAMB,", "LAMBDA,", 1)
                     if reply.endswith(",TOT"):
                         reply = reply.removesuffix(",TOT") + ",TOTAL"
-                    if reply != item:
-                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {item} / {reply[:100]}")
-                self.transport.write(":NUMERIC:HOLD OFF")
+                    if reply != item and self.profile.model.startswith(("WT310", "WT332", "WT333")):
+                        fallback = item.replace("URMS,", "U,", 1).replace("IRMS,", "I,", 1)
+                        if fallback != item:
+                            self.transport.write(":INPUT:MODE RMS")
+                            self.transport.write(f":NUMERIC:NORMAL:ITEM{index} {fallback}")
+                            raw_reply2 = self.transport.query(f":NUMERIC:NORMAL:ITEM{index}?").strip().upper()
+                            reply2 = raw_reply2.split()[-1].replace(' ', '') if raw_reply2 else ""
+                            if reply2 == fallback:
+                                items[index - 1] = fallback
+                                reply = fallback
+                    if reply != items[index - 1]:
+                        raise ValueError(f"DUT 조회 항목 설정 확인 실패: {items[index - 1]} / {reply[:100]}")
+                if self.profile.model.startswith(("WT310", "WT332", "WT333", "WT500")) and self.profile.model != "WT5000":
+                    if type(self.transport) is DUTTransport:
+                        self.transport.write(":HOLD OFF")
+                    else:
+                        self.transport.write(":NUMERIC:HOLD OFF")
+                else:
+                    self.transport.write(":NUMERIC:HOLD OFF")
                 numbers = self._read_wt_numbers(count, fresh)
                 values = dict(zip((m[0] for m in DUT_METRICS), numbers))
                 if count == 9:
@@ -3481,11 +3512,11 @@ if HAS_TKINTER:
 # =====================================================================
 if HAS_TKINTER:
     class Fluke5560AControllerApp(tk.Tk):
-        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.8.1"""
+        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.9.0"""
 
         def __init__(self) -> None:
             super().__init__()
-            self.title("Fluke 교정기 통합 제어 프로그램 v6.8.1 (USB / LAN / RS232 / GPIB)")
+            self.title("Fluke 교정기 통합 제어 프로그램 v6.9.0 (USB / LAN / RS232 / GPIB)")
             self.geometry("1280x930")
             self.minsize(1140, 840)
             self.configure(bg="#F4F6F9")
@@ -4014,7 +4045,7 @@ if HAS_TKINTER:
             header.pack(fill="x")
             tk.Label(header, text="Fluke Controller", bg="#F5F7FA", fg="#0F172A",
                      font=("Segoe UI", 18, "bold")).pack(side="left")
-            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.8.1", bg="#F5F7FA",
+            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.9.0", bg="#F5F7FA",
                      fg="#64748B", font=("Segoe UI", 9)).pack(side="left", padx=16)
             self.lbl_conn_badge = tk.Label(header, text="연결 안 됨", bg="#E2E8F0", fg="#64748B", padx=12, pady=5)
             self.lbl_conn_badge.pack(side="right")
@@ -6195,7 +6226,7 @@ if HAS_TKINTER:
 def run_cli_interactive(model="5560A") -> None:
     mgr = Fluke5560AConnectionManager()
     print("=" * 88)
-    print(" Fluke 5560A Multi-Product Calibrator Controller v6.8.1 (CLI Mode)")
+    print(" Fluke 5560A Multi-Product Calibrator Controller v6.9.0 (CLI Mode)")
     print("=" * 88)
     print(f"현재 PC 로컬 IPv4: {mgr.get_local_pc_ipv4_list()}")
     print(f"감지된 이더넷 어댑터: {AutoNetworkAligner.list_ethernet_interfaces()}")
