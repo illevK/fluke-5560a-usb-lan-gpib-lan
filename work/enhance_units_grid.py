@@ -31,6 +31,17 @@ def enhance_source(source, root):
     source = source.replace('f"OUT {value:.8g} {norm_unit},', 'f"OUT {volts:.12g} V,')
     source = source.replace('f"OUT {value:.8g} {norm_unit};', 'f"OUT {ohms:.12g} OHM;')
     source = source.replace('current_or_power_val * cls.unit_multiplier(power_unit)', 'SIUnits.to_base(current_or_power_val, power_unit, "W")')
+    for limit in ('abs(volts) > MAX_VOLTAGE_V', 'abs(actual_output_a) > MAX_CURRENT_A',
+                  'ohms < 0 or ohms > MAX_RESISTANCE_OHM'):
+        pattern = rf'(        if {re.escape(limit)}:\n(?:            max_effective = [^\n]+\n)?            raise )ValueError'
+        source, count = re.subn(pattern, r'\g<1>OutputRangeError', source, count=1)
+        if count != 1:
+            raise ValueError(f'Output limit check missing: {limit}')
+    source = source.replace('''        if abs(voltage_v) <= 0 or abs(voltage_v) > MAX_VOLTAGE_V:
+            raise ValueError(f"기준 전압은 0보다 크고 {MAX_VOLTAGE_V:g} V 이하여야 합니다.")''', '''        if abs(voltage_v) > MAX_VOLTAGE_V:
+            raise OutputRangeError(f"기준 전압의 절댓값은 {MAX_VOLTAGE_V:g} V 이하여야 합니다.")
+        if voltage_v == 0:
+            raise ValueError("기준 전압은 0이 아닌 값이어야 합니다.")''', 1)
 
     start = source.index('    VI_SLASH_PATTERN =', source.index('class SmartClipboardSequenceParser:'))
     end = source.index('    @classmethod\n    def _is_header_line', start)
@@ -123,6 +134,18 @@ def enhance_source(source, root):
             direction = re.search(r"\\b(LEAD|LAG)\\b", rem_str, re.I)
             if direction:
                 pf_str += " " + direction[1]''')
+    parser = parser.replace('    @classmethod\n    def build_Single_step_from_fields(', '''    @classmethod
+    def build_sheet_step(cls, *, step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw, nominal_raw,
+                         breakpoint=False, **settings):
+        try:
+            return cls.build_Single_step_from_fields(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw,
+                                                     nominal_raw, breakpoint=breakpoint, **settings)
+        except OutputRangeError as exc:
+            return SequenceStep(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw, nominal_raw,
+                                "OUT_OF_RANGE", "", str(exc).splitlines()[0], "⚠ 출력 범위 초과", breakpoint)
+
+    @classmethod
+    def build_Single_step_from_fields(''', 1)
     source = source[:start] + parser + source[end:]
     source = source.replace('DPF {dpf_val:.2f}', 'DPF {dpf_val:.6g}')
 
@@ -230,7 +253,8 @@ def enhance_source(source, root):
     source = source.replace('''            if replace_all:
                 self.seq_steps = []
             self._handle_excel_paste_at_cell(clip_text, start_row_idx=start_r, start_col_idx=2)''',
-        '''            self._handle_excel_paste_at_cell(clip_text, start_row_idx=start_r,
+        '''            replace_all = replace_all or (not self.seq_steps and not append)
+            self._handle_excel_paste_at_cell(clip_text, start_row_idx=start_r,
                                              start_col_idx=2, replace_all=replace_all, append=append)''', 1)
     source = source.replace('start_col_idx: int) -> None:', 'start_col_idx: int, *, replace_all=False, append=False) -> None:', 1)
     source = source.replace('            parsed_rows: List[Tuple[str, str, str, str]] = []',
@@ -271,13 +295,22 @@ def enhance_source(source, root):
                     self.var_seq_start_row.set("1")
                 if append:
                     self.var_active_row_banner.set(f"{len(new_steps)}행 추가 · 실행 범위 1~{len(self.seq_steps)}행")
-                invalid_rows = [str(step.step_no) for step in new_steps if not step.scpi_cmd]
+                out_of_range = [str(step.step_no) for step in new_steps if step.func_type == "OUT_OF_RANGE"]
+                invalid_rows = [str(step.step_no) for step in new_steps if step.func_type == "ERROR"]
+                notes = []
+                if out_of_range:
+                    notes.append("출력 범위 초과 · 실행 제외 " + ", ".join(out_of_range) + "행")
                 if invalid_rows:
-                    text = "전력 조건과 명목값 확인 · " + ", ".join(invalid_rows) + "행"
+                    notes.append("전력 조건과 명목값 확인 · " + ", ".join(invalid_rows) + "행")
+                if notes:
+                    text = " | ".join(notes)
                     self.var_active_row_banner.set(text)
                     self._log(text)
                 for i, st''', 1)
     source = source.replace('            for offset, ln in enumerate(lines):\n                target_idx',
         '            if tabular or replace_all or append:\n                return\n            for offset, ln in enumerate(lines):\n                ln = ln.strip()\n                target_idx', 1)
+    app_start = source.index('    class Fluke5560AControllerApp(')
+    source = source[:app_start] + source[app_start:].replace(
+        'SmartClipboardSequenceParser.build_Single_step_from_fields(', 'SmartClipboardSequenceParser.build_sheet_step(')
     source = source.replace('v6.1.1', 'v6.2.0')
     return source

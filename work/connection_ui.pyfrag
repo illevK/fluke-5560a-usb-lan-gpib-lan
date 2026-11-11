@@ -182,7 +182,7 @@
                     complete(value)
                 if self._pending_standby:
                     self._pending_standby = False
-                    if self.conn_mgr.info.connected:
+                    if self.conn_mgr.info.connected and self.is_operating is not False:
                         self._on_stby_clicked()
             if not self._io_busy and not self.conn_mgr.info.connected:
                 if self.is_operating is not None:

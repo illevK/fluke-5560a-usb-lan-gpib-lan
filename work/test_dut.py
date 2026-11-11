@@ -72,8 +72,9 @@ class DUTProtocolTests(unittest.TestCase):
         return session, instrument
 
     def test_requested_and_related_model_identification(self):
-        for model in ('510', '550', 'PPA510', 'PPA550', '1530', '2530', '2630', '3530', '4530', '5530'):
+        for model in ('510', '550', 'PPA510', 'PPA550', '1530', '2530', '2630', '3530', '4530', '5530', 'PPA 5511-HC'):
             self.assertEqual(f.identify_dut(f'NEWTONS4TH,{model},123,1.00').family, 'PPA')
+        self.assertEqual(f.identify_dut('NEWTONS4TH,PPA5511,123,1').channels, 1)
         for model, channels in [('WT310', 1), ('WT310E', 1), ('WT310HC', 1), ('WT310EH', 1),
                                 ('WT332E', 2), ('WT333', 3), ('760203', 3), ('WT500', 3), ('WT1806E', 6)]:
             self.assertEqual(f.identify_dut(f'YOKOGAWA,{model},123,1').channels, channels)
@@ -173,7 +174,22 @@ class DUTProtocolTests(unittest.TestCase):
         sample = session.read(1)
         self.assertEqual(sample.values, dict(voltage=120, current=1, power=60, apparent=120, reactive=103.923048, pf=.5, frequency=60))
         self.assertIn('순차', sample.note)
-        self.assertEqual(instrument.commands, ['*IDN?', 'RESOLU,HIGH', 'POWER,PHASE1,RMS?', 'POWER,PHASE1,WATTS?'])
+        self.assertEqual(instrument.commands, ['*IDN?', 'POWER,PHASE1,RMS?', 'POWER,PHASE1,WATTS?'])
+
+    def test_new_ppa_model_must_verify_common_records_before_connecting(self):
+        identity = 'NEWTONS4TH,PPA9999,123,1'
+        session, instrument = self.make_session(FakeInstrument(identity))
+        self.assertFalse(session.supports_fresh_capture)
+        self.assertIn('공통 조회', session.apply_measurement_defaults())
+        self.assertEqual(session.read().values['power'], 60)
+        with self.assertRaisesRegex(ValueError, '공통 조회'):
+            session.read(fresh=True)
+        queries = ['POWER,PHASE1,RMS?', 'POWER,PHASE1,WATTS?']
+        self.assertEqual(instrument.commands, ['*IDN?'] + queries * 2)
+        invalid = FakeInstrument(identity, replies={'POWER,PHASE1,RMS?': 'UNSUPPORTED'})
+        with self.assertRaises(ValueError):
+            self.make_session(invalid)
+        self.assertTrue(invalid.closed)
 
     def test_mapping_failure_and_timeout_close_stream_and_clear_sample(self):
         session, instrument = self.make_session(FakeInstrument(bad_item=True, replies={":INPUT:MODE?": "RMS"}))
@@ -294,7 +310,7 @@ class DUTProtocolTests(unittest.TestCase):
             session.read(1)
 
     def test_ppa_defaults_verify_model_specific_reference(self):
-        for model, reference in (("550", 38), ("2530", 40)):
+        for model, reference in (("550", 38), ("2530", 40), ("PPA5511", 38)):
             with self.subTest(model=model):
                 session, instrument = self.make_session(FakeInstrument(f"NEWTONS4TH,{model},1,1", replies={
                     "CONFIG,13?": "3", "CONFIG,28?": "0", "CONFIG,29?": "0",
@@ -335,7 +351,7 @@ class DUTProtocolTests(unittest.TestCase):
                     return next(self.flags if command == "DAV?" else self.rms_values)
                 return super().query(command)
 
-        session, instrument = self.make_session(UpdatingPPA("NEWTONS4TH,550,1,1",
+        session, instrument = self.make_session(UpdatingPPA("NEWTONS4TH,PPA5511,1,1",
             replies={"COUPLI,PHASE1?": "0", "STATUS,CH1?": "6,300V,OK", "STATUS,CH2?": "3,10A,OVER"}))
         sample = session.read(include_dc=True, fresh=True)
         self.assertEqual((sample.values["voltage"], sample.values["dc_voltage"], sample.values["dc_current"]),
@@ -405,7 +421,7 @@ class DUTProtocolTests(unittest.TestCase):
 
 class DUTGuiTests(unittest.TestCase):
     def setUp(self):
-        with patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]), patch.object(f, 'SAMPLE_POWER_TABLE', '1 V'):
+        with patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]):
             self.app = f.Fluke5560AControllerApp()
         self.app.withdraw()
         self.app.conn_mgr.send_command = Mock(side_effect=AssertionError('DUT must not operate calibrator'))
@@ -453,6 +469,7 @@ class DUTGuiTests(unittest.TestCase):
 
     def test_demo_reads_and_preserves_calibrator_and_measurement_table(self):
         app = self.app
+        app._handle_excel_paste_at_cell('1 V', 0, 2)
         app.seq_steps[0].measured_raw = 'user entry'
         self.demo()
         app._dut_start('read')

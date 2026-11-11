@@ -84,9 +84,7 @@ class MeasurementTests(unittest.TestCase):
     def setUp(self):
         self.adapters = patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[])
         self.adapters.start()
-        # Each test replaces the sample; skip building 63 unused example rows.
-        with patch.object(f, 'SAMPLE_POWER_TABLE', '1 V'):
-            self.app = f.Fluke5560AControllerApp()
+        self.app = f.Fluke5560AControllerApp()
         self.app.withdraw()
         self.app.seq_steps = [f.SmartClipboardSequenceParser.build_Single_step_from_fields(i, '-', 'DC', '-', f'{i} V') for i in (1, 2, 3)]
         self.grid = self.app.excel_grid

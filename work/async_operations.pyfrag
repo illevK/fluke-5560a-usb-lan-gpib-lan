@@ -1,4 +1,4 @@
-        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True, *, verify_setpoint=False):
+        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True, *, verify_setpoint=False, dual_current=False):
             if not self._ensure_connected_or_sim():
                 return False
             self.conn_mgr.operation_timeout = self._get_operation_timeout()
@@ -8,16 +8,28 @@
             self.is_operating = None
             self._refresh_oper_badge()
             def operation():
-                if verify_setpoint:
+                if dual_current and self.conn_mgr.query("OPER?").strip() != "0":
+                    self.conn_mgr.send_command("STBY")
+                    if self.conn_mgr.query("OPER?").strip() != "0":
+                        raise InstrumentProtocolError("5560A STBY를 확인하지 못했습니다. 본체 출력 상태를 확인하세요.")
+                if verify_setpoint or dual_current:
                     self.conn_mgr.send_command(cmd, check_before=True)
+                    if dual_current and not self.conn_mgr.info.interface_type.startswith("SIMULATION"):
+                        self.conn_mgr.profile.verify_dual_current_readback(cmd, self.conn_mgr.query("OUT?"))
                     if auto_oper:
                         self.conn_mgr.send_command("OPER")
                 else:
-                    self.conn_mgr.send_command(full_cmd)
+                    command = cmd.strip().upper()
+                    check_before = self.conn_mgr.profile.model == "5560A" and (
+                        auto_oper or command.startswith("OUT ") or command == "OPER")
+                    self.conn_mgr.send_command(full_cmd, check_before=check_before)
                 state = self.conn_mgr.query("OPER?").strip()
                 if state not in ("0", "1"):
                     self.conn_mgr.disconnect(standby=False)
                     raise InstrumentProtocolError(f"출력 상태 확인 실패: {state}")
+                if self.conn_mgr.profile.model == "5560A" and (auto_oper or cmd.strip().upper() == "OPER") and state == "0":
+                    error = self.conn_mgr.query("ERR?")
+                    raise InstrumentCommandError(f"5560A 출력 중단 · {error}. STBY 확인 완료, 연결 유지.")
                 return state == "1"
             def done(state):
                 self.is_operating = state
@@ -94,7 +106,9 @@
                 return
             try:
                 while idx <= stop_idx and idx < len(self.seq_steps) and not self._step_in_current_group(self.seq_steps[idx]):
-                    self._log(f"[#{idx + 1}행 건너뜀] 다른 전류 그룹")
+                    step = self.seq_steps[idx]
+                    reason = step.actual_out_desc if step.func_type == "OUT_OF_RANGE" else "다른 그룹"
+                    self._log(f"[#{idx + 1}행 건너뜀] {reason}")
                     idx += 1
             except ValueError as exc:
                 self.seq_running = False

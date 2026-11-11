@@ -65,8 +65,8 @@ source = source.replace('            status_banner = tk.Frame(container,',
                         '            self._build_current_group_panel(container)\n\n            status_banner = tk.Frame(container,', 1)
 # Freeze spreadsheet mutation during output/automatic runs; the worker captures
 # a command, and the row must continue to describe that same command.
-for name in ('_load_sample_into_sheet', '_on_paste_into_sheet_button', '_handle_excel_paste_at_cell',
-             '_handle_excel_cell_edited', '_on_add_blank_row', '_on_clear_sheet', '_recalculate_all_grid_steps'):
+for name in ('_on_paste_into_sheet_button', '_handle_excel_paste_at_cell',
+             '_handle_excel_cell_edited', '_recalculate_all_grid_steps'):
     source = re.sub(rf'(^        def {name}\([^\n]+\n)',
                     lambda m: m[1] + '            if self._io_busy or self.seq_running:\n                self._log("표를 수정하려면 실행을 일시중단하고 현재 응답을 기다려 주세요.")\n                return\n',
                     source, count=1, flags=re.M)
@@ -168,20 +168,29 @@ grid_source = grid_source.replace('        def _on_frame_configure(', '''       
 
         def _on_frame_configure(''', 1)
 grid_source = grid_source.replace('text="▶시작"', 'text="시작"').replace('bg="#DCFCE7",\n                        fg="#15803D"', 'bg="#F1F5F9",\n                        fg="#475569"')
+grid_source = grid_source.replace('            labels[6].configure(text=st.actual_out_desc,',
+    '            preview = getattr(self, "output_preview", None)\n'
+    '            output, command = preview(st) if preview else (st.actual_out_desc, st.scpi_cmd)\n'
+    '            labels[6].configure(text=output,')
+grid_source = grid_source.replace('            labels[7].configure(text=st.scpi_cmd,', '            labels[7].configure(text=command,')
 grid_source = grid_source.replace('"#FDE047"', '"#DBEAFE"').replace('"#FEF9C3"', '"#EFF6FF"')
 source = source[:grid_start] + grid_source + source[grid_end:]
 app_start = source.index('    class Fluke5560AControllerApp(')
 app_source = source[app_start:]
-app_source = app_source.replace('Fluke5560ACommandBuilder.build_', 'self._builder().build_')
+app_source = re.sub(
+    r'^        def (?:_build_(?:voltage|current|resistance|power)_tab|'
+    r'_update_(?:voltage|current|resistance|power)_preview|_apply_(?:voltage|current|resistance|power)|'
+    r'_load_sample_into_sheet)\(.*?(?=^        def |^        @|^# ====|\Z)',
+    '', app_source, flags=re.M | re.S)
+app_source = app_source.replace('            self._load_sample_into_sheet(SAMPLE_POWER_TABLE, silent=True)\n',
+                                '            self._refresh_current_group_preview()\n', 1)
 for name in ('build_sequence_steps', 'build_Single_step_from_fields'):
     # Already model-aware override is left intact.
     app_source = re.sub(rf'(SmartClipboardSequenceParser\.{name}\(\s*)(\w+)=',
                         lambda m: m[0] if m[2] == 'model' else m[1] + 'model=self._selected_model(), ' + m[2] + '=', app_source)
-app_source = app_source.replace('            cmb_post.grid(', '            self.combo_current_post = cmb_post\n            cmb_post.configure(values=["AUTO"])\n            cmb_post.grid(')
 app_source = app_source.replace('FLUKE 5560A MULTI-PRODUCT CALIBRATOR CONTROLLER', 'FLUKE 5560A / 5522A / 5520A / 5080A')
 app_source = app_source.replace('Fluke 5560A Controller', 'Fluke Calibrator Controller')
 app_source = app_source.replace('5560A 실제', '장비 실제')
-app_source = app_source.replace('(최대 30A 한계 내 정상)', '(선택 모델 범위 확인 완료)')
 app_source = app_source.replace('현재 연결된 Fluke 5560A 장비', '현재 연결된 Fluke 교정기')
 app_source = app_source.replace('Fluke 5560A 통합 제어 프로그램', 'Fluke 교정기 통합 제어 프로그램')
 app_source = app_source.replace('(USB / LAN / GPIB + LAN 진단)', '(USB / LAN / RS232 / GPIB)')
@@ -190,11 +199,9 @@ app_source = app_source.replace('self.lbl_conn_badge.configure(text="● DISCONN
 app_source = app_source.replace('            self._poll_after_id = self.after(100, self._poll_io_result)\n\n        def _on_refresh_adapters',
     '            self._refresh_connection_controls()\n            self._poll_after_id = self.after(100, self._poll_io_result)\n\n        def _on_refresh_adapters')
 app_source = app_source.replace('"#FDE047"', '"#DBEAFE"').replace('bg="#FEF9C3"', 'bg="#F8FAFC"')
-app_source = app_source.replace('▶ 엑셀 시트에 총 {len(steps)}개 행 로드 완료 — 각 행의 [▶시작]을 누르거나 아무 셀에나 Ctrl+V로 붙여넣으세요.',
-                                '{len(steps)}개 행 준비됨 · 셀을 선택하고 Ctrl+V로 측정값을 붙여넣을 수 있습니다.')
-app_source = app_source.replace('            ttk.Label(pad, text="저항(Resistance) 출력 및 리드 보상(ZCOMP) 설정 (0 Ω ~ 1100 MΩ)",',
-    '            self.var_resistance_title = tk.StringVar(value="저항 출력 및 리드 보상 (0 Ω ~ 1100 MΩ)")\n            ttk.Label(pad, textvariable=self.var_resistance_title,')
 source = source[:app_start] + app_source
+source = re.sub(r'^# 샘플 1:.*?(?=^@dataclass\nclass ConnectionInfo:)', '', source, count=1, flags=re.M | re.S)
+source = source.replace('하드웨어 사양 상수 및 기본 샘플 데이터', '하드웨어 사양 상수')
 source = source.replace('E: 5560A 실제 출력', 'E: 교정기 실제 출력')
 source = source.replace('def run_cli_interactive() -> None:', 'def run_cli_interactive(model="5560A") -> None:')
 source = source.replace('mgr.scan_and_auto_connect("SIMULATION")', 'mgr.scan_and_auto_connect("SIMULATION", model=model)')
@@ -202,11 +209,15 @@ source = source.replace('v6.0.0', 'v6.1.0')
 source = source.replace('v6.1.0', 'v6.1.1')
 from enhance_units_grid import enhance_source
 source = enhance_source(source, root)
-source = source.replace('v6.2.0', 'v6.10.4')
-# The historical DC voltage example included a reading after the target.
-source = re.sub(r'(SAMPLE_DCV_TABLE = """)(.*?)(""")',
-                lambda m: m[1] + '\n'.join(row.rsplit(r'\t', 1)[0] for row in m[2].splitlines()) + m[3],
-                source, count=1, flags=re.S)
+source = source.replace('v6.2.0', 'v6.10.10')
+source = source.replace('''        def _handle_row_direct_start(self, r_idx: int) -> None:
+            self.excel_grid.selected_row_idx = r_idx''', '''        def _handle_row_direct_start(self, r_idx: int) -> None:
+            step = self.seq_steps[r_idx]
+            if step.func_type in ("BLANK", "OUT_OF_RANGE"):
+                detail = step.actual_out_desc or "명목값을 입력하세요."
+                self.var_active_row_banner.set(f"#{step.step_no}행 실행 제외 · {detail}")
+                return
+            self.excel_grid.selected_row_idx = r_idx''', 1)
 # A new sheet establishes a new original row order. Edits and appends keep it.
 source = re.sub(r'^( +)self\.seq_steps = (?:steps|\[\])\n',
                 lambda match: match[0] + match[1] + 'self._original_row_positions = None\n', source, flags=re.M)
@@ -215,7 +226,6 @@ source = source.replace('class Fluke5560AConnectionManager:',
             for fragment in ('dut_support.pyfrag', 'dut_discovery.pyfrag'))
     + 'class Fluke5560AConnectionManager:', 1)
 source = source.replace('        def _build_ui(self):', (root / 'work/dut_ui.pyfrag').read_text(encoding='utf-8') + '        def _build_ui(self):', 1)
-source = source.replace('("resistance", "저항"), ("power", "전력")):', '("resistance", "저항"), ("power", "전력"), ("dut", "DUT 연결")):', 1)
 source = source.replace('            self._on_seq_stop_auto(silent=True)\n            try:\n                self.conn_mgr.disconnect()', '            self._on_seq_stop_auto(silent=True)\n            if not self._dut_close_ready():\n                self.after(200, self._on_close)\n                return\n            try:\n                self.conn_mgr.disconnect()', 1)
 from enhance_dut_sequence import enhance_dut_sequence
 source = enhance_dut_sequence(source, root)

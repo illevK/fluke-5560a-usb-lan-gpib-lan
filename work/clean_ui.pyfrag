@@ -44,18 +44,18 @@
             self._build_console_panel()
             self.notebook = ttk.Notebook(self)
             self.notebook.pack(fill="both", expand=True, padx=16, pady=(8, 8))
-            for name, title in (("sequence", "측정표"), ("voltage", "전압"), ("current", "전류"),
-                                ("resistance", "저항"), ("power", "전력")):
+            for name, title in (("sequence", "측정표"), ("dut", "DUT 연결")):
                 tab = ttk.Frame(self.notebook, style="Card.TFrame")
                 setattr(self, "tab_" + name, tab)
                 self.notebook.add(tab, text=title)
                 getattr(self, "_build_" + name + "_tab")()
-            self._polish_manual_tabs()
             self._sync_model_controls()
             self._sync_connection_view()
 
             self.bind("<F8>", lambda _e: self._on_seq_step_next())
             self.bind("<F9>", lambda _e: self._on_seq_toggle_breakpoint(self.excel_grid.selected_row_idx))
+            self.bind("<<Paste>>", self._paste_into_empty_sheet)
+            self.excel_grid.focus_set()
 
         def _ui_label(self, parent, text):
             label = ttk.Label(parent, text=text)
@@ -232,12 +232,6 @@
             menu.add_command(label="전체 새로 붙여넣기", command=lambda: self._on_paste_into_sheet_button(replace_all=True))
             menu.add_command(label="빈 행 추가", command=self._on_add_blank_row)
             menu.add_command(label="시트 비우기", command=self._on_clear_sheet)
-            menu.add_separator()
-            samples = tk.Menu(menu, tearoff=False)
-            for name, sample in (("AC 전력 · 63행", SAMPLE_POWER_TABLE), ("AC 전압", SAMPLE_ACV_TABLE),
-                                 ("AC 전류", SAMPLE_ACI_TABLE), ("DC 전압", SAMPLE_DCV_TABLE)):
-                samples.add_command(label=name, command=lambda value=sample: self._load_sample_into_sheet(value, silent=False))
-            menu.add_cascade(label="예제 불러오기", menu=samples)
             edit.configure(menu=menu)
             self.var_seq_use_coil = tk.BooleanVar(value=False)
             ttk.Checkbutton(toolbar, text="턴코일", variable=self.var_seq_use_coil,
@@ -255,7 +249,7 @@
             self.sequence_details = tk.Frame(container, bg="white", pady=8)
             self._sequence_details_open = False
             self.var_seq_start_row = tk.StringVar(value="1")
-            self.var_seq_stop_row = tk.StringVar(value="63")
+            self.var_seq_stop_row = tk.StringVar(value="1")
             self.var_seq_dwell_sec = tk.StringVar(value="3.0")
             self.var_seq_auto_oper = tk.BooleanVar(value=True)
             range_row = tk.Frame(self.sequence_details, bg="white")
@@ -269,10 +263,10 @@
             self.var_show_commands = tk.BooleanVar(value=False)
             ttk.Checkbutton(range_row, text="명령어 열 표시", variable=self.var_show_commands,
                             command=lambda: self.excel_grid.set_command_visibility(self.var_show_commands.get())).pack(side="right")
-            self._build_current_group_panel(container)
+            self._build_current_group_panel(container, toolbar)
             status = tk.Frame(container, bg="#F8FAFC", padx=10, pady=8)
             status.pack(fill="x", pady=(4, 8))
-            self.var_active_row_banner = tk.StringVar(value="측정값을 붙여넣고 시작하세요.")
+            self.var_active_row_banner = tk.StringVar(value="측정 조건과 명목값을 붙여넣으세요.")
             self.lbl_active_row_banner = tk.Label(status, textvariable=self.var_active_row_banner, bg="#F8FAFC", fg="#475569",
                                                   anchor="w", justify="left", wraplength=1000)
             self.lbl_active_row_banner.pack(fill="x")
@@ -297,15 +291,58 @@
                 on_paste_text_callback=self._handle_excel_paste_at_cell, on_cell_edited_callback=self._handle_excel_cell_edited,
                 on_row_start_callback=self._handle_row_direct_start, on_row_breakpoint_callback=self._on_seq_toggle_breakpoint,
                 on_row_select_callback=self._handle_row_selected)
+            self.excel_grid.output_preview = self._sequence_output_preview
             self.excel_grid.pack(fill="both", expand=True, pady=(0, 8))
 
-        def _build_current_group_panel(self, container):
+        def _paste_into_empty_sheet(self, event):
+            if self.seq_steps or self.notebook.select() != str(self.tab_sequence):
+                return
+            if isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text)):
+                return
+            self._on_paste_into_sheet_button(replace_all=True)
+            return "break"
+
+        def _on_add_blank_row(self):
+            if self._io_busy or self.seq_running:
+                self._log("표를 수정하려면 실행을 일시중단하고 현재 응답을 기다려 주세요.")
+                return
+            new_no = len(self.seq_steps) + 1
+            self.seq_steps.append(SequenceStep(new_no, "", "", "", "", "BLANK", "", "", "명목값 입력"))
+            self.var_seq_stop_row.set(str(new_no))
+            self.excel_grid.render_steps(self.seq_steps, active_idx=self.seq_current_idx)
+            self.excel_grid.scroll_to_row(new_no - 1)
+
+        def _on_clear_sheet(self):
+            if self._io_busy or self.seq_running:
+                self._log("표를 수정하려면 실행을 일시중단하고 현재 응답을 기다려 주세요.")
+                return
+            self._on_seq_stop_auto(silent=True)
+            self.seq_steps = []
+            self.seq_current_idx = self.seq_paused_idx = -1
+            self._seq_active_indices = []
+            self.var_seq_start_row.set("1")
+            self.var_seq_stop_row.set("1")
+            self.progress_var.set(0)
+            self.excel_grid.selected_row_idx, self.excel_grid.selected_col_idx = 0, 2
+            self.excel_grid.render_steps(self.seq_steps)
+            self._refresh_current_group_preview()
+            self.excel_grid.focus_set()
+            self.var_active_row_banner.set("측정 조건과 명목값을 붙여넣으세요.")
+
+        def _build_current_group_panel(self, container, toolbar):
             self._group_high_only = False
-            self._group_basis = SequenceCurrentFilter.JOB
+            self._group_basis = SequenceCurrentFilter.POSTS
+            self._group_output = SequenceCurrentFilter.ALL_OUTPUTS
+            self._dual_current = False
+            self._dual_dc_voltage, self._dual_ac_voltage = DUAL_CURRENT_DC_DEFAULT, DUAL_CURRENT_AC_MIN
             self._seq_active_indices = []
             self._original_row_positions = None
             self.var_high_current_only = tk.BooleanVar(value=False)
             self.var_current_group_basis = tk.StringVar(value=self._group_basis)
+            self.var_output_group = tk.StringVar(value=self._group_output)
+            self.var_dual_current = tk.BooleanVar(value=self._dual_current)
+            self.var_dual_dc_voltage = tk.StringVar(value=f"{self._dual_dc_voltage:g} V")
+            self.var_dual_ac_voltage = tk.StringVar(value=f"{self._dual_ac_voltage:g} V")
             self.var_current_group_summary = tk.StringVar()
             self.group_panel = tk.Frame(container, bg="white")
             self.group_panel.pack(fill="x", pady=(0, 4))
@@ -325,6 +362,22 @@
             combo = self._ui_combo(row, self.var_current_group_basis, (SequenceCurrentFilter.JOB, SequenceCurrentFilter.POSTS), 28)
             combo.bind("<<ComboboxSelected>>", lambda _e: self._on_current_group_changed())
             self._ui_label(row, "전류·전력 공통 / 코일 환산 후 실제 A 기준")
+            row = tk.Frame(self.sequence_details, bg="white")
+            row.pack(fill="x")
+            self._ui_label(row, "5560A 출력 그룹")
+            self.combo_output_group = self._ui_combo(row, self.var_output_group, SequenceCurrentFilter.OUTPUT_GROUPS, 13)
+            self.combo_output_group.bind("<<ComboboxSelected>>", lambda _e: self._on_current_group_changed())
+            self._ui_label(row, "듀얼 DC")
+            dc_voltage = self._ui_entry(row, self.var_dual_dc_voltage, 10)
+            self._ui_label(row, "듀얼 AC")
+            ac_voltage = self._ui_entry(row, self.var_dual_ac_voltage, 10)
+            for entry in (dc_voltage, ac_voltage):
+                entry.bind("<Return>", lambda _e: self._on_dual_current_voltages_applied())
+            apply_voltages = self._ui_button(row, "전압 적용", self._on_dual_current_voltages_applied)
+            self.dual_voltage_controls = (dc_voltage, ac_voltage, apply_voltages)
+            self.chk_dual_current = ttk.Checkbutton(toolbar, text="전류 듀얼 출력",
+                variable=self.var_dual_current, command=self._on_current_group_changed)
+            self.chk_dual_current.pack(side="left", padx=6)
 
         def _toggle_sequence_details(self):
             self._sequence_details_open = not self._sequence_details_open
@@ -388,27 +441,4 @@
             else:
                 text, bg, fg = "STBY · 출력 대기", "#DCFCE7", "#166534"
             self.lbl_output_state.configure(text=text, bg=bg, fg=fg)
-
-        def _polish_manual_tabs(self):
-            def walk(widget, tab):
-                for child in widget.winfo_children():
-                    if isinstance(child, tk.Button):
-                        text = str(child.cget("text"))
-                        if "전송 후" in text:
-                            child.configure(text="설정 후 출력", bg="#2563EB", fg="white")
-                        elif "전송" in text:
-                            child.configure(text="설정만 전송", bg="#F1F5F9", fg="#334155")
-                        else:
-                            child.configure(bg="#F1F5F9", fg="#334155")
-                        child.configure(font=("Malgun Gothic", 9), padx=10, pady=5, relief="flat")
-                    elif isinstance(child, (tk.Label, tk.LabelFrame, tk.Checkbutton)):
-                        value = str(child.cget("text"))
-                        value = re.sub(r"[⚡📤🧲🔋💡⚠📊]+\s*", "", value)
-                        child.configure(text=value)
-                        if isinstance(child, tk.Label) and child.cget("textvariable"):
-                            child.configure(font=("Malgun Gothic", 9), fg="#475569", justify="left", wraplength=1000)
-                            tab.bind("<Configure>", lambda e, label=child: label.configure(wraplength=max(400, e.width - 64)), add="+")
-                    walk(child, tab)
-            for tab in (self.tab_voltage, self.tab_current, self.tab_resistance, self.tab_power):
-                walk(tab, tab)
 

@@ -75,11 +75,11 @@ class AsyncGuiTests(unittest.TestCase):
             self.app._run_next_auto_step(0,1,200)
             self.pump_until(lambda:not self.app._io_busy)
             self.assertFalse(self.app.seq_running)
-            self.assertFalse(self.app.conn_mgr.info.connected)
-            self.assertIsNone(self.app.is_operating)
+            self.assertTrue(self.app.conn_mgr.info.connected)
+            self.assertIs(self.app.is_operating, False)
             self.assertEqual(self.app.seq_steps[0].status,'⚠ 오류')
             self.assertNotIn('OUT 2 V, 0 HZ; OPER',server.commands)
-            self.assertEqual(server.commands[-1],'STBY')
+            self.assertEqual(server.commands[-4:], ['STBY', '*IDN?', 'OPER?', 'ERR?'])
             self.assertIn('OUT 1 V',self.app._last_report)
 
     def test_standby_button_interrupts_pending_output_without_replay(self):
@@ -92,9 +92,10 @@ class AsyncGuiTests(unittest.TestCase):
             self.app._on_stby_clicked()
             self.pump_until(lambda:not self.app._io_busy,timeout=2)
             self.assertLess(time.monotonic()-started,2)
-            self.assertIsNone(self.app.is_operating)
-            self.assertFalse(self.app.conn_mgr.info.connected)
-            self.assertEqual(server.commands[-1],'STBY')
+            self.assertIs(self.app.is_operating, False)
+            self.assertTrue(self.app.conn_mgr.info.connected)
+            self.assertEqual(server.commands[-4:], ['STBY', '*IDN?', 'OPER?', 'ERR?'])
+            self.assertEqual(server.commands.count('STBY'), 1)
             self.assertEqual(server.commands.count('OUT 1 V, 0 HZ; OPER'),1)
 
     def test_standby_button_preserves_pending_automatic_standby_confirmation(self):

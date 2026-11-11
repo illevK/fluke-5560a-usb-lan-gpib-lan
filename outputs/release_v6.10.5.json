@@ -1,0 +1,13 @@
+{
+  "version": "v6.10.5",
+  "exe_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "481318F2FBD6EF3A868F926E0F7A8849DD0FCC303D2C7D77986AD94016A30888",
+  "source_sha256": "3F2B54D2B68F1092D7B6FD9A2693D9C67F3B3634A38A745F1704D650278FBCBE",
+  "desktop_copied": [
+    "C:\\Users\\HCT-2714\\Desktop\\Fluke 교정기.exe"
+  ],
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\AppData\\Local\\Temp\\fluke-v6.10.5-build-20261110164302152\\previous-desktop.exe",
+  "focused_tests_passed": 14,
+  "packaged_code_checks_passed": 3,
+  "verified_hardware": "Physical PPA5511 on USB COM3: auto identification, FAST defaults, voltage/current/power/PF reads, and fresh capture with a simulated calibrator"
+}

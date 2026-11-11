@@ -335,13 +335,19 @@ class LinkLocalReconnectTests(unittest.TestCase):
 
 
 class SlowOutputTests(unittest.TestCase):
-    def peer(self, delay=0, missing=False, error='0,"No error"'):
-        state = {'output': False, 'error': error}
+    def peer(self, delay=0, missing=False, error='0,"No error"', *, recovery_reply=True, late_completion=False,
+             protection_standby=False):
+        state = {'output': False, 'error': error, 'standby': False}
         def handler(conn, command):
             if command.startswith('OUT '):
-                state['output'] = True
+                state['output'] = not protection_standby
             if command == 'STBY':
                 state['output'] = False
+                state['standby'] = True
+                if late_completion:
+                    conn.sendall(b'1\r\n')
+            if command == '*IDN?' and state['standby'] and not recovery_reply:
+                return
             if command == '*OPC?' and state['output']:
                 if missing:
                     return
@@ -385,19 +391,20 @@ class SlowOutputTests(unittest.TestCase):
             mgr.disconnect(standby=False)
 
     def test_final_timeout_attempts_standby_before_closing_without_replay(self):
-        with self.peer(missing=True) as server:
+        with self.peer(missing=True, recovery_reply=False) as server:
             mgr=self.connect(server)
             with self.assertRaises(TimeoutError):
                 mgr.send_command('OUT 1 A, 50 HZ; OPER')
             self.assertFalse(mgr.info.connected)
-            self.assertEqual(server.commands[-1],'STBY')
+            self.assertEqual(server.commands[-2:], ['STBY', '*IDN?'])
             self.assertEqual(server.commands.count('OUT 1 A, 50 HZ; OPER'),1)
             self.assertIn('출력 차단 확인은 되지 않았',mgr.last_error)
             self.assertIn('OUT 1 A',mgr.last_error)
 
-    def test_abort_interrupts_lan_wait_and_sends_standby(self):
-        with self.peer(missing=True) as server:
+    def test_abort_discards_late_completion_and_keeps_confirmed_standby(self):
+        with self.peer(missing=True, late_completion=True, error='4100,"Compliance voltage exceeded"') as server:
             mgr=self.connect(server,operation_timeout=60)
+            original_socket = mgr._lan_sock
             failures=[]
             def output():
                 try: mgr.send_command('OUT 1 V; OPER')
@@ -412,9 +419,101 @@ class SlowOutputTests(unittest.TestCase):
             thread.join(1)
             self.assertFalse(thread.is_alive())
             self.assertLess(time.monotonic()-started,1)
-            self.assertIsInstance(failures[0],f.OperationCancelled)
-            self.assertEqual(server.commands[-1],'STBY')
-            self.assertFalse(mgr.info.connected)
+            self.assertIsInstance(failures[0], f.InstrumentCommandError)
+            self.assertIn('4100', str(failures[0]))
+            self.assertEqual(server.commands[-4:], ['STBY', '*IDN?', 'OPER?', 'ERR?'])
+            self.assertIs(mgr._lan_sock, original_socket)
+            self.assertEqual(mgr.query('OPER?'), '0')
+            mgr.disconnect()
+            self.assertIn('LOCAL', server.commands)
+            mgr.scan_and_auto_connect('LAN', '127.0.0.1', server.port, timeout_sec=.2)
+            self.assertTrue(mgr.info.connected)
+            self.assertEqual(server.commands.count('OUT 1 V; OPER'), 1)
+            mgr.disconnect(standby=False)
+
+    def test_compliance_error_uses_the_devices_existing_standby(self):
+        with self.peer(error='4102,"Compliance current limit exceeded"', protection_standby=True) as server:
+            mgr = self.connect(server)
+            with self.assertRaisesRegex(f.InstrumentCommandError, '4102'):
+                mgr.send_command('OUT 1 V; OPER')
+            self.assertTrue(mgr.info.connected)
+            self.assertNotIn('STBY', server.commands)
+            self.assertEqual(server.commands[-2:], ['ERR?', 'OPER?'])
+            mgr.disconnect(standby=False)
+
+    def test_first_lan_output_rechecks_one_interrupted_query_in_standby(self):
+        interrupted = '-410,"488.2 interrupted query"'
+        with self.peer() as server:
+            respond = server.handler
+            queued = [interrupted]
+
+            def error_queue(conn, command):
+                if command == "ERR?" and queued:
+                    conn.sendall((queued.pop(0) + "\r\n").encode("ascii"))
+                else:
+                    respond(conn, command)
+
+            server.handler = error_queue
+            mgr = self.connect(server)
+            mgr.send_command("OUT 3 V, 0.03 A, 50 HZ", check_before=True)
+            index = server.commands.index("OUT 3 V, 0.03 A, 50 HZ")
+            self.assertEqual(server.commands[index - 3:index], ["ERR?", "OPER?", "ERR?"])
+            self.assertTrue(mgr.info.connected)
+            self.assertNotIn("STBY", server.commands)
+            self.assertNotIn("*CLS", server.commands)
+            queued.append(interrupted)
+            with self.assertRaisesRegex(f.InstrumentCommandError, "-410"):
+                mgr.send_command("OUT 3 V, 0.1 A, 50 HZ", check_before=True)
+            self.assertNotIn("OUT 3 V, 0.1 A, 50 HZ", server.commands)
+            mgr.disconnect(standby=False)
+
+    def test_initial_lan_query_interruption_does_not_hide_a_following_fault(self):
+        with self.peer() as server:
+            respond = server.handler
+            queued = ['-410,"488.2 interrupted query"', '4100,"Compliance voltage exceeded"']
+
+            def error_queue(conn, command):
+                if command == "ERR?" and queued:
+                    conn.sendall((queued.pop(0) + "\r\n").encode("ascii"))
+                else:
+                    respond(conn, command)
+
+            server.handler = error_queue
+            mgr = self.connect(server)
+            with self.assertRaisesRegex(f.InstrumentCommandError, "4100"):
+                mgr.send_command("OUT 3 V, 0.03 A, 50 HZ", check_before=True)
+            self.assertTrue(mgr.info.connected)
+            self.assertFalse(any(cmd.startswith("OUT ") for cmd in server.commands))
+            mgr.disconnect(standby=False)
+
+    def test_initial_standby_command_rechecks_an_interrupted_query(self):
+        with self.peer(error='-410,"488.2 interrupted query"') as server:
+            mgr = self.connect(server)
+            mgr.send_command("STBY")
+            self.assertEqual(server.commands[-5:], ["STBY", "*OPC?", "ERR?", "OPER?", "ERR?"])
+            self.assertTrue(mgr.info.connected)
+            mgr.disconnect(standby=False)
+
+    def test_oper_status_timeout_rechecks_standby_on_the_same_socket(self):
+        with self.peer(error='4102,"Compliance current limit exceeded"') as server:
+            respond = server.handler
+            skipped = False
+
+            def skip_first_oper_reply(conn, command):
+                nonlocal skipped
+                if command == 'OPER?' and not skipped:
+                    skipped = True
+                    return
+                respond(conn, command)
+
+            server.handler = skip_first_oper_reply
+            mgr = self.connect(server)
+            original_socket = mgr._lan_sock
+            with self.assertRaisesRegex(f.InstrumentCommandError, '4102'):
+                mgr.query('OPER?')
+            self.assertIs(mgr._lan_sock, original_socket)
+            self.assertEqual(server.commands[-5:], ['OPER?', 'STBY', '*IDN?', 'OPER?', 'ERR?'])
+            mgr.disconnect(standby=False)
 
     def test_reported_device_error_retains_confirmed_standby_connection(self):
         with self.peer(error='4103,"Output settling timed out"') as server:

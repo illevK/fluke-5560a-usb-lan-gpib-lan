@@ -10,7 +10,7 @@ import fluke_5560a_controller as f
 
 class CurrentGroupOrderTests(unittest.TestCase):
     def setUp(self):
-        with patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]), patch.object(f, 'SAMPLE_POWER_TABLE', '1 V'):
+        with patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]):
             self.app = f.Fluke5560AControllerApp()
         self.app.withdraw()
         self.app.conn_mgr.send_command = Mock(side_effect=AssertionError('Ordering must not send device commands'))
@@ -24,7 +24,9 @@ class CurrentGroupOrderTests(unittest.TestCase):
             self.app._on_close()
 
     def load_current_example(self):
-        self.app._load_sample_into_sheet('1 A\n2 A\n3 A\n0.5 A', silent=True)
+        self.app.var_current_group_basis.set(f.SequenceCurrentFilter.JOB)
+        self.app._on_current_group_changed()
+        self.app._handle_excel_paste_at_cell('1 A\n2 A\n3 A\n0.5 A', 0, 2, replace_all=True)
 
     def set_high_group(self):
         self.app.var_high_current_only.set(True)
@@ -56,12 +58,23 @@ class CurrentGroupOrderTests(unittest.TestCase):
         self.assertEqual((self.app.var_seq_start_row.get(), self.app.var_seq_stop_row.get()), ('1', '4'))
 
     def test_power_uses_current_filter_and_keeps_both_partitions_stable(self):
-        self.app._load_sample_into_sheet('120 V / 1 A\n120 V / 3 A\n120 V / 2 A\n120 V / 5 A', silent=True)
+        self.app.var_current_group_basis.set(f.SequenceCurrentFilter.JOB)
+        self.app._on_current_group_changed()
+        self.app._handle_excel_paste_at_cell('120 V / 1 A\n120 V / 3 A\n120 V / 2 A\n120 V / 5 A', 0, 2, replace_all=True)
         self.set_high_group()
         self.assertEqual(self.nominal_values(), ['120 W', '360 W', '240 W', '600 W'])
         self.app._reorder_current_group_rows()
         self.assertEqual(self.nominal_values(), ['360 W', '600 W', '120 W', '240 W'])
         self.assertEqual([self.app._step_in_current_group(step) for step in self.app.seq_steps], [True, True, False, False])
+
+    def test_5560a_default_keeps_three_amps_with_vi_aux_in_dual_mode(self):
+        app = self.app
+        self.assertEqual(app.var_current_group_basis.get(), f.SequenceCurrentFilter.POSTS)
+        app._handle_excel_paste_at_cell('50 Hz\t2.9 A\n50 Hz\t3 A\n50 Hz\t3.1 A\n50 Hz\t3.1001 A', 0, 2, replace_all=True)
+        app.chk_dual_current.invoke()
+        self.assertEqual([app._step_in_current_group(row) for row in app.seq_steps], [True, True, True, False])
+        self.set_high_group()
+        self.assertEqual([app._step_in_current_group(row) for row in app.seq_steps], [False, False, False, True])
 
     def test_restore_keeps_pasted_readings_and_metadata_with_edited_rows(self):
         self.load_current_example()
@@ -74,7 +87,7 @@ class CurrentGroupOrderTests(unittest.TestCase):
         self.app._on_add_blank_row()
         self.app.btn_group_restore.invoke()
 
-        self.assertEqual(self.nominal_values(), ['1 A', '2 A', '3 A', '4 A', '1.0 V'])
+        self.assertEqual(self.nominal_values(), ['1 A', '2 A', '3 A', '4 A', ''])
         self.assertEqual([step.step_no for step in self.app.seq_steps], [1, 2, 3, 4, 5])
         self.assertEqual([step.measured_raw for step in self.app.seq_steps], ['0.9999 A', '1.9999 A', '2.9999 A', '0.4999 A', ''])
         self.assertEqual([step.breakpoint for step in self.app.seq_steps], [False, False, True, False, False])
@@ -99,7 +112,7 @@ class CurrentGroupOrderTests(unittest.TestCase):
     def test_loading_new_sheet_replaces_the_original_order(self):
         self.load_current_example()
         self.app._reorder_current_group_rows()
-        self.app._load_sample_into_sheet('5 A\n0.1 A\n3 A', silent=True)
+        self.app._handle_excel_paste_at_cell('5 A\n0.1 A\n3 A', 0, 2, replace_all=True)
         self.app._reorder_current_group_rows(restore=True)
         self.assertEqual(self.nominal_values(), ['5 A', '0.1 A', '3 A'])
         self.app._reorder_current_group_rows()

@@ -29,6 +29,9 @@ def check_bundle(report_path):
         app.withdraw()
         app.update_idletasks()
         assert not app.conn_mgr.info.connected
+        assert [app.notebook.tab(tab, "text") for tab in app.notebook.tabs()] == ["측정표", "DUT 연결"]
+        assert not app.seq_steps
+        report['empty_measurement_table'] = True
         report['title'] = app.title()
         assert Path(app.conn_mgr.log_path).parent.parent == Path(sys.executable).parent
         app.conn_mgr.record_event('EXE package verification: no instrument connection')
@@ -71,13 +74,14 @@ def check_bundle(report_path):
         report['dc_power'] = True
         assert all(col[0] != '분해능' for col in app.excel_grid.COL_SPECS)
         report['raw_measurements_retained'] = True
-        app._load_sample_into_sheet('1 A\n2 A\n3 A\n0.5 A', silent=True)
+        assert app.var_current_group_basis.get() == controller.SequenceCurrentFilter.POSTS
+        app._handle_excel_paste_at_cell('1 A\n2 A\n3.2 A\n0.5 A', 0, 2, replace_all=True)
         app.excel_grid._row_widgets[2]['measurement_var'].set('3.001 A')
         app.btn_group_sort.invoke()
-        assert [step.nominal_raw for step in app.seq_steps] == ['1 A', '2 A', '0.5 A', '3 A']
+        assert [step.nominal_raw for step in app.seq_steps] == ['1 A', '2 A', '0.5 A', '3.2 A']
         assert app.seq_steps[3].measured_raw == '3.001 A'
         app.btn_group_restore.invoke()
-        assert [step.nominal_raw for step in app.seq_steps] == ['1 A', '2 A', '3 A', '0.5 A']
+        assert [step.nominal_raw for step in app.seq_steps] == ['1 A', '2 A', '3.2 A', '0.5 A']
         assert app.seq_steps[2].measured_raw == '3.001 A'
         report['current_group_order_restore'] = True
         assert controller.identify_dut('NEWTONS4TH,550,123,1.0').family == 'PPA'

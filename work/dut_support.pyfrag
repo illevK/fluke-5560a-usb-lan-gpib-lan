@@ -14,6 +14,7 @@ class DUTProfile:
     model: str
     channels: int
     wt3000_numeric: bool = False
+    ppa_common_only: bool = False
 
 
 def identify_dut(identity):
@@ -23,10 +24,16 @@ def identify_dut(identity):
     maker = re.sub(r"[^A-Z0-9]", "", parts[0])
     model = re.sub(r"[\s-]", "", parts[1])
     if maker in ("NEWTONS4TH", "NEWTONS4THLTD", "N4L"):
-        number = model.removeprefix("PPA")
+        number = re.sub(r"(?:LC|HC|TE|HF)$", "", model.removeprefix("PPA"))
         # These families document the same POWER/RMS and POWER/WATTS records.
         if re.fullmatch(r"(?:5\d{2}|(?:15|25|26|35|45|55)\d{2})[A-Z]?", number):
-            return DUTProfile("PPA", "PPA" + number, 6 if number.startswith("35") else 3)
+            base = number.rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            phases = {"510": 1, "520": 2, "1510": 1, "1520": 2, "5511": 1}
+            return DUTProfile("PPA", "PPA" + number, phases.get(base, 6 if base.startswith("35") else 3))
+        if model.startswith("PPA") and re.fullmatch(r"\d{3,4}[A-Z]?", number):
+            # A new PPA can use the documented records if its replies match.
+            # Model-specific configuration and freshness checks require a profile.
+            return DUTProfile("PPA", "PPA" + number, 1, ppa_common_only=True)
     if maker.startswith("YOKOGAWA"):
         # WT3000(E) includes the option suffix in the model field of *IDN?.
         model_code = parts[1].split("-", 1)[0].strip()
@@ -249,7 +256,7 @@ class DUTSession:
 
     @property
     def supports_fresh_capture(self):
-        return self.connected and self.profile.family in ("WT", "PPA")
+        return self.connected and self.profile.family in ("WT", "PPA") and not self.profile.ppa_common_only
 
     @staticmethod
     def _wt_reply_value(reply):
@@ -294,6 +301,8 @@ class DUTSession:
             return ""
         t, profile = self.transport, self.profile
         if profile.family == "PPA":
+            if profile.ppa_common_only:
+                return "PPA 공통 조회 · 장비 설정 유지 · 자동 기록은 모델 확인 필요"
             # CONFIG indices are the common voltage/current autorange controls.
             # This preserves the configured minimum ranges and input scaling.
             t.write("SPEED,FAST")
@@ -372,6 +381,9 @@ class DUTSession:
                 raise ValueError("선택한 LAN 방식과 DUT 제조사가 다릅니다.")
             if settings.mode == "WT5000_TCP" and self.profile.model != "WT5000":
                 raise ValueError("이 TCP 연결은 WT5000용입니다. 본체 Remote Control의 Command Type을 WT5000으로 확인하세요.")
+            if self.profile.ppa_common_only:
+                dut_number_fields(self.transport.query("POWER,PHASE1,RMS?"), 5)
+                dut_number_fields(self.transport.query("POWER,PHASE1,WATTS?"), 11)
             return self.identity
         except Exception:
             self.disconnect()
@@ -448,6 +460,8 @@ class DUTSession:
         self.sample = None
         if not self.connected:
             raise ConnectionError("DUT를 먼저 연결하세요.")
+        if fresh and self.profile.ppa_common_only:
+            raise ValueError("이 PPA 모델은 공통 조회만 지원합니다. 자동 기록에는 모델별 갱신 상태 확인이 필요합니다.")
         if self.cancel.is_set():
             self.disconnect()
             raise InterruptedError("DUT 조회를 중지했습니다.")
@@ -471,7 +485,6 @@ class DUTSession:
                     coupling = self.transport.query(f"COUPLI,PHASE{channel}?").strip()
                     if coupling not in ("0", "2"):
                         raise ValueError("PPA의 DC 측정에는 해당 입력의 커플링을 AC+DC 또는 DC로 설정하세요.")
-                self.transport.write("RESOLU,HIGH")
                 rms_command = f"POWER,PHASE{channel},RMS?"
                 if fresh:
                     dut_numbers(self.transport.query(rms_command), 5)

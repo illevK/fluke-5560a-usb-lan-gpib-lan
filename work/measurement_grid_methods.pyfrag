@@ -34,9 +34,14 @@
         def _resize_columns(self, _event=None):
             base = sum(spec[1] for index, spec in enumerate(self.COL_SPECS)
                        if (index != 7 or self.show_commands) and (index != 9 or self.show_measurements))
-            width = max(base, self.canvas.winfo_width())
-            self.canvas.itemconfigure(self.canvas_window, width=width)
-            self.header_canvas.itemconfigure(self.header_window, width=width)
+            try:
+                width = max(base, self.canvas.winfo_width())
+                self.canvas.itemconfigure(self.canvas_window, width=width)
+                self.header_canvas.itemconfigure(self.header_window, width=width)
+            except tk.TclError as exc:
+                # Tk can deliver a queued resize while it tears down the canvas.
+                if not str(exc).startswith("invalid command name") and "application has been destroyed" not in str(exc):
+                    raise
 
         def _measurement_changed(self, row):
             if self._rendering_measurements or not 0 <= row < len(self._steps):

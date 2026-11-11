@@ -3,9 +3,6 @@
                 return self.conn_mgr.profile.model
             return self._configured_model
 
-        def _builder(self):
-            return CalibratorCommandBuilder(self._selected_model())
-
         def _sync_model_controls(self):
             profile = MODEL_PROFILES[self._configured_model]
             choices = list(profile.interfaces) + ["AUTO", "SIMULATION"]
@@ -23,12 +20,17 @@
             comp_note = ("단독 턴코일 LCOMP 없음" if profile.model == "5560A" else
                          "턴코일 AC: 지원 범위에서 LCOMP 자동 ON")
             self.var_model_note.set(f"{', '.join(profile.interfaces)} | 실제 전류 ≤{profile.max_current:g} A | {comp_note}")
-            if hasattr(self, 'var_resistance_title'):
-                self.var_resistance_title.set("5080A 저항: 18개 고정값 + 0 Ω / 최대 190 MΩ" if profile.model == "5080A"
-                                              else "저항 출력 및 리드 보상 (0 Ω ~ 1100 MΩ)")
-            if hasattr(self, 'combo_current_post'):
-                self.combo_current_post.configure(values=["AUTO"] if profile.model == "5560A" else ["AUTO", "AUX", "A20"])
-                self.var_i_post.set("AUTO")
+            if hasattr(self, 'combo_output_group'):
+                supported = profile.model == "5560A"
+                self.combo_output_group.configure(state="readonly" if supported else "disabled")
+                self.chk_dual_current.state(["!disabled"] if supported else ["disabled"])
+                for control in self.dual_voltage_controls:
+                    control.state(["!disabled"] if supported else ["disabled"])
+                if not supported:
+                    self._group_output = SequenceCurrentFilter.ALL_OUTPUTS
+                    self._dual_current = False
+                    self.var_output_group.set(self._group_output)
+                    self.var_dual_current.set(False)
             if hasattr(self, 'connection_endpoints'):
                 self._sync_connection_view()
 
@@ -47,9 +49,6 @@
             self._seq_active_indices = []
             self.progress_var.set(0)
             self._recalculate_all_grid_steps()
-            for method in (self._update_voltage_preview, self._update_current_preview,
-                           self._update_resistance_preview, self._update_power_preview):
-                method()
             self._refresh_current_group_preview()
             self._log(f"[모델 변경] {requested} — {MODEL_PROFILES[requested].terminal_note}")
 
@@ -72,6 +71,9 @@
                 return
             rebuilt_steps = []
             for st in self.seq_steps:
+                if st.func_type == "BLANK":
+                    rebuilt_steps.append(st)
+                    continue
                 try:
                     rebuilt = SmartClipboardSequenceParser.build_Single_step_from_fields(
                         model=self._selected_model(), step_no=st.step_no, vi_cond_raw=st.vi_cond_raw,

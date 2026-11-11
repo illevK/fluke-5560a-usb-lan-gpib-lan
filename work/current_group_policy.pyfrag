@@ -2,7 +2,13 @@ class SequenceCurrentFilter:
     """Classify the current actually encoded in OUT, after coil conversion."""
     JOB = "작업 기준: 3 A 이상"
     POSTS = "선택 모델의 실제 단자 기준"
-    CURRENT_FUNCTIONS = {"DCI", "ACI", "DCP", "ACP", "PF"}
+    ALL_OUTPUTS = "전체 출력"
+    SINGLE_OUTPUT = "싱글 출력"
+    DUAL_OUTPUT = "듀얼 출력"
+    OUTPUT_GROUPS = (ALL_OUTPUTS, SINGLE_OUTPUT, DUAL_OUTPUT)
+    CURRENT_ONLY = {"DCI", "ACI"}
+    DUAL_FUNCTIONS = {"DCP", "ACP", "PF"}
+    CURRENT_FUNCTIONS = CURRENT_ONLY | DUAL_FUNCTIONS
     CURRENT_TOKEN = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)\s*(UA|MA|A)\s*$", re.I)
 
     @classmethod

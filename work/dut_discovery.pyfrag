@@ -117,7 +117,29 @@ def _dut_discovery_resource_ip(resource):
     return None
 
 
-def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=True, include_lan=True, adapters=None):
+def _dut_serial_targets(excluded_resource, diagnostics):
+    if not HAS_PYSERIAL:
+        diagnostics.append(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
+        return {}
+    try:
+        ports = serial.tools.list_ports.comports()
+    except OSError as exc:
+        diagnostics.append(f"COM 포트 목록을 읽지 못했습니다: {exc}")
+        return {}
+    excluded_com = excluded_resource.split(" / ", 1)[0]
+    addresses = sorted({port.device.upper() for port in ports if port.vid not in (None, 0x0F7E)
+                        and port.device.upper() != excluded_com})
+    diagnostics.append(f"자동 검색용 USB COM 포트 {len(addresses)}개를 확인했습니다.")
+    # PPA RS232 / USB virtual COM, then common serial defaults. Other
+    # settings and onboard serial ports remain available via manual COM.
+    presets = ((19200, "RTS/CTS", "CR"), (19200, "NONE", "CR"),
+               (9600, "RTS/CTS", "CRLF"), (9600, "NONE", "CRLF"))
+    return {(address, baud, flow): DUTSettings(mode="SERIAL", address=address, baudrate=baud, flow=flow, eol=eol)
+            for baud, flow, eol in presets for address in addresses}
+
+
+def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=True, include_lan=True,
+                  include_serial=False, adapters=None):
     """Return all recognized, closed probe sessions and discovery diagnostics.
 
     Discovery never needs network configuration changes or address-range scans.
@@ -126,25 +148,25 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
     """
     _dut_discovery_check_cancel(cancel)
     diagnostics, candidates = [], []
-    if not (include_usb or include_lan):
+    resources = ()
+    visa_ready = False
+    if include_usb or include_lan:
+        if not HAS_PYVISA:
+            diagnostics.append(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
+        else:
+            try:
+                manager = SharedVisaManager()
+                visa_ready = True
+                try:
+                    resources = manager.list_resources("?*")
+                finally:
+                    manager.close()
+            except Exception as exc:
+                diagnostics.append(f"VISA 장치 목록을 읽지 못했습니다: {exc}")
+                if not visa_ready:
+                    diagnostics.append("VISA 드라이버를 시작할 수 없습니다. NI-VISA 설치 상태를 확인하세요.")
+    if not (visa_ready or include_serial):
         return candidates, diagnostics
-    if not HAS_PYVISA:
-        diagnostics.append(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
-        return candidates, diagnostics
-
-    manager = None
-    try:
-        manager = SharedVisaManager()
-        try:
-            resources = manager.list_resources("?*")
-        finally:
-            manager.close()
-    except Exception as exc:
-        resources = ()
-        diagnostics.append(f"VISA 장치 목록을 읽지 못했습니다: {exc}")
-        if manager is None:
-            diagnostics.append("VISA 드라이버를 시작할 수 없습니다. NI-VISA 설치 상태를 확인하세요.")
-            return candidates, diagnostics
 
     _dut_discovery_check_cancel(cancel)
     excluded_resource = excluded_resource.strip().upper()
@@ -181,9 +203,9 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         listed_lan.setdefault((settings.mode, host), settings)
 
     usb_count = len(targets)
-    if include_usb:
+    if include_usb and visa_ready:
         diagnostics.append(f"VISA USB-TMC 후보 {usb_count}개를 확인했습니다.")
-    if include_lan:
+    if include_lan and visa_ready:
         if adapters is None:
             adapters = AutoNetworkAligner.list_ethernet_interfaces()
             if AutoNetworkAligner.last_error:
@@ -193,18 +215,27 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
                 targets.setdefault(("WT_LAN", host), DUTSettings(mode="WT_LAN", address=host, eol="LF"))
         for key, settings in listed_lan.items():
             targets.setdefault(key, settings)
+    if include_serial:
+        targets.update(_dut_serial_targets(excluded_resource, diagnostics))
 
     deadline = time.monotonic() + 8.0
-    for index, settings in enumerate(targets.values()):
+    identified_com = set()
+    attempts = 0
+    for settings in targets.values():
         _dut_discovery_check_cancel(cancel)
-        if index >= 12 or time.monotonic() >= deadline:
+        if settings.mode == "SERIAL" and settings.address in identified_com:
+            continue
+        if attempts >= 12 or time.monotonic() >= deadline:
             diagnostics.append("자동 확인 범위에 도달했습니다. 표시되지 않은 장비는 주소를 직접 입력하세요.")
             break
+        attempts += 1
         probe = DUTSession()
         probe.cancel = cancel
         try:
             identity = probe.connect(replace(settings, timeout=1.0))
             candidates.append(DUTDiscoveryCandidate(settings, probe.profile, identity))
+            if settings.mode == "SERIAL":
+                identified_com.add(settings.address)
         except InterruptedError:
             raise
         except Exception as exc:
@@ -217,12 +248,14 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         diagnostics.append(f"식별이 확인된 DUT {len(candidates)}대가 있습니다.")
     else:
         message = ""
-        if include_usb:
+        if include_usb and visa_ready:
             message = ("USB 계측기는 목록에 있지만 지원 DUT로 식별되지 않았습니다. 본체의 USB 원격 설정과 통신 기록을 확인하세요."
                        if usb_count else
                        "VISA 목록에 USB DUT가 없습니다. 케이블과 본체의 USB 원격 설정을 확인하세요.")
-        if include_lan:
+        if include_lan and visa_ready:
             message += (" " if message else "") + "LAN에서 찾지 못한 DUT는 연결 방식을 선택해 IP를 직접 입력하세요."
+        if include_serial:
+            message += (" " if message else "") + "COM에서 찾지 못한 DUT는 RS232 방식을 선택해 본체 통신 설정과 맞추세요."
         diagnostics.append(message)
     return candidates, diagnostics
 

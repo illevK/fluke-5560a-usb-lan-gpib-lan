@@ -19,8 +19,7 @@ class LinkedDutTests(unittest.TestCase):
         self.read_calls = []
         self.adapters = patch.object(f.AutoNetworkAligner, "list_ethernet_interfaces", return_value=[])
         self.adapters.start()
-        with patch.object(f.Fluke5560AControllerApp, "_load_sample_into_sheet"):
-            self.app = f.Fluke5560AControllerApp()
+        self.app = f.Fluke5560AControllerApp()
         self.app.withdraw()
         self.app._show_report = lambda *_: None
         self.app.var_adapter_choice.set("자동: Windows 경로 사용")
@@ -63,7 +62,7 @@ class LinkedDutTests(unittest.TestCase):
         return f.DUTSample(self.app.dut_session.identity, channel, datetime.datetime.now().isoformat(),
                            values, "", raw_values=raw_values)
 
-    def acv_peer(self, pending='0,"No error"', setting_error='0,"No error"'):
+    def acv_peer(self, pending='0,"No error"', setting_error='0,"No error"', output=None):
         error, operating = pending, False
 
         def reply(conn, command):
@@ -75,13 +74,28 @@ class LinkedDutTests(unittest.TestCase):
             elif command == "STBY":
                 operating = False
             response = {"*IDN?": local.IDN, "COMM_MODE? TELNET": "COMP", "*OPC?": "1",
-                        "OPER?": "1" if operating else "0"}.get(command)
+                        "OPER?": "1" if operating else "0", "OUT?": output}.get(command)
             if command == "ERR?":
                 response, error = error, '0,"No error"'
             if response is not None:
                 conn.sendall((response + "\r\n").encode())
 
         return local.FakeInstrument(handler=reply)
+
+    def test_dual_current_records_current_instead_of_companion_voltage(self):
+        self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("60 Hz\t1 A"))
+        self.app.var_dual_current.set(True)
+        self.app._on_current_group_changed()
+        self.app.var_dual_ac_voltage.set("500 mV")
+        self.app._on_dual_current_voltages_applied()
+        with self.acv_peer(output="0.5,V,1.0,A,60") as peer:
+            self.connect(peer)
+            self.app.dut_session.read = lambda channel, **kwargs: self.sample(channel, current=.999, voltage=.5)
+            self.app._start_filtered_sequence(0, 0)
+            self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy)
+            self.assertEqual(float(self.app.seq_steps[0].measured_raw.split()[0]), .999)
+            self.assertTrue(self.app.seq_steps[0].measured_raw.endswith(" A"))
+            self.assertIn("OUT 0.5 V, 1 A, 60 HZ; WAVE SINE,SINE", peer.commands)
 
     def test_acv_waits_for_setpoint_ack_then_records_fresh_rms(self):
         self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("50 Hz\t1 V"))
@@ -132,7 +146,7 @@ class LinkedDutTests(unittest.TestCase):
                     self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy)
                     read.assert_not_called()
                 self.assertIn(expected, self.app.var_active_row_banner.get())
-                self.assertIn("STBY", peer.commands)
+                self.assertEqual("STBY" in peer.commands, pending.startswith("0,"))
                 self.assertNotIn("OPER", peer.commands)
                 self.assertEqual("OUT 1 V, 50 HZ" in peer.commands, pending.startswith("0,"))
                 self.app.conn_mgr.disconnect(standby=False)

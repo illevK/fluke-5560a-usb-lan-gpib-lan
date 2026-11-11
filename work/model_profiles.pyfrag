@@ -1,3 +1,11 @@
+class OutputRangeError(ValueError):
+    """A numeric setpoint falls outside the configured output limits."""
+
+
+DUAL_CURRENT_DC_DEFAULT = 0.01
+DUAL_CURRENT_AC_MIN = 0.033
+
+
 @dataclass(frozen=True)
 class CalibratorProfile:
     model: str
@@ -12,6 +20,43 @@ class CalibratorProfile:
 
     def high_current(self, amps):
         return abs(amps) > 3.1 if self.model == "5560A" else abs(amps) >= 3.0
+
+    @staticmethod
+    def validate_dual_current_voltages(dc_voltage, ac_voltage):
+        if not 0 < dc_voltage <= MAX_VOLTAGE_V:
+            raise ValueError(f"DC 듀얼 전압은 0 V 초과 {MAX_VOLTAGE_V:g} V 이하로 입력하세요.")
+        if not DUAL_CURRENT_AC_MIN <= ac_voltage <= MAX_VOLTAGE_V:
+            raise ValueError(f"AC 듀얼 전압은 {DUAL_CURRENT_AC_MIN:g}~{MAX_VOLTAGE_V:g} V로 입력하세요.")
+
+    def dual_current_command(self, command, *, dc_voltage=DUAL_CURRENT_DC_DEFAULT, ac_voltage=DUAL_CURRENT_AC_MIN):
+        """Keep the current setpoint and add the selected primary voltage."""
+        if self.model != "5560A":
+            return None
+        self.validate_dual_current_voltages(dc_voltage, ac_voltage)
+        values = self.output_values(command)
+        if values.keys() != {"A", "HZ"}:
+            raise ValueError("듀얼 전류로 바꿀 OUT에는 전류와 주파수만 지정하세요.")
+        amps, hz = values["A"], values["HZ"]
+        if hz == 0:
+            return f"OUT {dc_voltage:.12g} V, " + command[4:]
+        # 5560A Product Specifications, p. 21, Power and Dual Output Limits.
+        # 33 mV is the NORMAL output minimum in this band, not the AUX V minimum.
+        if 45 <= hz <= 65 and .0012001 <= amps <= 20.5:
+            return f"OUT {ac_voltage:.12g} V, " + command[4:] + "; WAVE SINE,SINE"
+        return None
+
+    def verify_dual_current_readback(self, command, reply):
+        expected = self.output_values(command.split(";", 1)[0])
+        fields = [field.strip().upper() for field in reply.split(",")]
+        try:
+            if len(fields) == 5 and (fields[1], fields[3]) == ("V", "A"):
+                actual = [float(fields[i]) for i in (0, 2, 4)]
+                if actual[0] > 0 and all(math.isclose(value, expected[unit], rel_tol=1e-5, abs_tol=1e-8)
+                                         for value, unit in zip(actual, ("V", "A", "HZ"))):
+                    return
+        except ValueError:
+            pass
+        raise ValueError(f"5560A 듀얼 전압·전류 설정 확인 실패: {reply[:120]}. 본체 STBY를 확인하세요.")
 
     def lcomp_allowed(self, amps, hz):
         if self.model == "5560A" or hz <= 0:
@@ -50,9 +95,9 @@ class CalibratorProfile:
             raise ValueError("한 번에 OUT 한 개만 전송하세요.")
         values = self.output_values(out_parts[0]) if out_parts else {}
         if abs(values.get("V", 0)) > 1020:
-            raise ValueError(f"{self.model}: 최대 전압 1020 V를 초과합니다.")
+            raise OutputRangeError(f"{self.model}: 최대 전압 1020 V를 초과합니다.")
         if abs(values.get("A", 0)) > self.max_current:
-            raise ValueError(f"{self.model}: 코일 환산 후 실제 전류가 최대 {self.max_current:g} A를 초과합니다.")
+            raise OutputRangeError(f"{self.model}: 코일 환산 후 실제 전류가 최대 {self.max_current:g} A를 초과합니다.")
         if values.get("HZ", 0) < 0:
             raise ValueError("주파수는 0 이상이어야 합니다.")
         if values.get("HZ", 0) > 0 and any(values.get(u, 1) <= 0 for u in ("V", "A")):
@@ -60,7 +105,7 @@ class CalibratorProfile:
         ohms = values.get("OHM")
         if ohms is not None:
             if not 0 <= ohms <= self.max_resistance:
-                raise ValueError(f"{self.model}: 저항 범위 0~{self.max_resistance / 1e6:g} MΩ를 벗어났습니다.")
+                raise OutputRangeError(f"{self.model}: 저항 범위 0~{self.max_resistance / 1e6:g} MΩ를 벗어났습니다.")
             if self.model == "5080A" and not any(math.isclose(ohms, r, rel_tol=1e-10, abs_tol=1e-12) for r in RESISTORS_5080A):
                 raise ValueError("5080A는 고정 저항만 출력합니다: 0, 1/1.9/10/19/100/190 Ω, "
                                  "1/1.9/10/19/100/190 kΩ, 1/1.9/10/19/100/190 MΩ. 자동 반올림하지 않습니다.")

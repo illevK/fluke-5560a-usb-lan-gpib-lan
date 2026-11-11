@@ -2,6 +2,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'outputs'))
@@ -35,12 +36,52 @@ def power_table():
 
 class ClipboardTableTests(unittest.TestCase):
     def setUp(self):
-        with patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]), \
-             patch.object(f, 'SAMPLE_POWER_TABLE', '1 V'):
+        with patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]):
             self.app = f.Fluke5560AControllerApp()
         self.app.withdraw()
         self.addCleanup(self.app._on_close)
         self.grid = self.app.excel_grid
+
+    def test_empty_sheet_keeps_two_tabs_and_accepts_first_paste(self):
+        app = self.app
+        self.assertEqual([app.notebook.tab(tab, 'text') for tab in app.notebook.tabs()], ['측정표', 'DUT 연결'])
+        self.assertFalse(app.seq_steps)
+        self.assertTrue(app.bind('<<Paste>>'))
+        self.assertTrue(app.chk_dual_current.winfo_manager())
+        with patch.object(app, 'clipboard_get', return_value='1 A\n31 A\n60 Hz\t2 A'):
+            self.assertEqual(app._paste_into_empty_sheet(SimpleNamespace(widget=self.grid)), 'break')
+        self.assertEqual([row.nominal_raw for row in app.seq_steps], ['1 A', '31 A', '2 A'])
+        self.assertEqual(app.seq_steps[1].func_type, 'OUT_OF_RANGE')
+        app.chk_dual_current.invoke()
+        self.assertEqual(app._sequence_output_command(app.seq_steps[0]), ('OUT 0.01 V, 1 A, 0 HZ', True))
+        self.assertEqual(app._sequence_output_command(app.seq_steps[2]),
+                         ('OUT 0.033 V, 2 A, 60 HZ; WAVE SINE,SINE', True))
+        app._on_clear_sheet()
+        self.assertFalse(app.seq_steps)
+        app._on_add_blank_row()
+        self.assertEqual(app.seq_steps[0].nominal_raw, '')
+        self.assertEqual(app.seq_steps[0].scpi_cmd, '')
+        self.assertFalse(app._step_in_current_group(app.seq_steps[0]))
+        app._handle_excel_cell_edited(0, '', 'DC', '', '1 V')
+        self.assertEqual(app.seq_steps[0].scpi_cmd, 'OUT 1 V, 0 HZ')
+
+    def test_dual_voltage_edits_must_be_applied_and_update_the_preview(self):
+        app = self.app
+        app._handle_excel_paste_at_cell('1 A\n60 Hz\t2 A', 0, 2, replace_all=True)
+        app.chk_dual_current.invoke()
+        app.var_dual_dc_voltage.set('250 mV')
+        app.var_dual_ac_voltage.set('20 mV')
+        app._on_dual_current_voltages_applied()
+        self.assertIn('0.033', app.var_active_row_banner.get())
+        self.assertEqual((app._dual_dc_voltage, app._dual_ac_voltage), (0.01, 0.033))
+        with self.assertRaisesRegex(ValueError, '전압 적용'):
+            app._sequence_output_command(app.seq_steps[0])
+        app.var_dual_ac_voltage.set('1.25')
+        app._on_dual_current_voltages_applied()
+        self.assertIn('0.25 V DC', app._sequence_output_preview(app.seq_steps[0])[0])
+        self.assertEqual(app._sequence_output_command(app.seq_steps[0]), ('OUT 0.25 V, 1 A, 0 HZ', True))
+        self.assertEqual(app._sequence_output_command(app.seq_steps[1]),
+                         ('OUT 1.25 V, 2 A, 60 HZ; WAVE SINE,SINE', True))
 
     def test_toolbar_paste_preserves_all_pf_points_and_reads_rightmost_value(self):
         with patch.object(self.app, 'clipboard_get', return_value=power_factor_table()):
@@ -101,13 +142,28 @@ class ClipboardTableTests(unittest.TestCase):
             run.assert_called_once_with(0, 3)
 
     def test_append_unrecognized_row_is_atomic_and_does_not_insert_dummy_output(self):
+        self.app._handle_excel_paste_at_cell('1 V', 0, 2)
         with patch.object(self.app, 'clipboard_get', return_value='50 Hz\t1 V\nbroken value'), \
              patch.object(f.messagebox, 'showerror') as error:
             self.app._on_paste_into_sheet_button(append=True)
         error.assert_called_once()
         self.assertEqual([row.nominal_raw for row in self.app.seq_steps], ['1 V'])
 
+    def test_append_uses_actual_coil_current_and_accepts_correction(self):
+        app = self.app
+        app._handle_excel_paste_at_cell('1 V', 0, 2)
+        app.var_seq_use_coil.set(True)
+        with patch.object(app, '_get_coil_turns', return_value=50):
+            app._handle_excel_paste_at_cell('1500 A\n1550 A\n2 kV', 0, 2, append=True)
+            self.assertEqual([row.nominal_raw for row in app.seq_steps], ['1 V', '1500 A', '1550 A', '2 kV'])
+            self.assertEqual(app.seq_steps[1].scpi_cmd, 'OUT 30 A, 0 HZ')
+            self.assertEqual([row.func_type for row in app.seq_steps[2:]], ['OUT_OF_RANGE', 'OUT_OF_RANGE'])
+            app._handle_excel_cell_edited(2, '-', 'DC', '-', '100 A')
+            self.assertEqual(app.seq_steps[2].scpi_cmd, 'OUT 2 A, 0 HZ')
+            self.assertEqual(app.seq_steps[2].status, '대기')
+
     def test_missing_last_cell_never_becomes_current_and_failed_replace_is_atomic(self):
+        self.app._handle_excel_paste_at_cell('1 V', 0, 2)
         malformed = '120 V / 1 A\t\t50 Hz\t120 V\t1 A\t'
         with patch.object(self.app, 'clipboard_get', return_value=power_factor_table() + '\n' + malformed), \
              patch.object(f.messagebox, 'showerror') as error:

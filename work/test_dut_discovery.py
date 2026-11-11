@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'outputs'))
@@ -23,6 +24,39 @@ def candidate(settings, identity):
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_usb_com_discovery_works_without_visa_and_skips_calibrator_port(self):
+        identity = 'NEWTONS4TH,PPA5511,TEST,1.00'
+        ports = [SimpleNamespace(device='COM3', vid=0x0403),
+                 SimpleNamespace(device='COM4', vid=0x0403),
+                 SimpleNamespace(device='COM7', vid=None)]
+        handles = []
+
+        def open_port(address, **options):
+            self.assertEqual(address, 'COM3')
+            port = Mock()
+            handles.append(port)
+            if options['rtscts']:
+                port.write.side_effect = TimeoutError('no handshake')
+            else:
+                port.write.side_effect = len
+                reply = (identity + '\r\n').encode('ascii')
+                port.in_waiting = len(reply)
+                port.read.return_value = reply
+            return port
+
+        with (patch.object(f, 'HAS_PYVISA', False),
+              patch.object(f.serial.tools.list_ports, 'comports', return_value=ports),
+              patch.object(f.serial, 'Serial', side_effect=open_port)):
+            devices, _ = f.discover_duts(threading.Event(), excluded_resource='COM4 / 9600 / 8N1 / NONE',
+                                         include_serial=True)
+        self.assertEqual([item.identity for item in devices], [identity])
+        settings = devices[0].settings
+        self.assertEqual((settings.address, settings.baudrate, settings.flow, settings.eol), ('COM3', 19200, 'NONE', 'CR'))
+        self.assertEqual(len(handles), 2)
+        for port in handles:
+            port.write.assert_called_once_with(b'*IDN?\r')
+            port.close.assert_called_once()
+
     def test_only_verified_usb_or_lan_candidates_are_returned(self):
         calibrator = 'TCPIP0::192.168.1.21::inst0::INSTR'
         fluke_usb = 'USB0::0x0F7E::0x800A::7165657::INSTR'
@@ -75,8 +109,7 @@ class DiscoveryTests(unittest.TestCase):
 
 class DiscoveryUiTests(unittest.TestCase):
     def setUp(self):
-        with (patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]),
-              patch.object(f, 'SAMPLE_POWER_TABLE', '1 V')):
+        with patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]):
             self.app = f.Fluke5560AControllerApp()
         self.app.withdraw()
         self.app.conn_mgr.send_command = Mock(side_effect=AssertionError('discovery must not operate calibrator'))
@@ -117,6 +150,7 @@ class DiscoveryUiTests(unittest.TestCase):
             app.notebook.select(app.tab_dut)
             self.wait(lambda: not app._dut_busy and app.dut_session.connected)
             discover.assert_called_once()
+            self.assertTrue(discover.call_args.kwargs['include_serial'])
             self.assertEqual(connect.call_args.args[0].address, WT_USB)
             self.assertEqual(app.var_dut_identity.get(), WT_ID)
             app.conn_mgr.send_command.assert_not_called()
@@ -146,6 +180,24 @@ class DiscoveryUiTests(unittest.TestCase):
             self.assertEqual(connect.call_args.args[0].address, WT_LAN)
             self.assertEqual(app.var_dut_identity.get(), WT_LAN_ID)
             defaults.assert_called_once()
+
+    def test_com_discovery_selection_preserves_negotiated_settings(self):
+        app = self.app
+        identity = 'NEWTONS4TH,PPA5511,TEST,1.00'
+        com = candidate(f.DUTSettings(mode='SERIAL', address='COM3', baudrate=19200, flow='NONE', eol='CR'),
+                        identity)
+
+        def connect_result(_settings):
+            app.dut_session.profile = com.profile
+            app.dut_session.identity = identity
+            return identity
+
+        with (patch.object(f, 'discover_duts', return_value=([com], [])),
+              patch.object(app.dut_session, 'connect', side_effect=connect_result) as connect):
+            app._dut_scan()
+            self.wait(lambda: connect.called and not app._dut_busy)
+            self.assertEqual(app.var_dut_address.get(), 'PPA5511 · COM · COM3')
+            self.assertEqual(connect.call_args.args[0], com.settings)
 
 
 if __name__ == '__main__':

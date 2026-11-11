@@ -29,6 +29,9 @@
             if self._seq_dut_pending is not None or not (0 <= index < len(self.seq_steps)):
                 return False
             step = self.seq_steps[index]
+            if step.func_type == "OUT_OF_RANGE":
+                self.var_active_row_banner.set(f"#{step.step_no}행 실행 제외 · {step.actual_out_desc}")
+                return False
             try:
                 if not self._step_in_current_group(step):
                     self._log(f"[#{index + 1}행 제외] 현재 그룹: {self._current_group_label()}")
@@ -40,6 +43,11 @@
                 return False
             if not step.scpi_cmd or step.func_type == "ERROR":
                 self._show_report("행 설정 확인", f"#{step.step_no}행: {step.actual_out_desc}")
+                return False
+            try:
+                command, dual_current = self._sequence_output_command(step)
+            except ValueError as exc:
+                self._show_report("출력 그룹 확인", str(exc))
                 return False
             self.seq_current_idx = self.seq_paused_idx = index
 
@@ -76,9 +84,9 @@
             step.status = "… 출력 안정화 대기"
             self.excel_grid._update_single_row_visual(index, step, is_active=True)
             self.excel_grid.scroll_to_row(index)
-            self.var_active_row_banner.set(f"#{step.step_no}행 완료 응답 대기: {step.scpi_cmd}")
+            self.var_active_row_banner.set(f"#{step.step_no}행 완료 응답 대기: {command}")
             self.lbl_active_row_banner.configure(bg="#FEF3C7", fg="#92400E")
-            self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={step.scpi_cmd}")
+            self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={command}")
 
             def same_step():
                 return index < len(self.seq_steps) and self.seq_steps[index] is step
@@ -102,9 +110,9 @@
                 step.status = "⚠ 오류"
                 if same_step():
                     self.excel_grid._update_single_row_visual(index, step, is_active=False)
-                self.var_active_row_banner.set(f"#{step.step_no}행 중단 — {step.scpi_cmd} / 출력 상태는 상단과 본체에서 확인하세요.")
+                self.var_active_row_banner.set(f"#{step.step_no}행 중단 — {exc}")
                 self.lbl_active_row_banner.configure(bg="#FECACA", fg="#991B1B")
-                self._log(f"[#{step.step_no}행 실행 오류] 명령={step.scpi_cmd} | {exc}")
+                self._log(f"[#{step.step_no}행 실행 오류] 명령={command} | {exc}")
 
             def record_after_oper_check(sample, error):
                 if not current_capture():
@@ -189,7 +197,8 @@
                     failed("교정기의 OPER 상태를 확인하세요.")
                     return
                 step.status = "… 유지시간 대기" if linked else "▶ 측정 진행 중"
-                self.var_active_row_banner.set(f"[#{step.step_no}/{len(self.seq_steps)}행 출력 확인] {step.nominal_raw} → {step.actual_out_desc}")
+                output, _ = self._sequence_output_preview(step)
+                self.var_active_row_banner.set(f"[#{step.step_no}/{len(self.seq_steps)}행 출력 확인] {step.nominal_raw} → {output}")
                 self.lbl_active_row_banner.configure(bg="#DBEAFE", fg="#0F172A")
                 self.excel_grid._update_single_row_visual(index, step, is_active=True)
                 self._log(f"[#{step.step_no}행 완료 응답 확인] 유지시간 시작")
@@ -201,7 +210,7 @@
                         on_complete()
 
             try:
-                started = self._send_and_log(step.scpi_cmd, auto_oper=self.var_seq_auto_oper.get(),
+                started = self._send_and_log(command, auto_oper=self.var_seq_auto_oper.get(), dual_current=dual_current,
                                              on_done=done, on_error=failed, stop_sequence=False,
                                              verify_setpoint=(step.func_type == "ACV"
                                                               and self.conn_mgr.profile.model == "5560A"))

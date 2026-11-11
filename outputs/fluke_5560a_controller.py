@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fluke 5560A / 5522A / 5520A / 5080A Controller v6.10.4
+Fluke 5560A / 5522A / 5520A / 5080A Controller v6.10.10
 LAN: verified physical adapter, source-IP binding, Telnet stream framing,
 strict *IDN? validation, read-only diagnosis, background connection tasks.
 USB/GPIB: PyVISA with backend diagnostics and correct interface handling.
@@ -142,126 +142,13 @@ class SharedVisaManager:
 
 
 # =====================================================================
-# 1. 하드웨어 사양 상수 및 기본 샘플 데이터 (Fluke 5560A 기준)
+# 1. 하드웨어 사양 상수 (Fluke 5560A 기준)
 # =====================================================================
 MAX_VOLTAGE_V = 1020.0          # 최대 AC/DC 전압 (1020 V)
 MAX_CURRENT_A = 30.0            # 최대 연속 AC/DC 전류 (30 A, 무휴지 연속 출력)
 MAX_RESISTANCE_OHM = 1.1e9      # 최대 저항 (1100 MΩ)
 DEFAULT_LAN_PORT = 3490         # Fluke 5560A 공식 Ethernet Telnet 포트 (CRLF 종료)
 HIGH_VOLTAGE_WARN_V = 30.0      # 고전압 주의 기준 (30 V 이상)
-
-# 샘플 1: 사용자 제공 AC 전력 63행 데이터
-SAMPLE_POWER_TABLE = """120 V / 500 mA\t\t\t\t\t50 Hz\t1 \t120 V\t60 W
-120 V / 1 A   \t\t\t\t\t50 Hz\t1 \t120 V\t120 W
-120 V / 5 A   \t\t\t\t\t50 Hz\t1 \t120 V\t600 W
-120 V / 20 A   \t\t\t\t\t50 Hz\t1 \t120 V\t2.4 kW
-220 V / 1 A   \t\t\t\t\t50 Hz\t1 \t220 V\t220 W
-240 V / 5 mA\t\t\t\t\t50 Hz\t1 \t240 V\t1.2 W
-240 V / 1 A   \t\t\t\t\t50 Hz\t1 \t240 V\t240 W
-240 V / 5 A   \t\t\t\t\t50 Hz\t1 \t240 V\t1.2 kW
-240 V / 20 A   \t\t\t\t\t50 Hz\t1 \t240 V\t4.8 kW
-120 V / 10 mA\t\t\t\t\t50 Hz\t-0.5 \t120 V\t0.6 W
-120 V / 500 mA\t\t\t\t\t50 Hz\t-0.5 \t120 V\t30 W
-120 V / 1 A   \t\t\t\t\t50 Hz\t-0.5 \t120 V\t60 W
-120 V / 5 A   \t\t\t\t\t50 Hz\t-0.5 \t120 V\t300 W
-120 V / 20 A   \t\t\t\t\t50 Hz\t-0.5 \t120 V\t1.2 kW
-220 V / 1 A   \t\t\t\t\t50 Hz\t-0.5 \t220 V\t110 W
-240 V / 5 mA\t\t\t\t\t50 Hz\t-0.5 \t240 V\t0.6 W
-240 V / 1 A   \t\t\t\t\t50 Hz\t-0.5 \t240 V\t120 W
-240 V / 5 A   \t\t\t\t\t50 Hz\t-0.5 \t240 V\t0.6 kW
-240 V / 20 A   \t\t\t\t\t50 Hz\t-0.5 \t240 V\t2.4 kW
-120 V / 10 mA\t\t\t\t\t50 Hz\t0.5 \t120 V\t0.6 W
-120 V / 500 mA\t\t\t\t\t50 Hz\t0.5 \t120 V\t30 W
-120 V / 1 A   \t\t\t\t\t50 Hz\t0.5 \t120 V\t60 W
-120 V / 5 A   \t\t\t\t\t50 Hz\t0.5 \t120 V\t300 W
-120 V / 20 A   \t\t\t\t\t50 Hz\t0.5 \t120 V\t1.2 kW
-220 V / 1 A   \t\t\t\t\t50 Hz\t0.5 \t220 V\t110 W
-240 V / 5 mA\t\t\t\t\t50 Hz\t0.5 \t240 V\t0.6 W
-240 V / 1 A   \t\t\t\t\t50 Hz\t0.5 \t240 V\t120 W
-240 V / 5 A   \t\t\t\t\t50 Hz\t0.5 \t240 V\t0.6 kW
-240 V / 20 A   \t\t\t\t\t50 Hz\t0.5 \t240 V\t2.4 kW
-120 V / 10 mA\t\t\t\t\t60 Hz\t1 \t120 V\t1.2 W
-120 V / 500 mA\t\t\t\t\t60 Hz\t1 \t120 V\t60 W
-120 V / 1 A   \t\t\t\t\t60 Hz\t1 \t120 V\t120 W
-120 V / 5 A   \t\t\t\t\t60 Hz\t1 \t120 V\t600 W
-120 V / 20 A   \t\t\t\t\t60 Hz\t1 \t120 V\t2.4 kW
-240 V / 5 mA\t\t\t\t\t60 Hz\t1 \t240 V\t1.2 W
-220 V / 1 A   \t\t\t\t\t60 Hz\t1 \t220 V\t220 W
-240 V / 1 A   \t\t\t\t\t60 Hz\t1 \t240 V\t240 W
-240 V / 5 A   \t\t\t\t\t60 Hz\t1 \t240 V\t1.2 kW
-240 V / 20 A   \t\t\t\t\t60 Hz\t1 \t240 V\t4.8 kW
-120 V / 10 mA\t\t\t\t\t60 Hz\t-0.5 \t120 V\t0.6 W
-120 V / 500 mA\t\t\t\t\t60 Hz\t-0.5 \t120 V\t30 W
-120 V / 1 A   \t\t\t\t\t60 Hz\t-0.5 \t120 V\t60 W
-120 V / 5 A   \t\t\t\t\t60 Hz\t-0.5 \t120 V\t300 W
-120 V / 20 A   \t\t\t\t\t60 Hz\t-0.5 \t120 V\t1.2 kW
-220 V / 1 A   \t\t\t\t\t60 Hz\t-0.5 \t220 V\t110 W
-240 V / 5 mA\t\t\t\t\t60 Hz\t-0.5 \t240 V\t0.6 W
-240 V / 1 A   \t\t\t\t\t60 Hz\t-0.5 \t240 V\t120 W
-240 V / 5 A   \t\t\t\t\t60 Hz\t-0.5 \t240 V\t0.6 kW
-240 V / 20 A   \t\t\t\t\t60 Hz\t-0.5 \t240 V\t2.4 kW
-120 V / 10 mA\t\t\t\t\t60 Hz\t0.5 \t120 V\t0.6 W
-120 V / 500 mA\t\t\t\t\t60 Hz\t0.5 \t120 V\t30 W
-120 V / 1 A   \t\t\t\t\t60 Hz\t0.5 \t120 V\t60 W
-120 V / 5 A   \t\t\t\t\t60 Hz\t0.5 \t120 V\t300 W
-120 V / 20 A   \t\t\t\t\t60 Hz\t0.5 \t120 V\t1.2 kW
-220 V / 1 A   \t\t\t\t\t60 Hz\t0.5 \t220 V\t110 W
-240 V / 5 mA\t\t\t\t\t60 Hz\t0.5 \t240 V\t0.6 W
-240 V / 1 A   \t\t\t\t\t60 Hz\t0.5 \t240 V\t120 W
-240 V / 5 A   \t\t\t\t\t60 Hz\t0.5 \t240 V\t0.6 kW
-240 V / 20 A   \t\t\t\t\t60 Hz\t0.5 \t240 V\t2.4 kW
-115 V / 2.087 mA\t\t\t\t\t60 Hz\t1 \t115 V\t0.24 W
-115 V / 4.348 mA\t\t\t\t\t60 Hz\t1 \t115 V\t0.5 W
-115 V / 8.696 mA\t\t\t\t\t60 Hz\t1 \t115 V\t1 W
-115 V / 43.478 mA\t\t\t\t\t60 Hz\t1 \t115 V\t5 W"""
-
-# 샘플 2: 사용자 제공 DC 전압 표
-SAMPLE_DCV_TABLE = """Spec\tRange\t조건1\t명목값
-99\t600 mV\t\t100.0 mV
--101\t600 mV\t\t-100.0 mV
-0.99\t6 V\t\t1.000 V
--1.01\t6 V\t\t-1.000 V
-54.45\t60 V\t\t55.00 V
--55.55\t60 V\t\t-55.00 V
-39.6\t60 V\t\t40.00 V
--40.4\t60 V\t\t-40.00 V
-29.7\t60 V\t\t30.00 V
--30.3\t60 V\t\t-30.00 V
-19.8\t60 V\t\t20.00 V
--20.2\t60 V\t\t-20.00 V
-9.9\t60 V\t\t10.00 V
--10.1\t60 V\t\t-10.00 V
-594\t600 V\t\t600.0 V
--606\t600 V\t\t-600.0 V"""
-
-# 샘플 3: 사용자 제공 주파수 조건 포함 AC 전압
-SAMPLE_ACV_TABLE = """100 Hz\t\t\t100 mV
-1 kHz\t\t\t100 mV
-100 Hz\t\t\t1 V
-1 kHz\t\t\t1 V
-100 Hz\t\t\t55 V
-1 kHz\t\t\t55 V
-1 kHz\t\t\t40 V
-1 kHz\t\t\t30 V
-1 kHz\t\t\t20 V
-1 kHz\t\t\t10 V
-100 Hz\t\t\t600 V
-1 kHz\t\t\t600 V"""
-
-# 샘플 4: 사용자 제공 주파수 조건 포함 AC 전류
-SAMPLE_ACI_TABLE = """100 Hz\t\t\t5.5 A
-100 Hz\t\t\t4 A
-100 Hz\t\t\t3 A
-100 Hz\t\t\t2 A
-100 Hz\t\t\t1 A
-1 kHz\t\t\t5.5 A
-1 kHz\t\t\t4 A
-1 kHz\t\t\t3 A
-1 kHz\t\t\t2 A
-1 kHz\t\t\t1 A
-100 Hz\t\t\t10 A
-1 kHz\t\t\t10 A"""
-
 
 @dataclass
 class ConnectionInfo:
@@ -441,7 +328,7 @@ class Fluke5560ACommandBuilder:
         norm_unit = cls.normalize_unit(unit)
         volts = SIUnits.to_base(value, norm_unit, "V")
         if abs(volts) > MAX_VOLTAGE_V:
-            raise ValueError(
+            raise OutputRangeError(
                 f"설정 전압({volts:.4g} V)이 Fluke 5560A 최대 허용 한계(±{MAX_VOLTAGE_V:g} V)를 초과합니다."
             )
 
@@ -474,7 +361,7 @@ class Fluke5560ACommandBuilder:
 
         if abs(actual_output_a) > MAX_CURRENT_A:
             max_effective = MAX_CURRENT_A * coil_turns
-            raise ValueError(
+            raise OutputRangeError(
                 f"5560A 실제 출력 전류({actual_output_a:.4f} A)가 장비 연속 최대 출력 한계({MAX_CURRENT_A:g} A)를 초과합니다.\n"
                 f"현재 {coil_turns:g}턴 코일 기준 최대 설정 가능 전류는 {max_effective:g} A 입니다."
             )
@@ -525,7 +412,7 @@ class Fluke5560ACommandBuilder:
         norm_unit = cls.normalize_unit(unit)
         ohms = SIUnits.to_base(value, norm_unit, "OHM")
         if ohms < 0 or ohms > MAX_RESISTANCE_OHM:
-            raise ValueError(
+            raise OutputRangeError(
                 f"설정 저항({ohms:.4g} Ω)이 허용 범위(0 Ω ~ {MAX_RESISTANCE_OHM/1e6:g} MΩ)를 벗어났습니다."
             )
         zcomp_clean = zcomp.strip().upper()
@@ -552,8 +439,10 @@ class Fluke5560ACommandBuilder:
         coil_turns: float = 1.0,
     ) -> Dict[str, object]:
         is_ac = mode.upper() == "ACP"
-        if abs(voltage_v) <= 0 or abs(voltage_v) > MAX_VOLTAGE_V:
-            raise ValueError(f"기준 전압은 0보다 크고 {MAX_VOLTAGE_V:g} V 이하여야 합니다.")
+        if abs(voltage_v) > MAX_VOLTAGE_V:
+            raise OutputRangeError(f"기준 전압의 절댓값은 {MAX_VOLTAGE_V:g} V 이하여야 합니다.")
+        if voltage_v == 0:
+            raise ValueError("기준 전압은 0이 아닌 값이어야 합니다.")
 
         if not is_ac:
             pf = 1.0
@@ -819,6 +708,16 @@ class SmartClipboardSequenceParser:
                     continue
             return True
         return False
+
+    @classmethod
+    def build_sheet_step(cls, *, step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw, nominal_raw,
+                         breakpoint=False, **settings):
+        try:
+            return cls.build_Single_step_from_fields(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw,
+                                                     nominal_raw, breakpoint=breakpoint, **settings)
+        except OutputRangeError as exc:
+            return SequenceStep(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw, nominal_raw,
+                                "OUT_OF_RANGE", "", str(exc).splitlines()[0], "⚠ 출력 범위 초과", breakpoint)
 
     @classmethod
     def build_Single_step_from_fields(
@@ -1133,6 +1032,14 @@ class SmartClipboardSequenceParser:
 # =====================================================================
 # 4. 실제 랜카드 조회 및 USB/GPIB/LAN 통신 엔진
 # =====================================================================
+class OutputRangeError(ValueError):
+    """A numeric setpoint falls outside the configured output limits."""
+
+
+DUAL_CURRENT_DC_DEFAULT = 0.01
+DUAL_CURRENT_AC_MIN = 0.033
+
+
 @dataclass(frozen=True)
 class CalibratorProfile:
     model: str
@@ -1147,6 +1054,43 @@ class CalibratorProfile:
 
     def high_current(self, amps):
         return abs(amps) > 3.1 if self.model == "5560A" else abs(amps) >= 3.0
+
+    @staticmethod
+    def validate_dual_current_voltages(dc_voltage, ac_voltage):
+        if not 0 < dc_voltage <= MAX_VOLTAGE_V:
+            raise ValueError(f"DC 듀얼 전압은 0 V 초과 {MAX_VOLTAGE_V:g} V 이하로 입력하세요.")
+        if not DUAL_CURRENT_AC_MIN <= ac_voltage <= MAX_VOLTAGE_V:
+            raise ValueError(f"AC 듀얼 전압은 {DUAL_CURRENT_AC_MIN:g}~{MAX_VOLTAGE_V:g} V로 입력하세요.")
+
+    def dual_current_command(self, command, *, dc_voltage=DUAL_CURRENT_DC_DEFAULT, ac_voltage=DUAL_CURRENT_AC_MIN):
+        """Keep the current setpoint and add the selected primary voltage."""
+        if self.model != "5560A":
+            return None
+        self.validate_dual_current_voltages(dc_voltage, ac_voltage)
+        values = self.output_values(command)
+        if values.keys() != {"A", "HZ"}:
+            raise ValueError("듀얼 전류로 바꿀 OUT에는 전류와 주파수만 지정하세요.")
+        amps, hz = values["A"], values["HZ"]
+        if hz == 0:
+            return f"OUT {dc_voltage:.12g} V, " + command[4:]
+        # 5560A Product Specifications, p. 21, Power and Dual Output Limits.
+        # 33 mV is the NORMAL output minimum in this band, not the AUX V minimum.
+        if 45 <= hz <= 65 and .0012001 <= amps <= 20.5:
+            return f"OUT {ac_voltage:.12g} V, " + command[4:] + "; WAVE SINE,SINE"
+        return None
+
+    def verify_dual_current_readback(self, command, reply):
+        expected = self.output_values(command.split(";", 1)[0])
+        fields = [field.strip().upper() for field in reply.split(",")]
+        try:
+            if len(fields) == 5 and (fields[1], fields[3]) == ("V", "A"):
+                actual = [float(fields[i]) for i in (0, 2, 4)]
+                if actual[0] > 0 and all(math.isclose(value, expected[unit], rel_tol=1e-5, abs_tol=1e-8)
+                                         for value, unit in zip(actual, ("V", "A", "HZ"))):
+                    return
+        except ValueError:
+            pass
+        raise ValueError(f"5560A 듀얼 전압·전류 설정 확인 실패: {reply[:120]}. 본체 STBY를 확인하세요.")
 
     def lcomp_allowed(self, amps, hz):
         if self.model == "5560A" or hz <= 0:
@@ -1185,9 +1129,9 @@ class CalibratorProfile:
             raise ValueError("한 번에 OUT 한 개만 전송하세요.")
         values = self.output_values(out_parts[0]) if out_parts else {}
         if abs(values.get("V", 0)) > 1020:
-            raise ValueError(f"{self.model}: 최대 전압 1020 V를 초과합니다.")
+            raise OutputRangeError(f"{self.model}: 최대 전압 1020 V를 초과합니다.")
         if abs(values.get("A", 0)) > self.max_current:
-            raise ValueError(f"{self.model}: 코일 환산 후 실제 전류가 최대 {self.max_current:g} A를 초과합니다.")
+            raise OutputRangeError(f"{self.model}: 코일 환산 후 실제 전류가 최대 {self.max_current:g} A를 초과합니다.")
         if values.get("HZ", 0) < 0:
             raise ValueError("주파수는 0 이상이어야 합니다.")
         if values.get("HZ", 0) > 0 and any(values.get(u, 1) <= 0 for u in ("V", "A")):
@@ -1195,7 +1139,7 @@ class CalibratorProfile:
         ohms = values.get("OHM")
         if ohms is not None:
             if not 0 <= ohms <= self.max_resistance:
-                raise ValueError(f"{self.model}: 저항 범위 0~{self.max_resistance / 1e6:g} MΩ를 벗어났습니다.")
+                raise OutputRangeError(f"{self.model}: 저항 범위 0~{self.max_resistance / 1e6:g} MΩ를 벗어났습니다.")
             if self.model == "5080A" and not any(math.isclose(ohms, r, rel_tol=1e-10, abs_tol=1e-12) for r in RESISTORS_5080A):
                 raise ValueError("5080A는 고정 저항만 출력합니다: 0, 1/1.9/10/19/100/190 Ω, "
                                  "1/1.9/10/19/100/190 kΩ, 1/1.9/10/19/100/190 MΩ. 자동 반올림하지 않습니다.")
@@ -1281,7 +1225,13 @@ class SequenceCurrentFilter:
     """Classify the current actually encoded in OUT, after coil conversion."""
     JOB = "작업 기준: 3 A 이상"
     POSTS = "선택 모델의 실제 단자 기준"
-    CURRENT_FUNCTIONS = {"DCI", "ACI", "DCP", "ACP", "PF"}
+    ALL_OUTPUTS = "전체 출력"
+    SINGLE_OUTPUT = "싱글 출력"
+    DUAL_OUTPUT = "듀얼 출력"
+    OUTPUT_GROUPS = (ALL_OUTPUTS, SINGLE_OUTPUT, DUAL_OUTPUT)
+    CURRENT_ONLY = {"DCI", "ACI"}
+    DUAL_FUNCTIONS = {"DCP", "ACP", "PF"}
+    CURRENT_FUNCTIONS = CURRENT_ONLY | DUAL_FUNCTIONS
     CURRENT_TOKEN = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)\s*(UA|MA|A)\s*$", re.I)
 
     @classmethod
@@ -1543,7 +1493,7 @@ class TelnetLineTransport:
         text = cls.PROMPT.sub("", text).strip()
         return "" if text.upper() == command.upper() else text
 
-    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None):
+    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None, *, expected_reply=None):
         limit = self.timeout if timeout is None else timeout
         # One query, one reply. Never retransmit OPC while a reply is pending.
         self.write(command)
@@ -1565,6 +1515,8 @@ class TelnetLineTransport:
                 self.last_received = text
                 # Initial banners/prompts are not identification responses.
                 if identity and len(text.split(",")) < 4:
+                    continue
+                if expected_reply is not None and text != expected_reply:
                     continue
                 return text
             remaining = deadline - time.monotonic()
@@ -1648,6 +1600,7 @@ class DUTProfile:
     model: str
     channels: int
     wt3000_numeric: bool = False
+    ppa_common_only: bool = False
 
 
 def identify_dut(identity):
@@ -1657,10 +1610,16 @@ def identify_dut(identity):
     maker = re.sub(r"[^A-Z0-9]", "", parts[0])
     model = re.sub(r"[\s-]", "", parts[1])
     if maker in ("NEWTONS4TH", "NEWTONS4THLTD", "N4L"):
-        number = model.removeprefix("PPA")
+        number = re.sub(r"(?:LC|HC|TE|HF)$", "", model.removeprefix("PPA"))
         # These families document the same POWER/RMS and POWER/WATTS records.
         if re.fullmatch(r"(?:5\d{2}|(?:15|25|26|35|45|55)\d{2})[A-Z]?", number):
-            return DUTProfile("PPA", "PPA" + number, 6 if number.startswith("35") else 3)
+            base = number.rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            phases = {"510": 1, "520": 2, "1510": 1, "1520": 2, "5511": 1}
+            return DUTProfile("PPA", "PPA" + number, phases.get(base, 6 if base.startswith("35") else 3))
+        if model.startswith("PPA") and re.fullmatch(r"\d{3,4}[A-Z]?", number):
+            # A new PPA can use the documented records if its replies match.
+            # Model-specific configuration and freshness checks require a profile.
+            return DUTProfile("PPA", "PPA" + number, 1, ppa_common_only=True)
     if maker.startswith("YOKOGAWA"):
         # WT3000(E) includes the option suffix in the model field of *IDN?.
         model_code = parts[1].split("-", 1)[0].strip()
@@ -1883,7 +1842,7 @@ class DUTSession:
 
     @property
     def supports_fresh_capture(self):
-        return self.connected and self.profile.family in ("WT", "PPA")
+        return self.connected and self.profile.family in ("WT", "PPA") and not self.profile.ppa_common_only
 
     @staticmethod
     def _wt_reply_value(reply):
@@ -1928,6 +1887,8 @@ class DUTSession:
             return ""
         t, profile = self.transport, self.profile
         if profile.family == "PPA":
+            if profile.ppa_common_only:
+                return "PPA 공통 조회 · 장비 설정 유지 · 자동 기록은 모델 확인 필요"
             # CONFIG indices are the common voltage/current autorange controls.
             # This preserves the configured minimum ranges and input scaling.
             t.write("SPEED,FAST")
@@ -2006,6 +1967,9 @@ class DUTSession:
                 raise ValueError("선택한 LAN 방식과 DUT 제조사가 다릅니다.")
             if settings.mode == "WT5000_TCP" and self.profile.model != "WT5000":
                 raise ValueError("이 TCP 연결은 WT5000용입니다. 본체 Remote Control의 Command Type을 WT5000으로 확인하세요.")
+            if self.profile.ppa_common_only:
+                dut_number_fields(self.transport.query("POWER,PHASE1,RMS?"), 5)
+                dut_number_fields(self.transport.query("POWER,PHASE1,WATTS?"), 11)
             return self.identity
         except Exception:
             self.disconnect()
@@ -2082,6 +2046,8 @@ class DUTSession:
         self.sample = None
         if not self.connected:
             raise ConnectionError("DUT를 먼저 연결하세요.")
+        if fresh and self.profile.ppa_common_only:
+            raise ValueError("이 PPA 모델은 공통 조회만 지원합니다. 자동 기록에는 모델별 갱신 상태 확인이 필요합니다.")
         if self.cancel.is_set():
             self.disconnect()
             raise InterruptedError("DUT 조회를 중지했습니다.")
@@ -2105,7 +2071,6 @@ class DUTSession:
                     coupling = self.transport.query(f"COUPLI,PHASE{channel}?").strip()
                     if coupling not in ("0", "2"):
                         raise ValueError("PPA의 DC 측정에는 해당 입력의 커플링을 AC+DC 또는 DC로 설정하세요.")
-                self.transport.write("RESOLU,HIGH")
                 rms_command = f"POWER,PHASE{channel},RMS?"
                 if fresh:
                     dut_numbers(self.transport.query(rms_command), 5)
@@ -2332,7 +2297,29 @@ def _dut_discovery_resource_ip(resource):
     return None
 
 
-def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=True, include_lan=True, adapters=None):
+def _dut_serial_targets(excluded_resource, diagnostics):
+    if not HAS_PYSERIAL:
+        diagnostics.append(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
+        return {}
+    try:
+        ports = serial.tools.list_ports.comports()
+    except OSError as exc:
+        diagnostics.append(f"COM 포트 목록을 읽지 못했습니다: {exc}")
+        return {}
+    excluded_com = excluded_resource.split(" / ", 1)[0]
+    addresses = sorted({port.device.upper() for port in ports if port.vid not in (None, 0x0F7E)
+                        and port.device.upper() != excluded_com})
+    diagnostics.append(f"자동 검색용 USB COM 포트 {len(addresses)}개를 확인했습니다.")
+    # PPA RS232 / USB virtual COM, then common serial defaults. Other
+    # settings and onboard serial ports remain available via manual COM.
+    presets = ((19200, "RTS/CTS", "CR"), (19200, "NONE", "CR"),
+               (9600, "RTS/CTS", "CRLF"), (9600, "NONE", "CRLF"))
+    return {(address, baud, flow): DUTSettings(mode="SERIAL", address=address, baudrate=baud, flow=flow, eol=eol)
+            for baud, flow, eol in presets for address in addresses}
+
+
+def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=True, include_lan=True,
+                  include_serial=False, adapters=None):
     """Return all recognized, closed probe sessions and discovery diagnostics.
 
     Discovery never needs network configuration changes or address-range scans.
@@ -2341,25 +2328,25 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
     """
     _dut_discovery_check_cancel(cancel)
     diagnostics, candidates = [], []
-    if not (include_usb or include_lan):
+    resources = ()
+    visa_ready = False
+    if include_usb or include_lan:
+        if not HAS_PYVISA:
+            diagnostics.append(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
+        else:
+            try:
+                manager = SharedVisaManager()
+                visa_ready = True
+                try:
+                    resources = manager.list_resources("?*")
+                finally:
+                    manager.close()
+            except Exception as exc:
+                diagnostics.append(f"VISA 장치 목록을 읽지 못했습니다: {exc}")
+                if not visa_ready:
+                    diagnostics.append("VISA 드라이버를 시작할 수 없습니다. NI-VISA 설치 상태를 확인하세요.")
+    if not (visa_ready or include_serial):
         return candidates, diagnostics
-    if not HAS_PYVISA:
-        diagnostics.append(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
-        return candidates, diagnostics
-
-    manager = None
-    try:
-        manager = SharedVisaManager()
-        try:
-            resources = manager.list_resources("?*")
-        finally:
-            manager.close()
-    except Exception as exc:
-        resources = ()
-        diagnostics.append(f"VISA 장치 목록을 읽지 못했습니다: {exc}")
-        if manager is None:
-            diagnostics.append("VISA 드라이버를 시작할 수 없습니다. NI-VISA 설치 상태를 확인하세요.")
-            return candidates, diagnostics
 
     _dut_discovery_check_cancel(cancel)
     excluded_resource = excluded_resource.strip().upper()
@@ -2396,9 +2383,9 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         listed_lan.setdefault((settings.mode, host), settings)
 
     usb_count = len(targets)
-    if include_usb:
+    if include_usb and visa_ready:
         diagnostics.append(f"VISA USB-TMC 후보 {usb_count}개를 확인했습니다.")
-    if include_lan:
+    if include_lan and visa_ready:
         if adapters is None:
             adapters = AutoNetworkAligner.list_ethernet_interfaces()
             if AutoNetworkAligner.last_error:
@@ -2408,18 +2395,27 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
                 targets.setdefault(("WT_LAN", host), DUTSettings(mode="WT_LAN", address=host, eol="LF"))
         for key, settings in listed_lan.items():
             targets.setdefault(key, settings)
+    if include_serial:
+        targets.update(_dut_serial_targets(excluded_resource, diagnostics))
 
     deadline = time.monotonic() + 8.0
-    for index, settings in enumerate(targets.values()):
+    identified_com = set()
+    attempts = 0
+    for settings in targets.values():
         _dut_discovery_check_cancel(cancel)
-        if index >= 12 or time.monotonic() >= deadline:
+        if settings.mode == "SERIAL" and settings.address in identified_com:
+            continue
+        if attempts >= 12 or time.monotonic() >= deadline:
             diagnostics.append("자동 확인 범위에 도달했습니다. 표시되지 않은 장비는 주소를 직접 입력하세요.")
             break
+        attempts += 1
         probe = DUTSession()
         probe.cancel = cancel
         try:
             identity = probe.connect(replace(settings, timeout=1.0))
             candidates.append(DUTDiscoveryCandidate(settings, probe.profile, identity))
+            if settings.mode == "SERIAL":
+                identified_com.add(settings.address)
         except InterruptedError:
             raise
         except Exception as exc:
@@ -2432,12 +2428,14 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         diagnostics.append(f"식별이 확인된 DUT {len(candidates)}대가 있습니다.")
     else:
         message = ""
-        if include_usb:
+        if include_usb and visa_ready:
             message = ("USB 계측기는 목록에 있지만 지원 DUT로 식별되지 않았습니다. 본체의 USB 원격 설정과 통신 기록을 확인하세요."
                        if usb_count else
                        "VISA 목록에 USB DUT가 없습니다. 케이블과 본체의 USB 원격 설정을 확인하세요.")
-        if include_lan:
+        if include_lan and visa_ready:
             message += (" " if message else "") + "LAN에서 찾지 못한 DUT는 연결 방식을 선택해 IP를 직접 입력하세요."
+        if include_serial:
+            message += (" " if message else "") + "COM에서 찾지 못한 DUT는 RS232 방식을 선택해 본체 통신 설정과 맞추세요."
         diagnostics.append(message)
     return candidates, diagnostics
 
@@ -2447,6 +2445,7 @@ class Fluke5560AConnectionManager:
         self._visa_rm = None
         self._visa_inst = None
         self._lan_sock = None
+        self._first_lan_command_check = False
         self._transport = None
         self._serial_port = None
         self.expected_model = "5560A"
@@ -2639,6 +2638,7 @@ class Fluke5560AConnectionManager:
             stage = "Computer 통신 모드 확인"
             self._prepare_remote_stream(transport, "LAN")
             self._lan_sock, self._transport = sock, transport
+            self._first_lan_command_check = self.profile.model == "5560A"
             self.info = ConnectionInfo(True, "LAN (Ethernet Socket)", f"TCPIP::{ip}::{port}::SOCKET", idn, ip, port)
             self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = ""
@@ -2811,6 +2811,7 @@ class Fluke5560AConnectionManager:
                 except Exception:
                     pass
         self._visa_inst = self._visa_rm = self._lan_sock = self._transport = None
+        self._first_lan_command_check = False
         self._serial_port = None
         self.info = ConnectionInfo()
 
@@ -2848,17 +2849,44 @@ class Fluke5560AConnectionManager:
         else:
             raise ConnectionError("유효한 통신 핸들이 없습니다.")
 
-    def _fail_control_session(self, context, exc):
-        # Keep the handle until STBY has been attempted. Never read after an
-        # uncertain reply: a late OPC '1' could be mistaken for a new query.
+    def _confirm_standby_after_interrupted_wait(self):
+        # An earlier OPC/ERR reply can still be in flight. Only trust new
+        # status queries after seeing this session's exact identification.
+        deadline = time.monotonic() + 3.0
+        self.record_event("TX QUERY >> *IDN? | STBY 복구")
+        self._transport.query("*IDN?", timeout=3.0, expected_reply=self.info.idn_string)
+        self.record_event(f"RX << {self.info.idn_string} | STBY 복구")
+        if self._query("OPER?", timeout=max(.001, deadline - time.monotonic()), cancellable=False) != "0":
+            raise InstrumentProtocolError("본체의 STBY 상태를 확인하지 못했습니다.")
+        error = self._query("ERR?", timeout=max(.001, deadline - time.monotonic()), cancellable=False)
+        if not re.match(r"^[+-]?\d+\s*,", error):
+            raise InstrumentProtocolError(f"장비 오류 응답 형식이 올바르지 않습니다: {error[:120]}")
+        return error
+
+    def _can_recover_standby(self, exc):
+        return (self.profile.model == "5560A" and self._lan_sock is not None
+                and isinstance(exc, (OperationCancelled, TimeoutError)))
+
+    def _fail_control_session(self, context, exc, *, recover_standby=False):
         message = f"{context}: {type(exc).__name__}: {exc}"
         try:
             self._write("STBY")
-            message += "\nSTBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요."
         except Exception as standby_error:
             message += f"\nSTBY 전송 실패: {standby_error}. 본체의 STBY 상태를 확인하세요."
-        finally:
-            self._drop_connection()
+        else:
+            if recover_standby:
+                try:
+                    error = self._confirm_standby_after_interrupted_wait()
+                except Exception as recovery_error:
+                    message += f"\nSTBY 확인 실패: {recovery_error}"
+                else:
+                    self.cancel_event.clear()
+                    message = f"{message}\n5560A 응답 {error}. STBY 확인 완료, LAN 연결 유지. 다음 행은 실행하지 않습니다."
+                    self.last_error = message
+                    self.record_event(message, notify=True)
+                    raise InstrumentCommandError(message) from exc
+            message += "\nSTBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요."
+        self._drop_connection()
         self.last_error = message
         self.record_event(message, notify=True)
 
@@ -2876,17 +2904,27 @@ class Fluke5560AConnectionManager:
             try:
                 return self._query(command, timeout=self.operation_timeout if command.upper() == "*OPC?" else None)
             except Exception as exc:
-                self._fail_control_session(f"조회 {command}", exc)
+                recover_standby = command.upper() in ("OPER?", "*OPC?") and self._can_recover_standby(exc)
+                self._fail_control_session(f"조회 {command}", exc, recover_standby=recover_standby)
                 raise
 
     def _stop_after_command_error(self, error, phase):
         # A valid error reply means the stream is still synchronized.
-        self._write("STBY")
-        if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
-            raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
+        protection = (self.profile.model == "5560A" and self._lan_sock is not None
+                      and re.match(r"^\+?(4008|4100|4102|4202)\s*,", error))
+        if not protection or self._query("OPER?") != "0":
+            self._write("STBY")
+            if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
+                raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
         raise InstrumentCommandError(
             f"{self.profile.model} 오류 ({phase}): {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
         )
+
+    def _check_initial_lan_error(self, error):
+        if re.match(r"^-410\s*,", error) and self._query("OPER?") == "0":
+            self.record_event(f"[LAN 최초 확인] STBY에서 이전 조회 중단 응답 확인: {error}")
+            return self._query("ERR?")
+        return error
 
     def send_command(self, cmd, *, check_before=False):
         command = self._validate_command(cmd)
@@ -2911,14 +2949,23 @@ class Fluke5560AConnectionManager:
             try:
                 if self.cancel_event.is_set():
                     raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
+                first_output = self._first_lan_command_check and any(
+                    re.match(r"^(?:OUT\s|OPER$)", part.strip(), re.I) for part in command.split(";"))
+                if first_output:
+                    self._first_lan_command_check = False
                 if check_before:
                     pending = self._query("ERR?")
+                    if first_output:
+                        pending = self._check_initial_lan_error(pending)
                     if not re.match(r"^\+?0\s*(?:,|$)", pending):
                         self._stop_after_command_error(pending, "출력 전 대기 중이던 오류")
                 self._write(command)
                 if self._query("*OPC?", timeout=self.operation_timeout) != "1":
                     raise InstrumentProtocolError("명령 처리 완료를 확인하지 못했습니다.")
                 error = self._query("ERR?")
+                if self._first_lan_command_check and command.upper() == "STBY":
+                    self._first_lan_command_check = False
+                    error = self._check_initial_lan_error(error)
                 if not re.match(r"^\+?0\s*(?:,|$)", error):
                     self._stop_after_command_error(error, command)
                 self.record_event(f"[명령 완료] {command} | {time.monotonic() - started:.3f}s", notify=True)
@@ -2928,7 +2975,7 @@ class Fluke5560AConnectionManager:
                 raise
             except Exception as exc:
                 context = f"명령 [{command}] / {time.monotonic() - started:.3f}초 경과 / 완료 대기 한도 {self.operation_timeout:g}초"
-                self._fail_control_session(context, exc)
+                self._fail_control_session(context, exc, recover_standby=self._can_recover_standby(exc))
                 raise
 
     def _record_shutdown_error(self, phase):
@@ -3334,9 +3381,14 @@ if HAS_TKINTER:
         def _resize_columns(self, _event=None):
             base = sum(spec[1] for index, spec in enumerate(self.COL_SPECS)
                        if (index != 7 or self.show_commands) and (index != 9 or self.show_measurements))
-            width = max(base, self.canvas.winfo_width())
-            self.canvas.itemconfigure(self.canvas_window, width=width)
-            self.header_canvas.itemconfigure(self.header_window, width=width)
+            try:
+                width = max(base, self.canvas.winfo_width())
+                self.canvas.itemconfigure(self.canvas_window, width=width)
+                self.header_canvas.itemconfigure(self.header_window, width=width)
+            except tk.TclError as exc:
+                # Tk can deliver a queued resize while it tears down the canvas.
+                if not str(exc).startswith("invalid command name") and "application has been destroyed" not in str(exc):
+                    raise
 
         def _on_frame_configure(self, _event: Optional[tk.Event] = None) -> None:
             bbox = self.canvas.bbox("all")
@@ -3537,8 +3589,10 @@ if HAS_TKINTER:
                     ent.delete(0, "end")
                     ent.insert(0, val_str)
 
-            labels[6].configure(text=st.actual_out_desc, bg=row_bg, fg="#0369A1" if not is_active else "#000000", font=row_font)
-            labels[7].configure(text=st.scpi_cmd, bg=row_bg, fg="#334155" if not is_active else "#000000", font=row_font)
+            preview = getattr(self, "output_preview", None)
+            output, command = preview(st) if preview else (st.actual_out_desc, st.scpi_cmd)
+            labels[6].configure(text=output, bg=row_bg, fg="#0369A1" if not is_active else "#000000", font=row_font)
+            labels[7].configure(text=command, bg=row_bg, fg="#334155" if not is_active else "#000000", font=row_font)
             labels[8].configure(text=st.status, bg=row_bg, fg=row_fg, font=("Malgun Gothic", 9, "bold"))
 
         def _select_row(self, r_idx: int) -> None:
@@ -3609,11 +3663,11 @@ if HAS_TKINTER:
 # =====================================================================
 if HAS_TKINTER:
     class Fluke5560AControllerApp(tk.Tk):
-        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.10.4"""
+        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.10.10"""
 
         def __init__(self) -> None:
             super().__init__()
-            self.title("Fluke 교정기 통합 제어 프로그램 v6.10.4 (USB / LAN / RS232 / GPIB)")
+            self.title("Fluke 교정기 통합 제어 프로그램 v6.10.10 (USB / LAN / RS232 / GPIB)")
             self.geometry("1280x930")
             self.minsize(1140, 840)
             self.configure(bg="#F4F6F9")
@@ -3638,7 +3692,7 @@ if HAS_TKINTER:
             self._build_ui()
             self.protocol("WM_DELETE_WINDOW", self._on_close)
             self._refresh_oper_badge()
-            self._load_sample_into_sheet(SAMPLE_POWER_TABLE, silent=True)
+            self._refresh_current_group_preview()
 
             self._log(f"통신 기록 자동 저장: {self.conn_mgr.log_path}")
             self._log(f"실행 Python: {sys.executable} | PyVISA={HAS_PYVISA} | pyserial={HAS_PYSERIAL}")
@@ -3685,12 +3739,12 @@ if HAS_TKINTER:
             self._dut_candidates = {}
             self._dut_first_visit = True
             self._dut_modes = {
-                "자동 · USB / LAN": "AUTO",
+                "자동 · USB / LAN / COM": "AUTO",
                 "USB / GPIB · VISA": "VISA", "LAN · WT": "WT_LAN",
                 "LAN · WT5000 TCP": "WT5000_TCP",
                 "LAN · PPA": "PPA_LAN", "COM · USB / RS232": "SERIAL", "미리보기 · 가상 DUT": "DEMO",
             }
-            self.var_dut_mode = tk.StringVar(value="자동 · USB / LAN")
+            self.var_dut_mode = tk.StringVar(value="자동 · USB / LAN / COM")
             self.var_dut_address = tk.StringVar()
             self.var_dut_port = tk.StringVar(value="10001")
             self.var_dut_channel = tk.StringVar(value="1")
@@ -3704,7 +3758,7 @@ if HAS_TKINTER:
             self.var_dut_stop = tk.StringVar(value="1")
             self.var_dut_flow = tk.StringVar(value="RTS/CTS")
             self.var_dut_status = tk.StringVar(value="연결 안 됨 · 캘리브레이터와 별도로 연결합니다.")
-            self.var_dut_identity = tk.StringVar(value="USB 또는 LAN에 연결한 DUT를 찾습니다.")
+            self.var_dut_identity = tk.StringVar(value="USB, LAN 또는 USB COM으로 연결한 DUT를 찾습니다.")
             self.var_dut_note = tk.StringVar(value="WT310 계열, WT3000·WT3000E, WT5000, PPA 등 지원 장비의 채널별 측정값을 조회합니다.")
             self.var_dut_time = tk.StringVar(value="수신 기록 없음")
             self.var_dut_hint = tk.StringVar()
@@ -3721,7 +3775,7 @@ if HAS_TKINTER:
             ttk.Label(pad, text="DUT 연결", style="SubHeader.TLabel").pack(anchor="w", pady=(0, 10))
             bar = ttk.Frame(pad, style="Card.TFrame")
             bar.pack(fill="x")
-            self.combo_dut_mode = self._ui_combo(bar, self.var_dut_mode, tuple(self._dut_modes), 21)
+            self.combo_dut_mode = self._ui_combo(bar, self.var_dut_mode, tuple(self._dut_modes), 24)
             self.combo_dut_mode.bind("<<ComboboxSelected>>", self._dut_mode_changed)
             self.combo_dut_address = ttk.Combobox(bar, textvariable=self.var_dut_address, width=40)
             self.combo_dut_address.pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -3801,12 +3855,12 @@ if HAS_TKINTER:
         def _dut_mode_changed(self, _event=None):
             mode = self._dut_modes[self.var_dut_mode.get()]
             hints = {
-                "AUTO": "USB 계측기와 같은 네트워크의 LAN DUT를 찾습니다. 한 대면 바로 연결합니다. 목록에 없으면 연결 방식을 골라 주소를 직접 입력하세요.",
+                "AUTO": "USB, LAN 및 USB COM의 DUT를 찾습니다. 한 대면 바로 연결합니다. COM 검색에 실패하면 RS232 방식에서 본체 설정과 맞추세요.",
                 "VISA": "목록에서 USB/GPIB 리소스를 선택하세요. VISA 드라이버에 표시되는 장치만 조회합니다.",
                 "WT_LAN": "WT의 IP 주소를 입력하세요. VXI-11과 VISA 드라이버가 필요합니다. WT3000 계열은 GPIB 또는 장착된 RS232를 선택하세요.",
                 "WT5000_TCP": "소켓 통신을 지원하는 WT5000의 IP를 입력하세요. TCP 10002와 LF를 사용합니다. 본체 Command Type은 WT5000으로 설정하세요.",
                 "PPA_LAN": "PPA의 IP 주소를 입력하세요 (기본 TCP 포트 10001). 본체 REMOTE 인터페이스도 LAN으로 선택하세요.",
-                "SERIAL": "COM 포트를 선택하세요. USB가 COM으로 인식되는 PPA 또는 USB–RS232 변환기를 사용합니다. 속도·흐름 설정은 본체와 맞추세요.",
+                "SERIAL": "‘목록’에서 COM 포트를 선택하고 본체와 통신 설정을 맞추세요. PPA55xx RS232 기본값은 19200 / 8-N-1 / RTS/CTS / CR입니다.",
                 "DEMO": "화면 확인용 고정 예제입니다. 실제 장비 연결이나 측정은 하지 않습니다.",
             }
             self.var_dut_hint.set(hints[mode])
@@ -3815,7 +3869,7 @@ if HAS_TKINTER:
             if _event is not None:
                 self.var_dut_address.set("")
                 self.var_dut_eol.set("LF" if mode in ("WT_LAN", "WT5000_TCP") else "CRLF")
-            if mode == "PPA_LAN" and not self._dut_details_open:
+            if mode in ("PPA_LAN", "SERIAL") and not self._dut_details_open:
                 self._dut_toggle_details()
             self._dut_sync_controls()
 
@@ -3845,7 +3899,7 @@ if HAS_TKINTER:
                 self._dut_candidates.clear()
                 self.combo_dut_address.configure(values=())
                 self.var_dut_address.set("")
-                self.var_dut_identity.set("USB 또는 LAN에 연결한 DUT를 찾습니다.")
+                self.var_dut_identity.set("USB, LAN 또는 USB COM으로 연결한 DUT를 찾습니다.")
                 self._dut_start("discover")
             else:
                 self._dut_start("scan")
@@ -3893,6 +3947,9 @@ if HAS_TKINTER:
                     transport = "USB"
                     fields = candidate.identity.split(",")
                     address = (fields[2].strip() if len(fields) > 2 else "") or settings.address
+                elif settings.mode == "SERIAL":
+                    transport = "COM"
+                    address = settings.address
                 else:
                     transport = "LAN"
                     address = settings.address
@@ -3954,7 +4011,7 @@ if HAS_TKINTER:
             self.var_dut_status.set({"connect": "DUT 연결 중…", "disconnect": "DUT 연결 해제 중…",
                                      "sequence_read": "새 DUT 측정값 대기 중…",
                                      "read": "조회 중… · 표시된 값은 이전 수신값입니다.", "scan": "연결 목록 조회 중…",
-                                     "discover": "USB / LAN DUT 검색 중…"}[operation])
+                                     "discover": "USB / LAN / COM DUT 검색 중…"}[operation])
             self._dut_sync_controls()
             def run():
                 result, error = None, None
@@ -3972,7 +4029,7 @@ if HAS_TKINTER:
                         result = identity, defaults
                     elif operation == "discover":
                         result = discover_duts(self.dut_session.cancel, excluded_resource=info.resource_name,
-                                               excluded_ip=excluded_ip)
+                                               excluded_ip=excluded_ip, include_serial=True)
                     elif operation == "disconnect":
                         self.dut_session.disconnect()
                     elif operation == "read":
@@ -4092,15 +4149,20 @@ if HAS_TKINTER:
                 elif operation == "connect":
                     identity, defaults = result
                     self.var_dut_identity.set(identity)
-                    self.var_dut_status.set("DUT 연결됨 · 측정표에서 DUT 자동 기록을 사용할 수 있습니다." if not self.dut_session.simulated
-                                            else "가상 DUT 연결됨 · 화면에서 예제 값을 조회할 수 있습니다.")
+                    if self.dut_session.simulated:
+                        status = "가상 DUT 연결됨 · 화면에서 예제 값을 조회할 수 있습니다."
+                    elif self.dut_session.supports_fresh_capture:
+                        status = "DUT 연결됨 · 측정표에서 DUT 자동 기록을 사용할 수 있습니다."
+                    else:
+                        status = "DUT 연결됨 · 이 탭에서 공통 측정값을 조회할 수 있습니다."
+                    self.var_dut_status.set(status)
                     channels = self.dut_session.input_channels or tuple(range(1, self.dut_session.profile.channels + 1))
                     self.combo_dut_channel.configure(values=channels)
                     self.var_dut_channel.set(str(channels[0]))
                     self._log(f"[DUT 연결] {identity}")
                     if defaults:
-                        self.var_dut_note.set(f"연결 시 기본값 적용 · {defaults}")
-                        self._log(f"[DUT 기본 설정] {defaults}")
+                        self.var_dut_note.set(defaults)
+                        self._log(f"[DUT 연결 설정] {defaults}")
                 elif operation in ("read", "sequence_read"):
                     self._dut_show_sample(result)
                 elif operation == "discover":
@@ -4153,7 +4215,7 @@ if HAS_TKINTER:
             header.pack(fill="x")
             tk.Label(header, text="Fluke Controller", bg="#F5F7FA", fg="#0F172A",
                      font=("Segoe UI", 18, "bold")).pack(side="left")
-            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.10.4", bg="#F5F7FA",
+            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.10.10", bg="#F5F7FA",
                      fg="#64748B", font=("Segoe UI", 9)).pack(side="left", padx=16)
             self.lbl_conn_badge = tk.Label(header, text="연결 안 됨", bg="#E2E8F0", fg="#64748B", padx=12, pady=5)
             self.lbl_conn_badge.pack(side="right")
@@ -4163,18 +4225,18 @@ if HAS_TKINTER:
             self._build_console_panel()
             self.notebook = ttk.Notebook(self)
             self.notebook.pack(fill="both", expand=True, padx=16, pady=(8, 8))
-            for name, title in (("sequence", "측정표"), ("voltage", "전압"), ("current", "전류"),
-                                ("resistance", "저항"), ("power", "전력"), ("dut", "DUT 연결")):
+            for name, title in (("sequence", "측정표"), ("dut", "DUT 연결")):
                 tab = ttk.Frame(self.notebook, style="Card.TFrame")
                 setattr(self, "tab_" + name, tab)
                 self.notebook.add(tab, text=title)
                 getattr(self, "_build_" + name + "_tab")()
-            self._polish_manual_tabs()
             self._sync_model_controls()
             self._sync_connection_view()
 
             self.bind("<F8>", lambda _e: self._on_seq_step_next())
             self.bind("<F9>", lambda _e: self._on_seq_toggle_breakpoint(self.excel_grid.selected_row_idx))
+            self.bind("<<Paste>>", self._paste_into_empty_sheet)
+            self.excel_grid.focus_set()
 
         def _build_connection_panel(self):
             card = tk.Frame(self, bg="white", padx=14, pady=10, highlightbackground="#E2E8F0", highlightthickness=1)
@@ -4366,7 +4428,7 @@ if HAS_TKINTER:
                     complete(value)
                 if self._pending_standby:
                     self._pending_standby = False
-                    if self.conn_mgr.info.connected:
+                    if self.conn_mgr.info.connected and self.is_operating is not False:
                         self._on_stby_clicked()
             if not self._io_busy and not self.conn_mgr.info.connected:
                 if self.is_operating is not None:
@@ -4471,12 +4533,6 @@ if HAS_TKINTER:
             menu.add_command(label="전체 새로 붙여넣기", command=lambda: self._on_paste_into_sheet_button(replace_all=True))
             menu.add_command(label="빈 행 추가", command=self._on_add_blank_row)
             menu.add_command(label="시트 비우기", command=self._on_clear_sheet)
-            menu.add_separator()
-            samples = tk.Menu(menu, tearoff=False)
-            for name, sample in (("AC 전력 · 63행", SAMPLE_POWER_TABLE), ("AC 전압", SAMPLE_ACV_TABLE),
-                                 ("AC 전류", SAMPLE_ACI_TABLE), ("DC 전압", SAMPLE_DCV_TABLE)):
-                samples.add_command(label=name, command=lambda value=sample: self._load_sample_into_sheet(value, silent=False))
-            menu.add_cascade(label="예제 불러오기", menu=samples)
             edit.configure(menu=menu)
             self.var_seq_use_coil = tk.BooleanVar(value=False)
             ttk.Checkbutton(toolbar, text="턴코일", variable=self.var_seq_use_coil,
@@ -4494,7 +4550,7 @@ if HAS_TKINTER:
             self.sequence_details = tk.Frame(container, bg="white", pady=8)
             self._sequence_details_open = False
             self.var_seq_start_row = tk.StringVar(value="1")
-            self.var_seq_stop_row = tk.StringVar(value="63")
+            self.var_seq_stop_row = tk.StringVar(value="1")
             self.var_seq_dwell_sec = tk.StringVar(value="3.0")
             self.var_seq_auto_oper = tk.BooleanVar(value=True)
             self.var_seq_dut_capture = tk.BooleanVar(value=True)
@@ -4509,10 +4565,10 @@ if HAS_TKINTER:
             self.var_show_commands = tk.BooleanVar(value=False)
             ttk.Checkbutton(range_row, text="명령어 열 표시", variable=self.var_show_commands,
                             command=lambda: self.excel_grid.set_command_visibility(self.var_show_commands.get())).pack(side="right")
-            self._build_current_group_panel(container)
+            self._build_current_group_panel(container, toolbar)
             status = tk.Frame(container, bg="#F8FAFC", padx=10, pady=8)
             status.pack(fill="x", pady=(4, 8))
-            self.var_active_row_banner = tk.StringVar(value="측정값을 붙여넣고 시작하세요.")
+            self.var_active_row_banner = tk.StringVar(value="측정 조건과 명목값을 붙여넣으세요.")
             self.lbl_active_row_banner = tk.Label(status, textvariable=self.var_active_row_banner, bg="#F8FAFC", fg="#475569",
                                                   anchor="w", justify="left", wraplength=1000)
             self.lbl_active_row_banner.pack(fill="x")
@@ -4538,6 +4594,7 @@ if HAS_TKINTER:
                 on_paste_text_callback=self._handle_excel_paste_at_cell, on_cell_edited_callback=self._handle_excel_cell_edited,
                 on_row_start_callback=self._handle_row_direct_start, on_row_breakpoint_callback=self._on_seq_toggle_breakpoint,
                 on_row_select_callback=self._handle_row_selected)
+            self.excel_grid.output_preview = self._sequence_output_preview
             self.excel_grid.pack(fill="both", expand=True, pady=(0, 8))
 
         def _get_coil_turns(self) -> float:
@@ -4546,33 +4603,6 @@ if HAS_TKINTER:
                 return t if t > 0 else 1.0
             except ValueError:
                 return 1.0
-
-        def _load_sample_into_sheet(self, sample_txt: str, silent: bool = False) -> None:
-            if self._io_busy or self.seq_running or self._seq_dut_pending is not None:
-                self._log("표를 수정하려면 실행을 일시중단하고 현재 응답을 기다려 주세요.")
-                return
-            self._on_seq_stop_auto(silent=True)
-            turns = self._get_coil_turns()
-            steps = SmartClipboardSequenceParser.build_sequence_steps(
-                model=self._selected_model(), raw_text=sample_txt,
-                use_coil=self.var_seq_use_coil.get(),
-                coil_turns=turns,
-            )
-            self.seq_steps = steps
-            self._original_row_positions = None
-            self.seq_current_idx = -1
-            self.seq_paused_idx = -1
-            self.var_seq_start_row.set("1")
-            self.var_seq_stop_row.set(str(len(steps)) if steps else "1")
-            self.progress_var.set(0.0)
-            self.excel_grid.render_steps(self.seq_steps, active_idx=-1)
-            self._refresh_current_group_preview()
-            self.var_active_row_banner.set(
-                f"{len(steps)}개 행 준비됨 · 셀을 선택하고 Ctrl+V로 측정값을 붙여넣을 수 있습니다."
-            )
-            self.lbl_active_row_banner.configure(bg="#F8FAFC", fg="#854D0E")
-            if not silent:
-                self._log(f"[엑셀 시트 로드] 총 {len(steps)}개 행이 엑셀 칸에 맞춰 등록되었습니다.")
 
         def _on_paste_into_sheet_button(self, replace_all: bool = False, *, append=False) -> None:
             if not (replace_all or append) and self.excel_grid.selected_col_idx == self.excel_grid.MEASUREMENT_COLUMN:
@@ -4598,6 +4628,7 @@ if HAS_TKINTER:
                 return
 
             start_r = 0 if replace_all else self.excel_grid.selected_row_idx
+            replace_all = replace_all or (not self.seq_steps and not append)
             self._handle_excel_paste_at_cell(clip_text, start_row_idx=start_r,
                                              start_col_idx=2, replace_all=replace_all, append=append)
 
@@ -4639,7 +4670,7 @@ if HAS_TKINTER:
                     target_idx = start_row_idx + offset
                     step_num = target_idx + 1
                     try:
-                        new_step = SmartClipboardSequenceParser.build_Single_step_from_fields(
+                        new_step = SmartClipboardSequenceParser.build_sheet_step(
                             model=self._selected_model(), step_no=step_num,
                             vi_cond_raw=vi_c,
                             freq_cond_raw=fq_c,
@@ -4663,9 +4694,15 @@ if HAS_TKINTER:
                     self.var_seq_start_row.set("1")
                 if append:
                     self.var_active_row_banner.set(f"{len(new_steps)}행 추가 · 실행 범위 1~{len(self.seq_steps)}행")
-                invalid_rows = [str(step.step_no) for step in new_steps if not step.scpi_cmd]
+                out_of_range = [str(step.step_no) for step in new_steps if step.func_type == "OUT_OF_RANGE"]
+                invalid_rows = [str(step.step_no) for step in new_steps if step.func_type == "ERROR"]
+                notes = []
+                if out_of_range:
+                    notes.append("출력 범위 초과 · 실행 제외 " + ", ".join(out_of_range) + "행")
                 if invalid_rows:
-                    text = "전력 조건과 명목값 확인 · " + ", ".join(invalid_rows) + "행"
+                    notes.append("전력 조건과 명목값 확인 · " + ", ".join(invalid_rows) + "행")
+                if notes:
+                    text = " | ".join(notes)
                     self.var_active_row_banner.set(text)
                     self._log(text)
                 for i, st in enumerate(self.seq_steps):
@@ -4685,7 +4722,7 @@ if HAS_TKINTER:
                 ln = ln.strip()
                 target_idx = start_row_idx + offset
                 while target_idx >= len(self.seq_steps):
-                    dummy = SmartClipboardSequenceParser.build_Single_step_from_fields(
+                    dummy = SmartClipboardSequenceParser.build_sheet_step(
                         model=self._selected_model(), step_no=len(self.seq_steps) + 1,
                         vi_cond_raw="-",
                         freq_cond_raw="DC",
@@ -4702,7 +4739,7 @@ if HAS_TKINTER:
                 pf_c = ln if start_col_idx == 4 else st.pf_cond_raw
                 nom_c = ln if start_col_idx == 5 else st.nominal_raw
                 try:
-                    self.seq_steps[target_idx] = SmartClipboardSequenceParser.build_Single_step_from_fields(
+                    self.seq_steps[target_idx] = SmartClipboardSequenceParser.build_sheet_step(
                         model=self._selected_model(), step_no=target_idx + 1,
                         vi_cond_raw=vi_c,
                         freq_cond_raw=fq_c,
@@ -4751,7 +4788,7 @@ if HAS_TKINTER:
             if (vi_c, fq_c, pf_c, nom_c) == (st.vi_cond_raw, st.freq_cond_raw, st.pf_cond_raw, st.nominal_raw):
                 return
             try:
-                updated = SmartClipboardSequenceParser.build_Single_step_from_fields(
+                updated = SmartClipboardSequenceParser.build_sheet_step(
                     model=self._selected_model(), step_no=st.step_no,
                     vi_cond_raw=vi_c,
                     freq_cond_raw=fq_c,
@@ -4774,40 +4811,44 @@ if HAS_TKINTER:
                 self._refresh_current_group_preview()
                 self._log(f"[#{st.step_no}행 셀 입력 오류] {e}")
 
-        def _on_add_blank_row(self) -> None:
+        def _on_add_blank_row(self):
             if self._io_busy or self.seq_running or self._seq_dut_pending is not None:
                 self._log("표를 수정하려면 실행을 일시중단하고 현재 응답을 기다려 주세요.")
                 return
             new_no = len(self.seq_steps) + 1
-            step = SmartClipboardSequenceParser.build_Single_step_from_fields(
-                model=self._selected_model(), step_no=new_no,
-                vi_cond_raw="-",
-                freq_cond_raw="DC",
-                pf_cond_raw="-",
-                nominal_raw="1.0 V",
-                use_coil=self.var_seq_use_coil.get(),
-                coil_turns=self._get_coil_turns(),
-            )
-            self.seq_steps.append(step)
-            self.var_seq_stop_row.set(str(len(self.seq_steps)))
+            self.seq_steps.append(SequenceStep(new_no, "", "", "", "", "BLANK", "", "", "명목값 입력"))
+            self.var_seq_stop_row.set(str(new_no))
             self.excel_grid.render_steps(self.seq_steps, active_idx=self.seq_current_idx)
             self._refresh_current_group_preview()
-            self.excel_grid.scroll_to_row(len(self.seq_steps) - 1)
+            self.excel_grid.scroll_to_row(new_no - 1)
 
-        def _on_clear_sheet(self) -> None:
+        def _on_clear_sheet(self):
             if self._io_busy or self.seq_running or self._seq_dut_pending is not None:
                 self._log("표를 수정하려면 실행을 일시중단하고 현재 응답을 기다려 주세요.")
                 return
             self._on_seq_stop_auto(silent=True)
             self.seq_steps = []
             self._original_row_positions = None
-            self._on_add_blank_row()
-            self._log("[시트 초기화] 시트를 비우고 1번 빈 행을 준비했습니다. 1번 행을 클릭하고 Ctrl+V를 눌러 붙여넣으세요.")
+            self.seq_current_idx = self.seq_paused_idx = -1
+            self._seq_active_indices = []
+            self.var_seq_start_row.set("1")
+            self.var_seq_stop_row.set("1")
+            self.progress_var.set(0)
+            self.excel_grid.selected_row_idx, self.excel_grid.selected_col_idx = 0, 2
+            self.excel_grid.render_steps(self.seq_steps)
+            self._refresh_current_group_preview()
+            self.excel_grid.focus_set()
+            self.var_active_row_banner.set("측정 조건과 명목값을 붙여넣으세요.")
 
         def _handle_row_selected(self, r_idx: int) -> None:
             self.var_seq_start_row.set(str(r_idx + 1))
 
         def _handle_row_direct_start(self, r_idx: int) -> None:
+            step = self.seq_steps[r_idx]
+            if step.func_type in ("BLANK", "OUT_OF_RANGE"):
+                detail = step.actual_out_desc or "명목값을 입력하세요."
+                self.var_active_row_banner.set(f"#{step.step_no}행 실행 제외 · {detail}")
+                return
             self.excel_grid.selected_row_idx = r_idx
             self.var_seq_start_row.set(str(r_idx + 1))
             self._on_seq_start_from_selected_or_range()
@@ -4833,8 +4874,11 @@ if HAS_TKINTER:
                 return
             rebuilt_steps = []
             for st in self.seq_steps:
+                if st.func_type == "BLANK":
+                    rebuilt_steps.append(st)
+                    continue
                 try:
-                    rebuilt = SmartClipboardSequenceParser.build_Single_step_from_fields(
+                    rebuilt = SmartClipboardSequenceParser.build_sheet_step(
                         model=self._selected_model(), step_no=st.step_no, vi_cond_raw=st.vi_cond_raw,
                         freq_cond_raw=st.freq_cond_raw, pf_cond_raw=st.pf_cond_raw, nominal_raw=st.nominal_raw,
                         use_coil=self.var_seq_use_coil.get(), coil_turns=self._get_coil_turns(), breakpoint=st.breakpoint)
@@ -4881,6 +4925,9 @@ if HAS_TKINTER:
             if self._seq_dut_pending is not None or not (0 <= index < len(self.seq_steps)):
                 return False
             step = self.seq_steps[index]
+            if step.func_type == "OUT_OF_RANGE":
+                self.var_active_row_banner.set(f"#{step.step_no}행 실행 제외 · {step.actual_out_desc}")
+                return False
             try:
                 if not self._step_in_current_group(step):
                     self._log(f"[#{index + 1}행 제외] 현재 그룹: {self._current_group_label()}")
@@ -4892,6 +4939,11 @@ if HAS_TKINTER:
                 return False
             if not step.scpi_cmd or step.func_type == "ERROR":
                 self._show_report("행 설정 확인", f"#{step.step_no}행: {step.actual_out_desc}")
+                return False
+            try:
+                command, dual_current = self._sequence_output_command(step)
+            except ValueError as exc:
+                self._show_report("출력 그룹 확인", str(exc))
                 return False
             self.seq_current_idx = self.seq_paused_idx = index
 
@@ -4928,9 +4980,9 @@ if HAS_TKINTER:
             step.status = "… 출력 안정화 대기"
             self.excel_grid._update_single_row_visual(index, step, is_active=True)
             self.excel_grid.scroll_to_row(index)
-            self.var_active_row_banner.set(f"#{step.step_no}행 완료 응답 대기: {step.scpi_cmd}")
+            self.var_active_row_banner.set(f"#{step.step_no}행 완료 응답 대기: {command}")
             self.lbl_active_row_banner.configure(bg="#FEF3C7", fg="#92400E")
-            self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={step.scpi_cmd}")
+            self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={command}")
 
             def same_step():
                 return index < len(self.seq_steps) and self.seq_steps[index] is step
@@ -4954,9 +5006,9 @@ if HAS_TKINTER:
                 step.status = "⚠ 오류"
                 if same_step():
                     self.excel_grid._update_single_row_visual(index, step, is_active=False)
-                self.var_active_row_banner.set(f"#{step.step_no}행 중단 — {step.scpi_cmd} / 출력 상태는 상단과 본체에서 확인하세요.")
+                self.var_active_row_banner.set(f"#{step.step_no}행 중단 — {exc}")
                 self.lbl_active_row_banner.configure(bg="#FECACA", fg="#991B1B")
-                self._log(f"[#{step.step_no}행 실행 오류] 명령={step.scpi_cmd} | {exc}")
+                self._log(f"[#{step.step_no}행 실행 오류] 명령={command} | {exc}")
 
             def record_after_oper_check(sample, error):
                 if not current_capture():
@@ -5041,7 +5093,8 @@ if HAS_TKINTER:
                     failed("교정기의 OPER 상태를 확인하세요.")
                     return
                 step.status = "… 유지시간 대기" if linked else "▶ 측정 진행 중"
-                self.var_active_row_banner.set(f"[#{step.step_no}/{len(self.seq_steps)}행 출력 확인] {step.nominal_raw} → {step.actual_out_desc}")
+                output, _ = self._sequence_output_preview(step)
+                self.var_active_row_banner.set(f"[#{step.step_no}/{len(self.seq_steps)}행 출력 확인] {step.nominal_raw} → {output}")
                 self.lbl_active_row_banner.configure(bg="#DBEAFE", fg="#0F172A")
                 self.excel_grid._update_single_row_visual(index, step, is_active=True)
                 self._log(f"[#{step.step_no}행 완료 응답 확인] 유지시간 시작")
@@ -5053,7 +5106,7 @@ if HAS_TKINTER:
                         on_complete()
 
             try:
-                started = self._send_and_log(step.scpi_cmd, auto_oper=self.var_seq_auto_oper.get(),
+                started = self._send_and_log(command, auto_oper=self.var_seq_auto_oper.get(), dual_current=dual_current,
                                              on_done=done, on_error=failed, stop_sequence=False,
                                              verify_setpoint=(step.func_type == "ACV"
                                                               and self.conn_mgr.profile.model == "5560A"))
@@ -5110,7 +5163,9 @@ if HAS_TKINTER:
                 return
             try:
                 while idx <= stop_idx and idx < len(self.seq_steps) and not self._step_in_current_group(self.seq_steps[idx]):
-                    self._log(f"[#{idx + 1}행 건너뜀] 다른 전류 그룹")
+                    step = self.seq_steps[idx]
+                    reason = step.actual_out_desc if step.func_type == "OUT_OF_RANGE" else "다른 그룹"
+                    self._log(f"[#{idx + 1}행 건너뜀] {reason}")
                     idx += 1
             except ValueError as exc:
                 self.seq_running = False
@@ -5235,405 +5290,6 @@ if HAS_TKINTER:
         # -----------------------------------------------------------------
         # 탭 1~4: 개별 수동 설정 탭 (전압 / 전류+턴코일 / 저항 / 전력+턴코일)
         # -----------------------------------------------------------------
-        def _build_voltage_tab(self) -> None:
-            pad = tk.Frame(self.tab_voltage, bg="#FFFFFF", padx=20, pady=16)
-            pad.pack(fill="both", expand=True)
-
-            ttk.Label(pad, text="DC / AC 전압 개별 출력 설정 (최대 ±1020 V)", style="SubHeader.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 12))
-
-            ttk.Label(pad, text="전압 모드:").grid(row=1, column=0, sticky="w", pady=6)
-            self.var_v_mode = tk.StringVar(value="DCV")
-            frm_vmode = ttk.Frame(pad)
-            frm_vmode.grid(row=1, column=1, columnspan=3, sticky="w")
-            ttk.Radiobutton(frm_vmode, text="DC 전압 (DCV, 0 Hz)", variable=self.var_v_mode, value="DCV", command=self._update_voltage_preview).pack(side="left", padx=(0, 16))
-            ttk.Radiobutton(frm_vmode, text="AC 전압 (ACV, 주파수 지정)", variable=self.var_v_mode, value="ACV", command=self._update_voltage_preview).pack(side="left")
-
-            ttk.Label(pad, text="출력 전압 값:").grid(row=2, column=0, sticky="w", pady=6)
-            self.var_v_val = tk.StringVar(value="10.0")
-            ent_v = ttk.Entry(pad, textvariable=self.var_v_val, width=18, font=("Consolas", 11))
-            ent_v.grid(row=2, column=1, sticky="w", pady=6)
-            ent_v.bind("<KeyRelease>", lambda _e: self._update_voltage_preview())
-
-            self.var_v_unit = tk.StringVar(value="V")
-            cmb_vunit = ttk.Combobox(pad, textvariable=self.var_v_unit, values=SIUnits.units("V"), width=8, state="readonly")
-            cmb_vunit.grid(row=2, column=2, sticky="w", padx=8)
-            cmb_vunit.bind("<<ComboboxSelected>>", lambda _e: self._update_voltage_preview())
-
-            ttk.Label(pad, text="주파수 (AC 전용, Hz):").grid(row=3, column=0, sticky="w", pady=6)
-            self.var_v_freq = tk.StringVar(value="60.0")
-            ent_vf = ttk.Entry(pad, textvariable=self.var_v_freq, width=18, font=("Consolas", 11))
-            ent_vf.grid(row=3, column=1, sticky="w", pady=6)
-            ent_vf.bind("<KeyRelease>", lambda _e: self._update_voltage_preview())
-
-            frm_vfreq_quick = ttk.Frame(pad)
-            frm_vfreq_quick.grid(row=3, column=2, columnspan=2, sticky="w", padx=8)
-            for fq in ("50", "60", "100", "400", "1000"):
-                tk.Button(
-                    frm_vfreq_quick,
-                    text=f"{fq} Hz",
-                    bg="#E2E8F0",
-                    relief="flat",
-                    padx=8,
-                    command=lambda f=fq: (self.var_v_freq.set(f), self.var_v_mode.set("ACV"), self._update_voltage_preview()),
-                ).pack(side="left", padx=2)
-
-            self.var_v_preview = tk.StringVar(value="")
-            tk.Label(pad, textvariable=self.var_v_preview, bg="#F8FAFC", fg="#0369A1", font=("Consolas", 11, "bold"), padx=12, pady=8).grid(row=4, column=0, columnspan=4, sticky="ew", pady=(14, 10))
-
-            frm_vbtns = ttk.Frame(pad)
-            frm_vbtns.grid(row=5, column=0, columnspan=4, sticky="w", pady=6)
-            tk.Button(
-                frm_vbtns,
-                text="📤 전압 설정값 장비로 전송 (OUT)",
-                bg="#0284C7",
-                fg="#FFFFFF",
-                font=("Malgun Gothic", 10, "bold"),
-                relief="flat",
-                padx=16,
-                pady=8,
-                command=lambda: self._apply_voltage(auto_oper=False),
-            ).pack(side="left", padx=(0, 10))
-
-            tk.Button(
-                frm_vbtns,
-                text="⚡ 전압 전송 후 즉시 출력 활성화 (OUT + OPER)",
-                bg="#16A34A",
-                fg="#FFFFFF",
-                font=("Malgun Gothic", 10, "bold"),
-                relief="flat",
-                padx=16,
-                pady=8,
-                command=lambda: self._apply_voltage(auto_oper=True),
-            ).pack(side="left")
-
-            self._update_voltage_preview()
-
-        def _build_current_tab(self) -> None:
-            pad = tk.Frame(self.tab_current, bg="#FFFFFF", padx=20, pady=14)
-            pad.pack(fill="both", expand=True)
-
-            ttk.Label(pad, text="DC / AC 전류 출력 및 클램프 미터 턴코일(Turn Coil) 배율 설정", style="SubHeader.TLabel").grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 10))
-
-            ttk.Label(pad, text="전류 모드:").grid(row=1, column=0, sticky="w", pady=5)
-            self.var_i_mode = tk.StringVar(value="DCI")
-            frm_imode = ttk.Frame(pad)
-            frm_imode.grid(row=1, column=1, columnspan=4, sticky="w")
-            ttk.Radiobutton(frm_imode, text="DC 전류 (DCI, 0 Hz)", variable=self.var_i_mode, value="DCI", command=self._update_current_preview).pack(side="left", padx=(0, 16))
-            ttk.Radiobutton(frm_imode, text="AC 전류 (ACI, 주파수 지정)", variable=self.var_i_mode, value="ACI", command=self._update_current_preview).pack(side="left")
-
-            ttk.Label(pad, text="목표 전류 (클램프 인가 기준):").grid(row=2, column=0, sticky="w", pady=5)
-            self.var_i_val = tk.StringVar(value="100.0")
-            ent_i = ttk.Entry(pad, textvariable=self.var_i_val, width=16, font=("Consolas", 11))
-            ent_i.grid(row=2, column=1, sticky="w", pady=5)
-            ent_i.bind("<KeyRelease>", lambda _e: self._update_current_preview())
-
-            self.var_i_unit = tk.StringVar(value="A")
-            cmb_iunit = ttk.Combobox(pad, textvariable=self.var_i_unit, values=SIUnits.units("A"), width=8, state="readonly")
-            cmb_iunit.grid(row=2, column=2, sticky="w", padx=6)
-            cmb_iunit.bind("<<ComboboxSelected>>", lambda _e: self._update_current_preview())
-
-            ttk.Label(pad, text="주파수 (AC 전용, Hz):").grid(row=3, column=0, sticky="w", pady=5)
-            self.var_i_freq = tk.StringVar(value="100.0")
-            ent_if = ttk.Entry(pad, textvariable=self.var_i_freq, width=16, font=("Consolas", 11))
-            ent_if.grid(row=3, column=1, sticky="w", pady=5)
-            ent_if.bind("<KeyRelease>", lambda _e: self._update_current_preview())
-
-            coil_box = tk.LabelFrame(
-                pad,
-                text=" 🧲 클램프 미터 교정용 턴코일 (Turn Coil) 배율 설정 ",
-                bg="#F8FAFC",
-                fg="#0F172A",
-                font=("Malgun Gothic", 10, "bold"),
-                padx=14,
-                pady=10,
-            )
-            coil_box.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(10, 10))
-
-            self.var_i_use_coil = tk.BooleanVar(value=True)
-            tk.Checkbutton(
-                coil_box,
-                text="턴코일(Turn Coil) 배율 환산 활성화 (체크 시: 장비 실제 출력 전류 = 목표 클램프 전류 ÷ 코일 배율 N)",
-                variable=self.var_i_use_coil,
-                bg="#F8FAFC",
-                font=("Malgun Gothic", 9, "bold"),
-                command=self._update_current_preview,
-            ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
-
-            tk.Label(coil_box, text="턴코일 배율 (N Turns):", bg="#F8FAFC", font=("Malgun Gothic", 9, "bold")).grid(row=1, column=0, sticky="w")
-            self.var_i_coil_turns = tk.StringVar(value="50")
-            ent_turns = ttk.Entry(coil_box, textvariable=self.var_i_coil_turns, width=10, font=("Consolas", 11, "bold"))
-            ent_turns.grid(row=1, column=1, sticky="w", padx=8)
-            ent_turns.bind("<KeyRelease>", lambda _e: self._update_current_preview())
-
-            tk.Label(coil_box, text="빠른 배율 선택 (직접 입력 가능):", bg="#F8FAFC").grid(row=1, column=2, sticky="w", padx=(10, 6))
-            frm_coil_presets = tk.Frame(coil_box, bg="#F8FAFC")
-            frm_coil_presets.grid(row=1, column=3, columnspan=3, sticky="w")
-            for t_val, t_label in (("1", "1x (직결)"), ("2", "2-Turn (2x)"), ("10", "10-Turn (10x)"), ("25", "25-Turn (25x)"), ("50", "50-Turn (50x)")):
-                tk.Button(
-                    frm_coil_presets,
-                    text=t_label,
-                    bg="#E0F2FE",
-                    fg="#0369A1",
-                    font=("Malgun Gothic", 9, "bold"),
-                    relief="flat",
-                    padx=8,
-                    pady=2,
-                    command=lambda v=t_val: (self.var_i_use_coil.set(v != "1"), self.var_i_coil_turns.set(v), self._update_current_preview()),
-                ).pack(side="left", padx=3)
-
-            tk.Label(coil_box, text="출력 단자(CUR_POST):", bg="#F8FAFC").grid(row=2, column=0, sticky="w", pady=(8, 0))
-            self.var_i_post = tk.StringVar(value="AUTO")
-            cmb_post = ttk.Combobox(coil_box, textvariable=self.var_i_post, values=["AUTO", "AUX", "A20"], width=10, state="readonly")
-            self.combo_current_post = cmb_post
-            cmb_post.configure(values=["AUTO"])
-            cmb_post.grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
-            cmb_post.bind("<<ComboboxSelected>>", lambda _e: self._update_current_preview())
-
-            self.var_i_preview = tk.StringVar(value="")
-            tk.Label(
-                pad,
-                textvariable=self.var_i_preview,
-                bg="#EFF6FF",
-                fg="#1D4ED8",
-                font=("Consolas", 10, "bold"),
-                justify="left",
-                padx=12,
-                pady=8,
-            ).grid(row=5, column=0, columnspan=5, sticky="ew", pady=(6, 10))
-
-            frm_ibtns = ttk.Frame(pad)
-            frm_ibtns.grid(row=6, column=0, columnspan=5, sticky="w")
-            tk.Button(
-                frm_ibtns,
-                text="📤 전류 설정값 장비로 전송 (OUT)",
-                bg="#0284C7",
-                fg="#FFFFFF",
-                font=("Malgun Gothic", 10, "bold"),
-                relief="flat",
-                padx=16,
-                pady=8,
-                command=lambda: self._apply_current(auto_oper=False),
-            ).pack(side="left", padx=(0, 10))
-
-            tk.Button(
-                frm_ibtns,
-                text="⚡ 전류 전송 후 즉시 출력 활성화 (OUT + OPER)",
-                bg="#16A34A",
-                fg="#FFFFFF",
-                font=("Malgun Gothic", 10, "bold"),
-                relief="flat",
-                padx=16,
-                pady=8,
-                command=lambda: self._apply_current(auto_oper=True),
-            ).pack(side="left")
-
-            self._update_current_preview()
-
-        def _build_resistance_tab(self) -> None:
-            pad = tk.Frame(self.tab_resistance, bg="#FFFFFF", padx=20, pady=16)
-            pad.pack(fill="both", expand=True)
-
-            self.var_resistance_title = tk.StringVar(value="저항 출력 및 리드 보상 (0 Ω ~ 1100 MΩ)")
-            ttk.Label(pad, textvariable=self.var_resistance_title, style="SubHeader.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 12))
-
-            ttk.Label(pad, text="출력 저항 값:").grid(row=1, column=0, sticky="w", pady=6)
-            self.var_r_val = tk.StringVar(value="1.0")
-            ent_r = ttk.Entry(pad, textvariable=self.var_r_val, width=18, font=("Consolas", 11))
-            ent_r.grid(row=1, column=1, sticky="w", pady=6)
-            ent_r.bind("<KeyRelease>", lambda _e: self._update_resistance_preview())
-
-            self.var_r_unit = tk.StringVar(value="kOHM")
-            cmb_runit = ttk.Combobox(pad, textvariable=self.var_r_unit, values=SIUnits.units("OHM"), width=10, state="readonly")
-            cmb_runit.grid(row=1, column=2, sticky="w", padx=8)
-            cmb_runit.bind("<<ComboboxSelected>>", lambda _e: self._update_resistance_preview())
-
-            ttk.Label(pad, text="와이어 리드 보상 (ZCOMP):").grid(row=2, column=0, sticky="w", pady=6)
-            self.var_r_zcomp = tk.StringVar(value="WIRE4")
-            frm_zcomp = ttk.Frame(pad)
-            frm_zcomp.grid(row=2, column=1, columnspan=3, sticky="w")
-            ttk.Radiobutton(frm_zcomp, text="4-Wire 보상 (WIRE4)", variable=self.var_r_zcomp, value="WIRE4", command=self._update_resistance_preview).pack(side="left", padx=(0, 14))
-            ttk.Radiobutton(frm_zcomp, text="2-Wire 보상 (WIRE2)", variable=self.var_r_zcomp, value="WIRE2", command=self._update_resistance_preview).pack(side="left", padx=(0, 14))
-            ttk.Radiobutton(frm_zcomp, text="보상 없음 (NONE)", variable=self.var_r_zcomp, value="NONE", command=self._update_resistance_preview).pack(side="left")
-
-            self.var_r_preview = tk.StringVar(value="")
-            tk.Label(pad, textvariable=self.var_r_preview, bg="#F8FAFC", fg="#0369A1", font=("Consolas", 11, "bold"), padx=12, pady=8).grid(row=3, column=0, columnspan=4, sticky="ew", pady=(14, 10))
-
-            frm_rbtns = ttk.Frame(pad)
-            frm_rbtns.grid(row=4, column=0, columnspan=4, sticky="w", pady=6)
-            tk.Button(
-                frm_rbtns,
-                text="📤 저항 설정값 장비로 전송 (OUT + ZCOMP)",
-                bg="#0284C7",
-                fg="#FFFFFF",
-                font=("Malgun Gothic", 10, "bold"),
-                relief="flat",
-                padx=16,
-                pady=8,
-                command=lambda: self._apply_resistance(auto_oper=False),
-            ).pack(side="left", padx=(0, 10))
-
-            tk.Button(
-                frm_rbtns,
-                text="⚡ 저항 전송 후 즉시 출력 활성화 (OUT + OPER)",
-                bg="#16A34A",
-                fg="#FFFFFF",
-                font=("Malgun Gothic", 10, "bold"),
-                relief="flat",
-                padx=16,
-                pady=8,
-                command=lambda: self._apply_resistance(auto_oper=True),
-            ).pack(side="left")
-
-            self._update_resistance_preview()
-
-        def _build_power_tab(self) -> None:
-            pad = tk.Frame(self.tab_power, bg="#FFFFFF", padx=20, pady=12)
-            pad.pack(fill="both", expand=True)
-
-            ttk.Label(pad, text="DC / AC 전력 동시 출력 (Dual Output) 및 클램프형 전력계 턴코일 연동", style="SubHeader.TLabel").grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
-
-            ttk.Label(pad, text="전력 모드:").grid(row=1, column=0, sticky="w", pady=4)
-            self.var_p_mode = tk.StringVar(value="ACP")
-            frm_pmode = ttk.Frame(pad)
-            frm_pmode.grid(row=1, column=1, columnspan=5, sticky="w")
-            ttk.Radiobutton(frm_pmode, text="AC 전력 (ACP, 주파수/역률/위상 포함)", variable=self.var_p_mode, value="ACP", command=self._update_power_preview).pack(side="left", padx=(0, 16))
-            ttk.Radiobutton(frm_pmode, text="DC 전력 (DCP, 0 Hz)", variable=self.var_p_mode, value="DCP", command=self._update_power_preview).pack(side="left")
-
-            ttk.Label(pad, text="전력 설정 방식:").grid(row=2, column=0, sticky="w", pady=4)
-            self.var_p_calc_method = tk.StringVar(value="PW")
-            frm_pcalc = ttk.Frame(pad)
-            frm_pcalc.grid(row=2, column=1, columnspan=5, sticky="w")
-            ttk.Radiobutton(frm_pcalc, text="목표 유효전력(W 계열) + 기준 전압(V) 입력 (전류 자동 역산)", variable=self.var_p_calc_method, value="PW", command=self._update_power_preview).pack(side="left", padx=(0, 16))
-            ttk.Radiobutton(frm_pcalc, text="전압(V) + 목표 전류(A) 직접 입력", variable=self.var_p_calc_method, value="VI", command=self._update_power_preview).pack(side="left")
-
-            ttk.Label(pad, text="기준 전압 (V):").grid(row=3, column=0, sticky="w", pady=4)
-            self.var_p_volt = tk.StringVar(value="120.0")
-            ent_pv = ttk.Entry(pad, textvariable=self.var_p_volt, width=14, font=("Consolas", 11))
-            ent_pv.grid(row=3, column=1, sticky="w", pady=4)
-            ent_pv.bind("<KeyRelease>", lambda _e: self._update_power_preview())
-
-            self.lbl_p_second_input = ttk.Label(pad, text="목표 전력 / 전류 값:")
-            self.lbl_p_second_input.grid(row=3, column=2, sticky="w", padx=(12, 4))
-            self.var_p_val = tk.StringVar(value="60.0")
-            ent_pval = ttk.Entry(pad, textvariable=self.var_p_val, width=14, font=("Consolas", 11))
-            ent_pval.grid(row=3, column=3, sticky="w", pady=4)
-            ent_pval.bind("<KeyRelease>", lambda _e: self._update_power_preview())
-
-            self.var_p_unit = tk.StringVar(value="W")
-            self.cmb_p_unit = ttk.Combobox(pad, textvariable=self.var_p_unit, values=SIUnits.units("W") + ("A",), width=8, state="readonly")
-            self.cmb_p_unit.grid(row=3, column=4, sticky="w", padx=6)
-            self.cmb_p_unit.bind("<<ComboboxSelected>>", lambda _e: self._update_power_preview())
-
-            ttk.Label(pad, text="AC 주파수 (Hz):").grid(row=4, column=0, sticky="w", pady=4)
-            self.var_p_freq = tk.StringVar(value="50.0")
-            ent_pfreq = ttk.Entry(pad, textvariable=self.var_p_freq, width=14, font=("Consolas", 11))
-            ent_pfreq.grid(row=4, column=1, sticky="w", pady=4)
-            ent_pfreq.bind("<KeyRelease>", lambda _e: self._update_power_preview())
-
-            ttk.Label(pad, text="역률/위상 지정:").grid(row=4, column=2, sticky="w", padx=(12, 4))
-            self.var_p_phase_mode = tk.StringVar(value="DPF")
-            cmb_phmode = ttk.Combobox(pad, textvariable=self.var_p_phase_mode, values=["DPF", "PHASE"], width=8, state="readonly")
-            cmb_phmode.grid(row=4, column=3, sticky="w")
-            cmb_phmode.bind("<<ComboboxSelected>>", lambda _e: self._update_power_preview())
-
-            frm_pf_detail = ttk.Frame(pad)
-            frm_pf_detail.grid(row=5, column=0, columnspan=6, sticky="w", pady=4)
-            ttk.Label(frm_pf_detail, text="역률(DPF, 0~1.0):").pack(side="left", padx=(0, 4))
-            self.var_p_dpf = tk.StringVar(value="1.00")
-            ent_dpf = ttk.Entry(frm_pf_detail, textvariable=self.var_p_dpf, width=8, font=("Consolas", 10))
-            ent_dpf.pack(side="left", padx=(0, 8))
-            ent_dpf.bind("<KeyRelease>", lambda _e: self._update_power_preview())
-
-            self.var_p_lead_lag = tk.StringVar(value="LEAD")
-            cmb_ll = ttk.Combobox(frm_pf_detail, textvariable=self.var_p_lead_lag, values=["LEAD", "LAG"], width=7, state="readonly")
-            cmb_ll.pack(side="left", padx=(0, 16))
-            cmb_ll.bind("<<ComboboxSelected>>", lambda _e: self._update_power_preview())
-
-            ttk.Label(frm_pf_detail, text="또는 위상각(PHASE, °):").pack(side="left", padx=(0, 4))
-            self.var_p_phase_deg = tk.StringVar(value="0.0")
-            ent_pdeg = ttk.Entry(frm_pf_detail, textvariable=self.var_p_phase_deg, width=8, font=("Consolas", 10))
-            ent_pdeg.pack(side="left")
-            ent_pdeg.bind("<KeyRelease>", lambda _e: self._update_power_preview())
-
-            pcoil_box = tk.LabelFrame(
-                pad,
-                text=" 🧲 클램프형 전력계(Clamp Power Meter) 교정용 턴코일 배율 연동 ",
-                bg="#F8FAFC",
-                fg="#0F172A",
-                font=("Malgun Gothic", 9, "bold"),
-                padx=12,
-                pady=8,
-            )
-            pcoil_box.grid(row=6, column=0, columnspan=6, sticky="ew", pady=(8, 8))
-
-            self.var_p_use_coil = tk.BooleanVar(value=False)
-            tk.Checkbutton(
-                pcoil_box,
-                text="전류 채널에 턴코일(Turn Coil) 배율 적용",
-                variable=self.var_p_use_coil,
-                bg="#F8FAFC",
-                font=("Malgun Gothic", 9, "bold"),
-                command=self._update_power_preview,
-            ).pack(side="left", padx=(0, 12))
-
-            tk.Label(pcoil_box, text="턴코일 배율 (N):", bg="#F8FAFC").pack(side="left", padx=(0, 4))
-            self.var_p_coil_turns = tk.StringVar(value="50")
-            ent_pturns = ttk.Entry(pcoil_box, textvariable=self.var_p_coil_turns, width=8, font=("Consolas", 10, "bold"))
-            ent_pturns.pack(side="left", padx=(0, 12))
-            ent_pturns.bind("<KeyRelease>", lambda _e: self._update_power_preview())
-
-            for pt_val, pt_lbl in (("1", "1x(직결)"), ("2", "2x"), ("10", "10x"), ("50", "50x")):
-                tk.Button(
-                    pcoil_box,
-                    text=pt_lbl,
-                    bg="#E0F2FE",
-                    fg="#0369A1",
-                    font=("Malgun Gothic", 8, "bold"),
-                    relief="flat",
-                    padx=6,
-                    command=lambda v=pt_val: (self.var_p_use_coil.set(v != "1"), self.var_p_coil_turns.set(v), self._update_power_preview()),
-                ).pack(side="left", padx=2)
-
-            self.var_p_preview = tk.StringVar(value="")
-            tk.Label(
-                pad,
-                textvariable=self.var_p_preview,
-                bg="#EFF6FF",
-                fg="#1D4ED8",
-                font=("Consolas", 10, "bold"),
-                justify="left",
-                padx=12,
-                pady=8,
-            ).grid(row=7, column=0, columnspan=6, sticky="ew", pady=(4, 8))
-
-            frm_pbtns = ttk.Frame(pad)
-            frm_pbtns.grid(row=8, column=0, columnspan=6, sticky="w")
-            tk.Button(
-                frm_pbtns,
-                text="📤 전력 설정값 장비로 전송 (Dual OUT)",
-                bg="#0284C7",
-                fg="#FFFFFF",
-                font=("Malgun Gothic", 10, "bold"),
-                relief="flat",
-                padx=16,
-                pady=7,
-                command=lambda: self._apply_power(auto_oper=False),
-            ).pack(side="left", padx=(0, 10))
-
-            tk.Button(
-                frm_pbtns,
-                text="⚡ 전력 전송 후 즉시 출력 활성화 (OUT + OPER)",
-                bg="#16A34A",
-                fg="#FFFFFF",
-                font=("Malgun Gothic", 10, "bold"),
-                relief="flat",
-                padx=16,
-                pady=7,
-                command=lambda: self._apply_power(auto_oper=True),
-            ).pack(side="left")
-
-            self._update_power_preview()
-
         def _build_console_panel(self):
             frame = tk.Frame(self, bg="#F5F7FA", padx=16, pady=6)
             frame.pack(side="bottom", fill="x")
@@ -5656,89 +5312,6 @@ if HAS_TKINTER:
             self.txt_log.pack(fill="both", expand=True)
             # The detailed command remains available without occupying the safety bar.
             self.after_idle(self._attach_command_summary)
-
-        def _update_voltage_preview(self) -> None:
-            try:
-                val = float(self.var_v_val.get())
-                freq = SIUnits.input_value(self.var_v_freq.get(), "HZ") if self.var_v_mode.get() == "ACV" else 0.0
-                cmd, volts = self._builder().build_voltage_cmd(
-                    mode=self.var_v_mode.get(),
-                    value=val,
-                    unit=self.var_v_unit.get(),
-                    freq_hz=freq,
-                )
-                warn = "  [⚠ 고전압 주의 (>30V)]" if abs(volts) >= HIGH_VOLTAGE_WARN_V else ""
-                self.var_v_preview.set(f"생성될 SCPI 명령: {cmd}   |   실제 출력 전압: {volts:g} V{warn}")
-            except Exception as e:
-                self.var_v_preview.set(f"[입력 오류] {e}")
-
-        def _update_current_preview(self) -> None:
-            try:
-                val = float(self.var_i_val.get())
-                freq = SIUnits.input_value(self.var_i_freq.get(), "HZ") if self.var_i_mode.get() == "ACI" else 0.0
-                turns = float(self.var_i_coil_turns.get())
-                cmd, actual_a, effective_a = self._builder().build_current_cmd(
-                    mode=self.var_i_mode.get(),
-                    input_value=val,
-                    unit=self.var_i_unit.get(),
-                    freq_hz=freq,
-                    use_coil=self.var_i_use_coil.get(),
-                    coil_turns=turns,
-                    current_post=self.var_i_post.get(),
-                )
-                coil_desc = f"{turns:g}턴 코일 적용 (배율 {turns:g}x)" if self.var_i_use_coil.get() else "직결 모드 (1x, 코일 미사용)"
-                self.var_i_preview.set(
-                    f"• [{coil_desc}] 클램프 미터 목표 전류: {effective_a:.6g} A  ➔  장비 실제 출력 전류: {actual_a:.6g} A (선택 모델 범위 확인 완료)\n"
-                    f"• 생성될 SCPI 명령: {cmd}"
-                )
-            except Exception as e:
-                self.var_i_preview.set(f"[설정 범위/입력 오류] {e}")
-
-        def _update_resistance_preview(self) -> None:
-            try:
-                val = float(self.var_r_val.get())
-                cmd, ohms = self._builder().build_resistance_cmd(
-                    value=val,
-                    unit=self.var_r_unit.get(),
-                    zcomp=self.var_r_zcomp.get(),
-                )
-                self.var_r_preview.set(f"생성될 SCPI 명령: {cmd}   |   환산 저항값: {ohms:g} Ω")
-            except Exception as e:
-                self.var_r_preview.set(f"[입력 오류] {e}")
-
-        def _update_power_preview(self) -> None:
-            try:
-                calc_method = self.var_p_calc_method.get()
-                if calc_method == "PW":
-                    if self.var_p_unit.get() == "A":
-                        self.var_p_unit.set("W")
-                    self.lbl_p_second_input.configure(text="목표 유효전력 (W 계열):")
-                else:
-                    self.var_p_unit.set("A")
-                    self.lbl_p_second_input.configure(text="목표 클램프 전류 (A):")
-
-                res = self._builder().build_power_cmd(
-                    mode=self.var_p_mode.get(),
-                    calc_method=calc_method,
-                    voltage_v=SIUnits.input_value(self.var_p_volt.get(), "V"),
-                    current_or_power_val=float(self.var_p_val.get()),
-                    power_unit=self.var_p_unit.get(),
-                    freq_hz=SIUnits.input_value(self.var_p_freq.get(), "HZ"),
-                    phase_mode=self.var_p_phase_mode.get(),
-                    dpf_val=float(self.var_p_dpf.get()),
-                    dpf_lead_lag=self.var_p_lead_lag.get(),
-                    phase_deg=float(self.var_p_phase_deg.get()),
-                    use_coil=self.var_p_use_coil.get(),
-                    coil_turns=float(self.var_p_coil_turns.get()),
-                )
-                turns_txt = f"{float(self.var_p_coil_turns.get()):g}x 턴코일" if self.var_p_use_coil.get() else "1x 직결"
-                self.var_p_preview.set(
-                    f"• [전력 산출 결과 ({turns_txt})] 유효전력(P): {res['active_power_w']:.6g} W | 피상전력(S): {res['apparent_power_va']:.6g} VA | 역률(PF): {res['pf']:.4f} (위상 {res['phase_deg']:+.2f}°)\n"
-                    f"• [전류 배분] 클램프 인가 유효 전류: {res['effective_current_a']:.6g} A  ➔  장비 실제 출력 전류: {res['actual_current_a']:.6g} A (전압: {res['voltage_v']:g} V)\n"
-                    f"• 생성될 SCPI 명령: {res['cmd']}"
-                )
-            except Exception as e:
-                self.var_p_preview.set(f"[전력/턴코일 설정 오류] {e}")
 
         def _on_connect_clicked(self):
             try:
@@ -5805,7 +5378,7 @@ if HAS_TKINTER:
                 return False
             return True
 
-        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True, *, verify_setpoint=False):
+        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True, *, verify_setpoint=False, dual_current=False):
             standby = cmd == "STBY" and not auto_oper
             if (self._seq_close_standby or self._dut_closing) and not standby:
                 return False
@@ -5822,12 +5395,21 @@ if HAS_TKINTER:
             self.is_operating = None
             self._refresh_oper_badge()
             def operation():
-                if verify_setpoint:
+                if dual_current and self.conn_mgr.query("OPER?").strip() != "0":
+                    self.conn_mgr.send_command("STBY")
+                    if self.conn_mgr.query("OPER?").strip() != "0":
+                        raise InstrumentProtocolError("5560A STBY를 확인하지 못했습니다. 본체 출력 상태를 확인하세요.")
+                if verify_setpoint or dual_current:
                     self.conn_mgr.send_command(cmd, check_before=True)
+                    if dual_current and not self.conn_mgr.info.interface_type.startswith("SIMULATION"):
+                        self.conn_mgr.profile.verify_dual_current_readback(cmd, self.conn_mgr.query("OUT?"))
                     if auto_oper:
                         self.conn_mgr.send_command("OPER")
                 else:
-                    self.conn_mgr.send_command(full_cmd)
+                    command = cmd.strip().upper()
+                    check_before = self.conn_mgr.profile.model == "5560A" and (
+                        auto_oper or command.startswith("OUT ") or command == "OPER")
+                    self.conn_mgr.send_command(full_cmd, check_before=check_before)
                 state = self.conn_mgr.query("OPER?").strip()
                 if state not in ("0", "1"):
                     error = InstrumentProtocolError(f"출력 상태 확인 실패: {state}")
@@ -5836,6 +5418,9 @@ if HAS_TKINTER:
                     raise error
                 if standby and state != "0":
                     raise InstrumentProtocolError("STBY 요청 후에도 OPER 상태입니다. 본체에서 출력을 끄세요.")
+                if self.conn_mgr.profile.model == "5560A" and (auto_oper or cmd.strip().upper() == "OPER") and state == "0":
+                    error = self.conn_mgr.query("ERR?")
+                    raise InstrumentCommandError(f"5560A 출력 중단 · {error}. STBY 확인 완료, 연결 유지.")
                 return state == "1"
             def done(state):
                 self.is_operating = state
@@ -5848,76 +5433,6 @@ if HAS_TKINTER:
             return self._start_io(f"TX >> {full_cmd} | 완료 대기 최대 {self.conn_mgr.operation_timeout:g}초",
                                   operation, done, on_error=on_error, stop_sequence=stop_sequence,
                                   standby=standby)
-
-        def _apply_voltage(self, auto_oper: bool) -> None:
-            try:
-                val = float(self.var_v_val.get())
-                freq = SIUnits.input_value(self.var_v_freq.get(), "HZ") if self.var_v_mode.get() == "ACV" else 0.0
-                cmd, _ = self._builder().build_voltage_cmd(
-                    mode=self.var_v_mode.get(),
-                    value=val,
-                    unit=self.var_v_unit.get(),
-                    freq_hz=freq,
-                )
-                self._send_and_log(cmd, auto_oper=auto_oper)
-            except Exception as e:
-                messagebox.showerror("전압 설정 오류", str(e))
-
-        def _apply_current(self, auto_oper: bool) -> None:
-            try:
-                val = float(self.var_i_val.get())
-                freq = SIUnits.input_value(self.var_i_freq.get(), "HZ") if self.var_i_mode.get() == "ACI" else 0.0
-                turns = float(self.var_i_coil_turns.get())
-                cmd, actual_a, effective_a = self._builder().build_current_cmd(
-                    mode=self.var_i_mode.get(),
-                    input_value=val,
-                    unit=self.var_i_unit.get(),
-                    freq_hz=freq,
-                    use_coil=self.var_i_use_coil.get(),
-                    coil_turns=turns,
-                    current_post=self.var_i_post.get(),
-                )
-                self._send_and_log(cmd, auto_oper=auto_oper)
-                if self.var_i_use_coil.get():
-                    self._log(f"   └─ [턴코일 {turns:g}x 환산] 클램프 목표 전류: {effective_a:g} A ➔ 장비 실제 출력: {actual_a:g} A")
-            except Exception as e:
-                messagebox.showerror("전류/턴코일 설정 오류", str(e))
-
-        def _apply_resistance(self, auto_oper: bool) -> None:
-            try:
-                val = float(self.var_r_val.get())
-                cmd, _ = self._builder().build_resistance_cmd(
-                    value=val,
-                    unit=self.var_r_unit.get(),
-                    zcomp=self.var_r_zcomp.get(),
-                )
-                self._send_and_log(cmd, auto_oper=auto_oper)
-            except Exception as e:
-                messagebox.showerror("저항 설정 오류", str(e))
-
-        def _apply_power(self, auto_oper: bool) -> None:
-            try:
-                res = self._builder().build_power_cmd(
-                    mode=self.var_p_mode.get(),
-                    calc_method=self.var_p_calc_method.get(),
-                    voltage_v=SIUnits.input_value(self.var_p_volt.get(), "V"),
-                    current_or_power_val=float(self.var_p_val.get()),
-                    power_unit=self.var_p_unit.get(),
-                    freq_hz=SIUnits.input_value(self.var_p_freq.get(), "HZ"),
-                    phase_mode=self.var_p_phase_mode.get(),
-                    dpf_val=float(self.var_p_dpf.get()),
-                    dpf_lead_lag=self.var_p_lead_lag.get(),
-                    phase_deg=float(self.var_p_phase_deg.get()),
-                    use_coil=self.var_p_use_coil.get(),
-                    coil_turns=float(self.var_p_coil_turns.get()),
-                )
-                self._send_and_log(str(res["cmd"]), auto_oper=auto_oper)
-                self._log(
-                    f"   └─ [전력 출력 요약] 유효전력={res['active_power_w']:.6g} W, 전압={res['voltage_v']:g} V, "
-                    f"클램프 유효전류={res['effective_current_a']:.6g} A (장비 실제 출력={res['actual_current_a']:.6g} A)"
-                )
-            except Exception as e:
-                messagebox.showerror("전력 설정 오류", str(e))
 
         def _on_oper_clicked(self):
             try:
@@ -5983,13 +5498,20 @@ if HAS_TKINTER:
             self.var_manual_cmd.set("ERR?")
             self._on_manual_send(is_query=True)
 
-        def _build_current_group_panel(self, container):
+        def _build_current_group_panel(self, container, toolbar):
             self._group_high_only = False
-            self._group_basis = SequenceCurrentFilter.JOB
+            self._group_basis = SequenceCurrentFilter.POSTS
+            self._group_output = SequenceCurrentFilter.ALL_OUTPUTS
+            self._dual_current = False
+            self._dual_dc_voltage, self._dual_ac_voltage = DUAL_CURRENT_DC_DEFAULT, DUAL_CURRENT_AC_MIN
             self._seq_active_indices = []
             self._original_row_positions = None
             self.var_high_current_only = tk.BooleanVar(value=False)
             self.var_current_group_basis = tk.StringVar(value=self._group_basis)
+            self.var_output_group = tk.StringVar(value=self._group_output)
+            self.var_dual_current = tk.BooleanVar(value=self._dual_current)
+            self.var_dual_dc_voltage = tk.StringVar(value=f"{self._dual_dc_voltage:g} V")
+            self.var_dual_ac_voltage = tk.StringVar(value=f"{self._dual_ac_voltage:g} V")
             self.var_current_group_summary = tk.StringVar()
             self.group_panel = tk.Frame(container, bg="white")
             self.group_panel.pack(fill="x", pady=(0, 4))
@@ -6009,12 +5531,103 @@ if HAS_TKINTER:
             combo = self._ui_combo(row, self.var_current_group_basis, (SequenceCurrentFilter.JOB, SequenceCurrentFilter.POSTS), 28)
             combo.bind("<<ComboboxSelected>>", lambda _e: self._on_current_group_changed())
             self._ui_label(row, "전류·전력 공통 / 코일 환산 후 실제 A 기준")
+            row = tk.Frame(self.sequence_details, bg="white")
+            row.pack(fill="x")
+            self._ui_label(row, "5560A 출력 그룹")
+            self.combo_output_group = self._ui_combo(row, self.var_output_group, SequenceCurrentFilter.OUTPUT_GROUPS, 13)
+            self.combo_output_group.bind("<<ComboboxSelected>>", lambda _e: self._on_current_group_changed())
+            self._ui_label(row, "듀얼 DC")
+            dc_voltage = self._ui_entry(row, self.var_dual_dc_voltage, 10)
+            self._ui_label(row, "듀얼 AC")
+            ac_voltage = self._ui_entry(row, self.var_dual_ac_voltage, 10)
+            for entry in (dc_voltage, ac_voltage):
+                entry.bind("<Return>", lambda _e: self._on_dual_current_voltages_applied())
+            apply_voltages = self._ui_button(row, "전압 적용", self._on_dual_current_voltages_applied)
+            self.dual_voltage_controls = (dc_voltage, ac_voltage, apply_voltages)
+            self.chk_dual_current = ttk.Checkbutton(toolbar, text="전류 듀얼 출력",
+                variable=self.var_dual_current, command=self._on_current_group_changed)
+            self.chk_dual_current.pack(side="left", padx=6)
 
         def _step_in_current_group(self, step):
-            return SequenceCurrentFilter.includes(step, self._group_high_only, self._group_basis, self._selected_model())
+            if step.func_type in ("BLANK", "OUT_OF_RANGE"):
+                return False
+            model = self._selected_model()
+            groups = SequenceCurrentFilter
+            if not groups.includes(step, self._group_high_only, self._group_basis, model):
+                return False
+            if model != "5560A" or self._group_output == groups.ALL_OUTPUTS:
+                return True
+            dual = (step.func_type in groups.DUAL_FUNCTIONS or
+                    (step.func_type in groups.CURRENT_ONLY and self._current_dual_command(step.scpi_cmd) is not None))
+            return dual == (self._group_output == groups.DUAL_OUTPUT)
 
         def _current_group_label(self):
-            return SequenceCurrentFilter.label(self._group_high_only, self._group_basis, self._selected_model())
+            model = self._selected_model()
+            current_group = SequenceCurrentFilter.label(self._group_high_only, self._group_basis, model)
+            return f"{self._group_output} · {current_group}" if model == "5560A" else current_group
+
+        def _current_dual_command(self, command):
+            if not self._dual_current or self._selected_model() != "5560A":
+                return None
+            return MODEL_PROFILES["5560A"].dual_current_command(
+                command, dc_voltage=self._dual_dc_voltage, ac_voltage=self._dual_ac_voltage)
+
+        def _read_dual_current_voltages(self):
+            return (SIUnits.input_value(self.var_dual_dc_voltage.get(), "V"),
+                    SIUnits.input_value(self.var_dual_ac_voltage.get(), "V"))
+
+        def _on_dual_current_voltages_applied(self):
+            if self._selected_model() != "5560A":
+                return
+            if self._io_busy or self.seq_running or self._seq_dut_pending is not None:
+                self.var_active_row_banner.set("측정을 멈추고 현재 응답이 끝난 뒤 듀얼 전압을 적용하세요.")
+                return
+            try:
+                voltages = self._read_dual_current_voltages()
+                MODEL_PROFILES["5560A"].validate_dual_current_voltages(*voltages)
+            except ValueError as exc:
+                self.var_active_row_banner.set(f"듀얼 전압 설정 확인 · {exc}")
+                return
+
+            def applied(_state=False):
+                self._dual_dc_voltage, self._dual_ac_voltage = voltages
+                dc = f"{self._dual_dc_voltage} V"
+                ac = f"{self._dual_ac_voltage} V"
+                self.var_dual_dc_voltage.set(dc)
+                self.var_dual_ac_voltage.set(ac)
+                self._refresh_current_group_preview()
+                self.var_active_row_banner.set(f"듀얼 전압 적용 · DC {dc} / AC {ac}")
+                self._log(f"[듀얼 전압 적용] DC {dc} / AC {ac}")
+
+            if self.conn_mgr.info.connected and self.is_operating is not False:
+                self._send_and_log("STBY", on_done=applied)
+            else:
+                applied()
+
+        def _sequence_output_command(self, step):
+            if step.func_type in SequenceCurrentFilter.CURRENT_ONLY and self._dual_current and self._selected_model() == "5560A":
+                dual = self._current_dual_command(step.scpi_cmd)
+                if dual:
+                    if not self.seq_running and self._read_dual_current_voltages() != (self._dual_dc_voltage, self._dual_ac_voltage):
+                        raise ValueError("변경한 듀얼 전압은 ‘전압 적용’을 눌러 확인하세요.")
+                    return dual, True
+                if self._group_output != SequenceCurrentFilter.SINGLE_OUTPUT:
+                    raise ValueError(f"#{step.step_no}행 AC 듀얼 전류는 45~65 Hz, 실제 전류 1.2001 mA~20.5 A에서 지원합니다. "
+                                     "싱글 출력 그룹에서 실행하세요.")
+            return step.scpi_cmd, False
+
+        def _sequence_output_preview(self, step):
+            if step.func_type in SequenceCurrentFilter.CURRENT_ONLY and self._dual_current and self._selected_model() == "5560A":
+                try:
+                    command = self._current_dual_command(step.scpi_cmd)
+                except ValueError:
+                    return step.actual_out_desc, step.scpi_cmd
+                if command:
+                    voltage, mode = ((self._dual_ac_voltage, "AC") if step.func_type == "ACI"
+                                     else (self._dual_dc_voltage, "DC"))
+                    return f"{step.actual_out_desc} · 듀얼 {voltage:.12g} V {mode}", command
+                return f"{step.actual_out_desc} · 싱글 결선", step.scpi_cmd
+            return step.actual_out_desc, step.scpi_cmd
 
         def _reorder_current_group_rows(self, restore=False):
             if self._io_busy or self.seq_running or self._seq_dut_pending is not None:
@@ -6088,25 +5701,35 @@ if HAS_TKINTER:
                     return
                 if included:
                     count += 1
-                    if step.status == "⏭ 다른 전류 그룹":
+                    if step.status in ("⏭ 다른 전류 그룹", "⏭ 다른 그룹"):
                         step.status = "대기"
                     step.status = step.status.removesuffix(" · 제외")
+                elif step.func_type == "OUT_OF_RANGE":
+                    step.status = "⚠ 출력 범위 초과"
+                elif step.func_type == "BLANK":
+                    step.status = "명목값 입력"
                 elif step.status.startswith("✓ 완료"):
                     step.status = "✓ 완료 · 제외"
                 else:
-                    step.status = "⏭ 다른 전류 그룹"
+                    step.status = "⏭ 다른 그룹"
                 self.excel_grid._update_single_row_visual(index, step,
                     is_active=included and index == self.seq_current_idx)
             note = MODEL_PROFILES[self._selected_model()].terminal_note
+            if self._dual_current and self._selected_model() == "5560A":
+                note += f" · 듀얼 DC {self._dual_dc_voltage:.12g} V / AC {self._dual_ac_voltage:.12g} V"
             self.var_current_group_summary.set(f"현재: {self._current_group_label()} | 시트 대상 {count}/{len(self.seq_steps)}행 | {note}")
 
         def _on_current_group_changed(self):
             high = self.var_high_current_only.get()
             basis = self.var_current_group_basis.get()
+            output = self.var_output_group.get()
+            dual = self.var_dual_current.get()
             # Display the committed selection until the change is accepted.
             self.var_high_current_only.set(self._group_high_only)
             self.var_current_group_basis.set(self._group_basis)
-            if high == self._group_high_only and basis == self._group_basis:
+            self.var_output_group.set(self._group_output)
+            self.var_dual_current.set(self._dual_current)
+            if (high, basis, output, dual) == (self._group_high_only, self._group_basis, self._group_output, self._dual_current):
                 return
             if self._io_busy or self.seq_running or self._seq_dut_pending is not None:
                 self._log("[그룹 변경 보류] 순차 실행을 일시중단하고 현재 응답이 끝난 뒤 변경하세요.")
@@ -6116,8 +5739,11 @@ if HAS_TKINTER:
                     self._log("[그룹 변경 실패] STBY 확인이 필요합니다.")
                     return
                 self._group_high_only, self._group_basis = high, basis
+                self._group_output, self._dual_current = output, dual
                 self.var_high_current_only.set(high)
                 self.var_current_group_basis.set(basis)
+                self.var_output_group.set(output)
+                self.var_dual_current.set(dual)
                 self.seq_current_idx = self.seq_paused_idx = -1
                 self._seq_active_indices = []
                 self.var_seq_start_row.set("1")
@@ -6146,13 +5772,17 @@ if HAS_TKINTER:
                     step = self.seq_steps[i]
                     if not step.scpi_cmd or step.func_type == "ERROR":
                         raise ValueError(f"#{step.step_no}행 설정을 확인하세요: {step.actual_out_desc}")
-                    MODEL_PROFILES[self._selected_model()].validate_command(step.scpi_cmd)
+                    command, _ = self._sequence_output_command(step)
+                    MODEL_PROFILES[self._selected_model()].validate_command(command)
             except (ValueError, IndexError) as exc:
                 self._show_report("순차 실행 설정 확인", str(exc))
                 return
             self._on_seq_stop_auto(silent=True)
             self._seq_active_indices = plan
             if not plan:
+                if start_idx == stop_idx and self.seq_steps[start_idx].func_type == "OUT_OF_RANGE":
+                    self.var_active_row_banner.set(f"#{start_idx + 1}행 실행 제외 · {self.seq_steps[start_idx].actual_out_desc}")
+                    return
                 self.var_active_row_banner.set(f"지정 범위에 {self._current_group_label()} 대상이 없습니다.")
                 self._log("[실행 대상 없음] 그룹 또는 시작·중단 행 범위를 확인하세요. 출력 명령을 보내지 않았습니다.")
                 return
@@ -6176,9 +5806,6 @@ if HAS_TKINTER:
                 return self.conn_mgr.profile.model
             return self._configured_model
 
-        def _builder(self):
-            return CalibratorCommandBuilder(self._selected_model())
-
         def _sync_model_controls(self):
             profile = MODEL_PROFILES[self._configured_model]
             choices = list(profile.interfaces) + ["AUTO", "SIMULATION"]
@@ -6196,12 +5823,17 @@ if HAS_TKINTER:
             comp_note = ("단독 턴코일 LCOMP 없음" if profile.model == "5560A" else
                          "턴코일 AC: 지원 범위에서 LCOMP 자동 ON")
             self.var_model_note.set(f"{', '.join(profile.interfaces)} | 실제 전류 ≤{profile.max_current:g} A | {comp_note}")
-            if hasattr(self, 'var_resistance_title'):
-                self.var_resistance_title.set("5080A 저항: 18개 고정값 + 0 Ω / 최대 190 MΩ" if profile.model == "5080A"
-                                              else "저항 출력 및 리드 보상 (0 Ω ~ 1100 MΩ)")
-            if hasattr(self, 'combo_current_post'):
-                self.combo_current_post.configure(values=["AUTO"] if profile.model == "5560A" else ["AUTO", "AUX", "A20"])
-                self.var_i_post.set("AUTO")
+            if hasattr(self, 'combo_output_group'):
+                supported = profile.model == "5560A"
+                self.combo_output_group.configure(state="readonly" if supported else "disabled")
+                self.chk_dual_current.state(["!disabled"] if supported else ["disabled"])
+                for control in self.dual_voltage_controls:
+                    control.state(["!disabled"] if supported else ["disabled"])
+                if not supported:
+                    self._group_output = SequenceCurrentFilter.ALL_OUTPUTS
+                    self._dual_current = False
+                    self.var_output_group.set(self._group_output)
+                    self.var_dual_current.set(False)
             if hasattr(self, 'connection_endpoints'):
                 self._sync_connection_view()
 
@@ -6220,9 +5852,6 @@ if HAS_TKINTER:
             self._seq_active_indices = []
             self.progress_var.set(0)
             self._recalculate_all_grid_steps()
-            for method in (self._update_voltage_preview, self._update_current_preview,
-                           self._update_resistance_preview, self._update_power_preview):
-                method()
             self._refresh_current_group_preview()
             self._log(f"[모델 변경] {requested} — {MODEL_PROFILES[requested].terminal_note}")
 
@@ -6292,6 +5921,14 @@ if HAS_TKINTER:
             self.btn_connect.configure(state="disabled" if locked else "normal")
             self.btn_disconnect.configure(state="normal" if connected and not self._io_busy else "disabled")
 
+        def _paste_into_empty_sheet(self, event):
+            if self.seq_steps or self.notebook.select() != str(self.tab_sequence):
+                return
+            if isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text)):
+                return
+            self._on_paste_into_sheet_button(replace_all=True)
+            return "break"
+
         def _toggle_sequence_details(self):
             self._sequence_details_open = not self._sequence_details_open
             if self._sequence_details_open:
@@ -6312,29 +5949,6 @@ if HAS_TKINTER:
                 self.console_details.pack_forget()
             self.btn_console.configure(text="통신 기록·수동 명령 ▴" if self._console_open else "통신 기록·수동 명령 ▾")
 
-        def _polish_manual_tabs(self):
-            def walk(widget, tab):
-                for child in widget.winfo_children():
-                    if isinstance(child, tk.Button):
-                        text = str(child.cget("text"))
-                        if "전송 후" in text:
-                            child.configure(text="설정 후 출력", bg="#2563EB", fg="white")
-                        elif "전송" in text:
-                            child.configure(text="설정만 전송", bg="#F1F5F9", fg="#334155")
-                        else:
-                            child.configure(bg="#F1F5F9", fg="#334155")
-                        child.configure(font=("Malgun Gothic", 9), padx=10, pady=5, relief="flat")
-                    elif isinstance(child, (tk.Label, tk.LabelFrame, tk.Checkbutton)):
-                        value = str(child.cget("text"))
-                        value = re.sub(r"[⚡📤🧲🔋💡⚠📊]+\s*", "", value)
-                        child.configure(text=value)
-                        if isinstance(child, tk.Label) and child.cget("textvariable"):
-                            child.configure(font=("Malgun Gothic", 9), fg="#475569", justify="left", wraplength=1000)
-                            tab.bind("<Configure>", lambda e, label=child: label.configure(wraplength=max(400, e.width - 64)), add="+")
-                    walk(child, tab)
-            for tab in (self.tab_voltage, self.tab_current, self.tab_resistance, self.tab_power):
-                walk(tab, tab)
-
         def _log(self, msg: str) -> None:
             self.conn_mgr.record_event(msg)
             ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -6345,7 +5959,7 @@ if HAS_TKINTER:
 def run_cli_interactive(model="5560A") -> None:
     mgr = Fluke5560AConnectionManager()
     print("=" * 88)
-    print(" Fluke 5560A Multi-Product Calibrator Controller v6.10.4 (CLI Mode)")
+    print(" Fluke 5560A Multi-Product Calibrator Controller v6.10.10 (CLI Mode)")
     print("=" * 88)
     print(f"현재 PC 로컬 IPv4: {mgr.get_local_pc_ipv4_list()}")
     print(f"감지된 이더넷 어댑터: {AutoNetworkAligner.list_ethernet_interfaces()}")

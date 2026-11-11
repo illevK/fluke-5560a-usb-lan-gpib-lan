@@ -217,7 +217,7 @@ class TelnetLineTransport:
         text = cls.PROMPT.sub("", text).strip()
         return "" if text.upper() == command.upper() else text
 
-    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None):
+    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None, *, expected_reply=None):
         limit = self.timeout if timeout is None else timeout
         # One query, one reply. Never retransmit OPC while a reply is pending.
         self.write(command)
@@ -239,6 +239,8 @@ class TelnetLineTransport:
                 self.last_received = text
                 # Initial banners/prompts are not identification responses.
                 if identity and len(text.split(",")) < 4:
+                    continue
+                if expected_reply is not None and text != expected_reply:
                     continue
                 return text
             remaining = deadline - time.monotonic()
@@ -270,6 +272,7 @@ class Fluke5560AConnectionManager:
         self._visa_rm = None
         self._visa_inst = None
         self._lan_sock = None
+        self._first_lan_command_check = False
         self._transport = None
         self._serial_port = None
         self.expected_model = "5560A"
@@ -462,6 +465,7 @@ class Fluke5560AConnectionManager:
             stage = "Computer 통신 모드 확인"
             self._prepare_remote_stream(transport, "LAN")
             self._lan_sock, self._transport = sock, transport
+            self._first_lan_command_check = self.profile.model == "5560A"
             self.info = ConnectionInfo(True, "LAN (Ethernet Socket)", f"TCPIP::{ip}::{port}::SOCKET", idn, ip, port)
             self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = ""
@@ -634,6 +638,7 @@ class Fluke5560AConnectionManager:
                 except Exception:
                     pass
         self._visa_inst = self._visa_rm = self._lan_sock = self._transport = None
+        self._first_lan_command_check = False
         self._serial_port = None
         self.info = ConnectionInfo()
 
@@ -671,17 +676,44 @@ class Fluke5560AConnectionManager:
         else:
             raise ConnectionError("유효한 통신 핸들이 없습니다.")
 
-    def _fail_control_session(self, context, exc):
-        # Keep the handle until STBY has been attempted. Never read after an
-        # uncertain reply: a late OPC '1' could be mistaken for a new query.
+    def _confirm_standby_after_interrupted_wait(self):
+        # An earlier OPC/ERR reply can still be in flight. Only trust new
+        # status queries after seeing this session's exact identification.
+        deadline = time.monotonic() + 3.0
+        self.record_event("TX QUERY >> *IDN? | STBY 복구")
+        self._transport.query("*IDN?", timeout=3.0, expected_reply=self.info.idn_string)
+        self.record_event(f"RX << {self.info.idn_string} | STBY 복구")
+        if self._query("OPER?", timeout=max(.001, deadline - time.monotonic()), cancellable=False) != "0":
+            raise InstrumentProtocolError("본체의 STBY 상태를 확인하지 못했습니다.")
+        error = self._query("ERR?", timeout=max(.001, deadline - time.monotonic()), cancellable=False)
+        if not re.match(r"^[+-]?\d+\s*,", error):
+            raise InstrumentProtocolError(f"장비 오류 응답 형식이 올바르지 않습니다: {error[:120]}")
+        return error
+
+    def _can_recover_standby(self, exc):
+        return (self.profile.model == "5560A" and self._lan_sock is not None
+                and isinstance(exc, (OperationCancelled, TimeoutError)))
+
+    def _fail_control_session(self, context, exc, *, recover_standby=False):
         message = f"{context}: {type(exc).__name__}: {exc}"
         try:
             self._write("STBY")
-            message += "\nSTBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요."
         except Exception as standby_error:
             message += f"\nSTBY 전송 실패: {standby_error}. 본체의 STBY 상태를 확인하세요."
-        finally:
-            self._drop_connection()
+        else:
+            if recover_standby:
+                try:
+                    error = self._confirm_standby_after_interrupted_wait()
+                except Exception as recovery_error:
+                    message += f"\nSTBY 확인 실패: {recovery_error}"
+                else:
+                    self.cancel_event.clear()
+                    message = f"{message}\n5560A 응답 {error}. STBY 확인 완료, LAN 연결 유지. 다음 행은 실행하지 않습니다."
+                    self.last_error = message
+                    self.record_event(message, notify=True)
+                    raise InstrumentCommandError(message) from exc
+            message += "\nSTBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요."
+        self._drop_connection()
         self.last_error = message
         self.record_event(message, notify=True)
 
@@ -699,17 +731,27 @@ class Fluke5560AConnectionManager:
             try:
                 return self._query(command, timeout=self.operation_timeout if command.upper() == "*OPC?" else None)
             except Exception as exc:
-                self._fail_control_session(f"조회 {command}", exc)
+                recover_standby = command.upper() in ("OPER?", "*OPC?") and self._can_recover_standby(exc)
+                self._fail_control_session(f"조회 {command}", exc, recover_standby=recover_standby)
                 raise
 
     def _stop_after_command_error(self, error, phase):
         # A valid error reply means the stream is still synchronized.
-        self._write("STBY")
-        if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
-            raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
+        protection = (self.profile.model == "5560A" and self._lan_sock is not None
+                      and re.match(r"^\+?(4008|4100|4102|4202)\s*,", error))
+        if not protection or self._query("OPER?") != "0":
+            self._write("STBY")
+            if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
+                raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
         raise InstrumentCommandError(
             f"{self.profile.model} 오류 ({phase}): {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
         )
+
+    def _check_initial_lan_error(self, error):
+        if re.match(r"^-410\s*,", error) and self._query("OPER?") == "0":
+            self.record_event(f"[LAN 최초 확인] STBY에서 이전 조회 중단 응답 확인: {error}")
+            return self._query("ERR?")
+        return error
 
     def send_command(self, cmd, *, check_before=False):
         command = self._validate_command(cmd)
@@ -734,14 +776,23 @@ class Fluke5560AConnectionManager:
             try:
                 if self.cancel_event.is_set():
                     raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
+                first_output = self._first_lan_command_check and any(
+                    re.match(r"^(?:OUT\s|OPER$)", part.strip(), re.I) for part in command.split(";"))
+                if first_output:
+                    self._first_lan_command_check = False
                 if check_before:
                     pending = self._query("ERR?")
+                    if first_output:
+                        pending = self._check_initial_lan_error(pending)
                     if not re.match(r"^\+?0\s*(?:,|$)", pending):
                         self._stop_after_command_error(pending, "출력 전 대기 중이던 오류")
                 self._write(command)
                 if self._query("*OPC?", timeout=self.operation_timeout) != "1":
                     raise InstrumentProtocolError("명령 처리 완료를 확인하지 못했습니다.")
                 error = self._query("ERR?")
+                if self._first_lan_command_check and command.upper() == "STBY":
+                    self._first_lan_command_check = False
+                    error = self._check_initial_lan_error(error)
                 if not re.match(r"^\+?0\s*(?:,|$)", error):
                     self._stop_after_command_error(error, command)
                 self.record_event(f"[명령 완료] {command} | {time.monotonic() - started:.3f}s", notify=True)
@@ -751,7 +802,7 @@ class Fluke5560AConnectionManager:
                 raise
             except Exception as exc:
                 context = f"명령 [{command}] / {time.monotonic() - started:.3f}초 경과 / 완료 대기 한도 {self.operation_timeout:g}초"
-                self._fail_control_session(context, exc)
+                self._fail_control_session(context, exc, recover_standby=self._can_recover_standby(exc))
                 raise
 
     def _record_shutdown_error(self, phase):
