@@ -1,6 +1,16 @@
         def _on_connect_clicked(self):
             try:
+                if self._dut_busy:
+                    self.var_idn_display.set("DUT 연결 확인이 끝난 뒤 기준기를 연결하세요.")
+                    return
                 args = self._connection_arguments()
+                dut = self.dut_session.settings
+                if dut is not None:
+                    target = dut.address.upper()
+                    args.update(excluded_com=target if dut.mode == "SERIAL" else "",
+                                excluded_gpib=_dut_gpib_key(target),
+                                excluded_ip=_dut_discovery_ipv4(target) or _dut_discovery_resource_ip(target) or "",
+                                excluded_usb=_dut_discovery_usb_key(target))
                 def connect():
                     info = self.conn_mgr.scan_and_auto_connect(**args)
                     state = self.conn_mgr.query("OPER?").strip()
@@ -10,10 +20,29 @@
                     return info, state == "1"
                 def done(result):
                     info, self.is_operating = result
+                    model = self.conn_mgr.profile.model
+                    if model != self._configured_model:
+                        self.var_model.set(model)
+                        self._apply_calibrator_model(model)
+                    if info.discovered_ip:
+                        self.var_lan_ip.set(info.discovered_ip)
+                        self.var_lan_port.set(str(info.discovered_port))
                     self._update_connection_ui(info)
                     self._refresh_oper_badge()
-                    self._log(f"[연결 성공] {info.interface_type} | {info.idn_string} | PC 원본 IP: {self.conn_mgr.source_ip}")
-                self._start_io("장비 연결 및 식별 확인 중…", connect, done)
+                    if info.interface_type.startswith("RS232"):
+                        self.var_serial_port.set(info.resource_name.split(" / ", 1)[0])
+                    route = f" | PC 원본 IP: {self.conn_mgr.source_ip}" if info.discovered_ip else ""
+                    self._log(f"[연결 성공] {info.interface_type} | {info.resource_name} | {info.idn_string}{route}")
+                def failed(exc):
+                    if args["preferred_mode"] != "AUTO" or self.conn_mgr.info.connected:
+                        self._show_report("통신 안내", self._last_report)
+                        return
+                    if isinstance(exc, OperationCancelled):
+                        return
+                    self.var_idn_display.set("기준기를 찾지 못했습니다. LAN 연결이면 상세 설정 → LAN IP에 본체 주소를 입력하고 다시 연결하세요.")
+                    if not self._connection_details_open:
+                        self._toggle_connection_details()
+                self._start_io("장비 연결 및 식별 확인 중…", connect, done, on_error=failed)
             except Exception as exc:
                 messagebox.showerror("입력 확인", str(exc))
 

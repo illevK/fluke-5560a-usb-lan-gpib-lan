@@ -31,7 +31,7 @@ No automatic PC IP/DHCP changes; no open-port identification fallback.
 Reference: Fluke 5560A Remote Programmers Manual, Rev. 3 (3/25),
 https://media.fluke.com/b2b30a71-26d0-4067-be01-b308017892a8_original%20file.pdf
 """''' + source[end:]
-source = source.replace('import tempfile\n', 'import ipaddress\nimport json\nimport threading\nimport queue\nimport argparse\n')
+source = source.replace('import tempfile\n', 'import tempfile\nimport ipaddress\nimport json\nimport threading\nimport queue\nimport argparse\nfrom pathlib import Path\n')
 source = source.replace('from concurrent.futures import ThreadPoolExecutor, as_completed\n', '')
 source = source.replace('from tkinter import ttk, messagebox', 'from tkinter import ttk, messagebox, filedialog')
 source = source.replace('CANDIDATE_LAN_PORTS = (3490, 5025, 23)\n', '')
@@ -48,7 +48,7 @@ source = source.replace('                    self._on_sim_connect_clicked()\n   
 source = source.replace('        def _refresh_oper_badge(self) -> None:\n            if self.is_operating:', '        def _refresh_oper_badge(self) -> None:\n            if self.is_operating is None:\n                self.lbl_output_state.configure(text="출력 상태 미확인 — 장비 화면 확인", bg="#FEF3C7", fg="#92400E")\n                return\n            if self.is_operating:')
 source = source.replace('                if is_query or cmd.endswith("?"):', '                if is_query or "?" in cmd:')
 async_methods = ''.join((root / f'work/{name}.pyfrag').read_text(encoding='utf-8')
-                        for name in ('async_operations', 'current_group_ui', 'multimodel_ui', 'clean_ui'))
+                        for name in ('async_operations', 'current_group_ui', 'multimodel_ui', 'clean_ui', 'sequence_channels_ui'))
 for block in re.split(r'(?=^        def )', async_methods, flags=re.M):
     if not block.strip():
         continue
@@ -74,7 +74,7 @@ cell_header = '        def _handle_excel_cell_edited(self, r_idx: int, vi_c: str
 source = source.replace(cell_header + '            if self._io_busy or self.seq_running:\n',
                         cell_header + '            if self._io_busy or self.seq_running:\n                if 0 <= r_idx < len(self.seq_steps):\n                    self.excel_grid._update_single_row_visual(r_idx, self.seq_steps[r_idx], is_active=(r_idx == self.seq_current_idx))\n')
 source = source.replace('            local_ips = self.conn_mgr.get_local_pc_ipv4_list()',
-                        '            self._log(f"통신 기록 자동 저장: {self.conn_mgr.log_path}")\n            self._log(f"실행 Python: {sys.executable} | PyVISA={HAS_PYVISA} | pyserial={HAS_PYSERIAL}")\n            local_ips = self.conn_mgr.get_local_pc_ipv4_list()')
+                        '            self._log(f"통신 기록 자동 저장: {self.conn_mgr.log_path}")\n            if self.conn_mgr.log_folder_warning:\n                self._log(self.conn_mgr.log_folder_warning)\n            self._log(f"실행 Python: {sys.executable} | PyVISA={HAS_PYVISA} | pyserial={HAS_PYSERIAL}")\n            local_ips = self.conn_mgr.get_local_pc_ipv4_list()')
 source = re.sub(r'^( +)self\.excel_grid\.render_steps\(self.seq_steps, [^\n]+\n',
                 lambda m: m[0] + m[1] + 'self._refresh_current_group_preview()\n', source, flags=re.M)
 source = source.replace('                self.excel_grid._update_single_row_visual(r_idx, updated, is_active=(r_idx == self.seq_current_idx))',
@@ -209,7 +209,7 @@ source = source.replace('v6.0.0', 'v6.1.0')
 source = source.replace('v6.1.0', 'v6.1.1')
 from enhance_units_grid import enhance_source
 source = enhance_source(source, root)
-source = source.replace('v6.2.0', 'v6.10.10')
+source = source.replace('v6.2.0', 'v6.10.26')
 source = source.replace('''        def _handle_row_direct_start(self, r_idx: int) -> None:
             self.excel_grid.selected_row_idx = r_idx''', '''        def _handle_row_direct_start(self, r_idx: int) -> None:
             step = self.seq_steps[r_idx]
@@ -229,6 +229,17 @@ source = source.replace('        def _build_ui(self):', (root / 'work/dut_ui.pyf
 source = source.replace('            self._on_seq_stop_auto(silent=True)\n            try:\n                self.conn_mgr.disconnect()', '            self._on_seq_stop_auto(silent=True)\n            if not self._dut_close_ready():\n                self.after(200, self._on_close)\n                return\n            try:\n                self.conn_mgr.disconnect()', 1)
 from enhance_dut_sequence import enhance_dut_sequence
 source = enhance_dut_sequence(source, root)
+source = source.replace('class SIUnits:', (root / 'work/sequence_channels.pyfrag').read_text(encoding='utf-8').rstrip()
+                        + '\n\n\nclass SIUnits:', 1)
+source = re.sub(r'^( +)(self\.seq_steps\[r_idx\] = (updated|invalid))$', r'\1\3.dut_channel = st.dut_channel\n\1\2', source, flags=re.M)
+for statement in ('                rebuilt_steps.append(rebuilt)',
+                  '                    self.seq_steps[target_idx].measured_raw'):
+    line = '                rebuilt.dut_channel = st.dut_channel\n' if statement.lstrip().startswith('rebuilt_steps') else '                    self.seq_steps[target_idx].dut_channel = st.dut_channel\n'
+    source = source.replace(statement, line + statement, 1)
+source = source.replace('                self.seq_steps[start_row_idx:start_row_idx + len(new_steps)] = new_steps',
+    '                for new_step, old_step in zip(new_steps, self.seq_steps[start_row_idx:start_row_idx + len(new_steps)]):\n'
+    '                    new_step.dut_channel = old_step.dut_channel\n'
+    '                self.seq_steps[start_row_idx:start_row_idx + len(new_steps)] = new_steps', 1)
 compile(source, 'fluke_5560a_controller.py', 'exec')
 (root / 'outputs/fluke_5560a_controller.py').write_text(source, encoding='utf-8')
 print('Built outputs/fluke_5560a_controller.py')

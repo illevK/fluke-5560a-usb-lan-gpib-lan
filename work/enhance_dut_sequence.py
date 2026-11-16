@@ -65,6 +65,10 @@ def enhance_dut_sequence(source, root):
         '                    raise ValueError("유지시간은 0.2초 이상의 유한한 숫자여야 합니다.")\n',
         '                if not .2 <= dwell <= 86_400:\n'
         '                    raise ValueError("유지시간은 0.2~86400초 사이여야 합니다.")\n')
+    patch_method("_start_filtered_sequence", "                    command, _ = self._sequence_output_command(step)\n",
+        "                    if self._sequence_dut_enabled() and step.func_type in self._DUT_SEQUENCE_QUANTITIES:\n"
+        "                        self._dut_channel_for_step(step)\n"
+        "                    command, _ = self._sequence_output_command(step)\n")
     patch_method("_start_filtered_sequence", "            self.seq_running = True\n",
         "            self._seq_dut_run = self._sequence_dut_enabled() and any(\n"
         "                self.seq_steps[i].func_type in self._DUT_SEQUENCE_QUANTITIES for i in plan)\n"
@@ -76,35 +80,9 @@ def enhance_dut_sequence(source, root):
         "                    and not self._sequence_dut_enabled()):\n"
         "                self._log('DUT를 다시 연결한 뒤 중단된 행부터 재개하세요.')\n"
         "                return\n")
-    patch_method("_run_next_auto_step", "            def completed():\n",
-        "            linked = self._seq_dut_run and self.seq_steps[idx].func_type in self._DUT_SEQUENCE_QUANTITIES\n"
-        "            def completed():\n")
-    patch_method("_run_next_auto_step", "                self._send_and_log(\"STBY\", on_done=finished)\n",
-        "                self._on_seq_stop_auto(silent=True)\n"
-        "                self._send_and_log(\"STBY\", on_done=finished)\n")
-    patch_method("_run_next_auto_step",
-        "                    self.excel_grid._update_single_row_visual(idx, self.seq_steps[idx], is_active=False)\n"
-        "                    return\n"
-        "                self.seq_after_id = self.after(dwell_ms, lambda: self._run_next_auto_step(idx + 1, stop_idx, dwell_ms))\n"
-        "            if not self._execute_sequence_step(idx, on_complete=completed):\n"
-        "                self.seq_running = False\n",
-        "                    self.excel_grid._update_single_row_visual(idx, self.seq_steps[idx], is_active=False)\n"
-        "                    if self._seq_dut_run:\n"
-        "                        self._seq_dut_resume_required = True\n"
-        "                        self._on_stby_clicked()\n"
-        "                    return\n"
-        "                self.seq_after_id = self.after(0 if linked else dwell_ms,\n"
-        "                    lambda: self._run_next_auto_step(idx + 1, stop_idx, dwell_ms))\n"
-        "            if not self._execute_sequence_step(idx, on_complete=completed, dwell_ms=dwell_ms):\n"
-        "                if self._seq_dut_run and self.conn_mgr.info.connected:\n"
-        "                    self._on_stby_clicked()\n"
-        "                else:\n"
-        "                    self._on_seq_stop_auto(silent=True)\n")
-    patch_method("_run_next_auto_step", "                self._show_report(\"전류 그룹 확인\", str(exc))\n",
-        "                if self._seq_dut_run:\n"
-        "                    self._on_stby_clicked()\n"
-        "                self._show_report(\"전류 그룹 확인\", str(exc))\n")
-
+    patch_method("_on_seq_output_selected", "            self._execute_sequence_step(idx)\n",
+        "            self._seq_active_indices = []\n"
+        "            self._execute_sequence_step(idx)\n")
     add_guard("_on_seq_stop_auto",
         "            had_linked_capture = self._sequence_dut_reserved()\n"
         "            if self._seq_dut_pending is not None or (had_linked_capture and not silent):\n"
@@ -117,9 +95,20 @@ def enhance_dut_sequence(source, root):
         '                self._log(f"[일시중단] #{self.seq_current_idx + 1}번 행에서 순차 실행을 중단했습니다.")\n',
         '                self._log(f"[일시중단] #{self.seq_current_idx + 1}번 행에서 순차 실행을 중단했습니다.")\n'
         '            if had_linked_capture:\n'
-        '                self._dut_sync_controls()\n'
-        '                if not silent and self.conn_mgr.info.connected:\n'
-        '                    self._on_stby_clicked()\n')
+        '                self._dut_sync_controls()\n')
+    patch_method("_on_seq_stop_auto", '                st.status = "⏸ 일시중단됨"\n',
+        '                st.status = self._SEQUENCE_HOLD_STATUS if keep_output else self._SEQUENCE_STOPPED_STATUS\n')
+    patch_method("_on_seq_stop_auto",
+        '                    f"⏸ [일시중단됨: #{st.step_no}번 행] ({st.vi_cond_raw} | {st.freq_cond_raw} | {st.nominal_raw}) — [⏯ 중단된 행부터 이어서 시작] 가능"\n',
+        '                    f"#{st.step_no}행 {st.status} · 재개하면 이 행부터 시작합니다. 출력 상태는 상단에서 확인하세요."\n')
+    patch_method("_on_seq_stop_auto",
+        '                self._log(f"[일시중단] #{self.seq_current_idx + 1}번 행에서 순차 실행을 중단했습니다.")\n',
+        '                action = "출력 유지" if keep_output else "정지"\n'
+        '                self._log(f"[{action}] #{self.seq_current_idx + 1}행에서 순차 실행을 중단했습니다.")\n')
+    source = source.replace(
+        "        def _on_seq_stop_auto(self, silent: bool = False) -> None:",
+        "        def _on_seq_stop_auto(self, silent: bool = False, *, keep_output: bool = False) -> None:",
+        1)
     add_guard("_on_disconnect_clicked",
         "            if self._sequence_dut_reserved():\n"
         "                if self._io_busy:\n"

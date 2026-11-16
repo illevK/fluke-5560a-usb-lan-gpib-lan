@@ -2,6 +2,7 @@
 """DUT discovery tests without a live instrument or network requests."""
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -28,7 +29,7 @@ class DiscoveryTests(unittest.TestCase):
         identity = 'NEWTONS4TH,PPA5511,TEST,1.00'
         ports = [SimpleNamespace(device='COM3', vid=0x0403),
                  SimpleNamespace(device='COM4', vid=0x0403),
-                 SimpleNamespace(device='COM7', vid=None)]
+                 SimpleNamespace(device='COM7', vid=None, hwid='BTHENUM\\7')]
         handles = []
 
         def open_port(address, **options):
@@ -48,7 +49,7 @@ class DiscoveryTests(unittest.TestCase):
               patch.object(f.serial.tools.list_ports, 'comports', return_value=ports),
               patch.object(f.serial, 'Serial', side_effect=open_port)):
             devices, _ = f.discover_duts(threading.Event(), excluded_resource='COM4 / 9600 / 8N1 / NONE',
-                                         include_serial=True)
+                                         include_lan=False, include_serial=True)
         self.assertEqual([item.identity for item in devices], [identity])
         settings = devices[0].settings
         self.assertEqual((settings.address, settings.baudrate, settings.flow, settings.eol), ('COM3', 19200, 'NONE', 'CR'))
@@ -56,6 +57,43 @@ class DiscoveryTests(unittest.TestCase):
         for port in handles:
             port.write.assert_called_once_with(b'*IDN?\r')
             port.close.assert_called_once()
+
+    def test_pw3390_entered_address_probes_wired_tcp_without_visa(self):
+        host = "192.168.10.3"
+        source = "192.168.10.100"
+        identity = "HIOKI,PW3390-03,TEST,V2.01"
+        adapters = [{"state": "Up", "wired": False, "addresses": [{"ip": "192.168.10.99", "prefix": 24}]},
+                    {"state": "Up", "wired": True, "addresses": [{"ip": source, "prefix": 24}]}]
+        sock = Mock()
+        sock.recv.return_value = (identity + "\r\n").encode("ascii")
+        with (patch.object(f, "HAS_PYVISA", False),
+              patch.object(f.socket, "create_connection", return_value=sock) as connect):
+            found, _ = f.discover_duts(threading.Event(), adapters=adapters, lan_ip=host)
+        connect.assert_called_once_with((host, 3390), timeout=1.0, source_address=(source, 0))
+        sock.sendall.assert_called_once_with(b"*IDN?\r\n")
+        sock.close.assert_called_once()
+        self.assertEqual([item.identity for item in found], [identity])
+
+    def test_pw3390_factory_address_needs_matching_wired_subnet_and_excludes_calibrator(self):
+        adapters = [{"state": "Up", "wired": False, "addresses": [{"ip": "192.168.1.99", "prefix": 24}]},
+                    {"state": "Up", "wired": True, "addresses": [{"ip": "192.168.10.100", "prefix": 24}]}]
+        with (patch.object(f, "HAS_PYVISA", False),
+              patch.object(f.socket, "create_connection", side_effect=TimeoutError) as connect):
+            f.discover_duts(threading.Event(), adapters=adapters)
+            connect.assert_not_called()
+            adapters[1]["addresses"].append({"ip": "192.168.1.100", "prefix": 24})
+            f.discover_duts(threading.Event(), adapters=adapters, excluded_ip="192.168.1.1")
+            connect.assert_not_called()
+            f.discover_duts(threading.Event(), adapters=adapters)
+            connect.assert_called_once_with(("192.168.1.1", 3390), timeout=1.0, source_address=("192.168.1.100", 0))
+
+    def test_pw3390_tcp_timeout_is_reported_in_search_status(self):
+        with (patch.object(f, "HAS_PYVISA", False),
+              patch.object(f.socket, "create_connection", side_effect=TimeoutError)):
+            found, notes = f.discover_duts(threading.Event(), adapters=[], lan_ip="192.168.10.3")
+        self.assertFalse(found)
+        self.assertIn("TCP 192.168.10.3:3390 연결 시간 초과", notes[-1])
+        self.assertIn("같은 서브넷", notes[-1])
 
     def test_only_verified_usb_or_lan_candidates_are_returned(self):
         calibrator = 'TCPIP0::192.168.1.21::inst0::INSTR'
@@ -97,6 +135,24 @@ class DiscoveryTests(unittest.TestCase):
             probe.disconnect.assert_called_once()
         manager.close.assert_called_once()
         self.assertTrue(any('unrecognized instrument' in note for note in notes))
+
+    def test_dut_gpib_auto_excludes_calibrator_and_probes_unique_addresses(self):
+        manager = Mock()
+        manager.list_resources.return_value = ["GPIB::4::INSTR", "GPIB0::05::INSTR",
+                                               "GPIB0::5::INSTR", "GPIB0::INTFC"]
+        probe = Mock()
+        probe.profile = f.identify_dut(WT_ID)
+        probe.connect.return_value = WT_ID
+        with (patch.object(f, "HAS_PYVISA", True),
+              patch.object(f, "SharedVisaManager", return_value=manager),
+              patch.object(f, "DUTSession", return_value=probe) as session):
+            found, _ = f.discover_duts(threading.Event(), excluded_resource="GPIB0::4::INSTR",
+                                        include_usb=False, include_lan=False, include_gpib=True)
+        session.assert_called_once_with()
+        probe.disconnect.assert_called_once_with()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].settings.mode, "GPIB")
+        self.assertEqual(found[0].settings.address, "GPIB0::05::INSTR")
 
     def test_vxi11_port_reply_checks_transaction_and_tcp_port(self):
         xid = 3575
@@ -140,7 +196,7 @@ class DiscoveryUiTests(unittest.TestCase):
         self.app.dut_session.identity = WT_ID if settings.mode == 'VISA' else WT_LAN_ID
         return self.app.dut_session.identity
 
-    def test_first_dut_tab_visit_searches_and_connects_only_candidate(self):
+    def test_connect_button_searches_and_connects_only_candidate(self):
         app = self.app
         with (patch.object(f, 'discover_duts', return_value=([self.usb], [])) as discover,
               patch.object(app.dut_session, 'connect', side_effect=self.connect_result) as connect):
@@ -148,12 +204,52 @@ class DiscoveryUiTests(unittest.TestCase):
             discover.assert_not_called()
             self.assertIn('DUT 연결', [app.notebook.tab(tab, 'text') for tab in app.notebook.tabs()])
             app.notebook.select(app.tab_dut)
+            app.update()
+            discover.assert_not_called()
+            app.btn_dut_connect.invoke()
             self.wait(lambda: not app._dut_busy and app.dut_session.connected)
             discover.assert_called_once()
             self.assertTrue(discover.call_args.kwargs['include_serial'])
+            self.assertTrue(discover.call_args.kwargs['include_gpib'])
             self.assertEqual(connect.call_args.args[0].address, WT_USB)
             self.assertEqual(app.var_dut_identity.get(), WT_ID)
             app.conn_mgr.send_command.assert_not_called()
+
+    def test_pw3390_ip_field_feeds_auto_search_and_remembers_success(self):
+        app = self.app
+        host = "192.168.10.3"
+        device = candidate(f.DUTSettings(mode="HIOKI_LAN", address=host, port=3390),
+                           "HIOKI,PW3390-03,TEST,V2.01")
+
+        def connect(settings):
+            app.dut_session.settings = settings
+            app.dut_session.profile = device.profile
+            app.dut_session.identity = device.identity
+            return device.identity
+
+        app.var_dut_lan_ip.set(host)
+        with (tempfile.TemporaryDirectory() as folder,
+              patch.object(f.Fluke5560AConnectionManager, "_connection_history_path", return_value=Path(folder) / "connections.json"),
+              patch.object(f, "discover_duts", return_value=([device], [])) as discover,
+              patch.object(app.dut_session, "connect", side_effect=connect),
+              patch.object(app.dut_session, "apply_measurement_defaults", return_value="")):
+            self.assertEqual(app.dut_details.winfo_manager(), "")
+            app.btn_dut_details.invoke()
+            self.assertEqual(app.dut_lan_row.winfo_manager(), "pack")
+            app.btn_dut_connect.invoke()
+            self.wait(lambda: not app._dut_busy and app.dut_session.connected)
+            self.assertEqual(discover.call_args.kwargs["lan_ip"], host)
+            reloaded = f.Fluke5560AConnectionManager()
+            self.assertEqual(reloaded._connection_history["DUT-LAN"]["ip"], host)
+            self.assertIn(f"{host}:3390", app.var_dut_identity.get())
+
+    def test_no_device_opens_lan_settings(self):
+        app = self.app
+        with patch.object(f, 'discover_duts', return_value=([], [])):
+            app.btn_dut_connect.invoke()
+            self.wait(lambda: not app._dut_busy)
+        self.assertEqual(app.dut_details.winfo_manager(), "pack")
+        self.assertIn("LAN 설정", app.var_dut_status.get())
 
     def test_multiple_devices_require_selection_then_recheck_identity(self):
         app = self.app
@@ -175,6 +271,9 @@ class DiscoveryUiTests(unittest.TestCase):
             self.assertIn('검색 때 확인한 장비와 다릅니다', app.var_dut_status.get())
             defaults.assert_not_called()
             connect.side_effect = self.connect_result
+            app._dut_connect()
+            self.wait(lambda: not app._dut_busy)
+            app.var_dut_address.set(next(label for label in app._dut_candidates if WT_LAN in label))
             app._dut_connect()
             self.wait(lambda: not app._dut_busy)
             self.assertEqual(connect.call_args.args[0].address, WT_LAN)

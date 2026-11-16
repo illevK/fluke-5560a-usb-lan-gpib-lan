@@ -2,7 +2,11 @@
 
         @staticmethod
         def _display_column(index):
-            return 6 if index == 9 else (index + 1 if index >= 6 else index)
+            if index == 9:
+                return 6
+            if index == 10:
+                return 7
+            return index + 2 if index >= 6 else index
 
         def set_measurement_visibility(self, visible):
             self.show_measurements = bool(visible)
@@ -19,7 +23,7 @@
             self._apply_optional_columns()
 
         def _apply_optional_columns(self):
-            for column, visible in ((7, self.show_commands), (9, self.show_measurements)):
+            for column, visible in ((7, self.show_commands), (9, self.show_measurements), (10, self.show_channels)):
                 cells = [self.header_frame.winfo_children()[column]] + [row["frames"][column] for row in self._row_widgets]
                 for cell in cells:
                     if visible:
@@ -33,7 +37,8 @@
 
         def _resize_columns(self, _event=None):
             base = sum(spec[1] for index, spec in enumerate(self.COL_SPECS)
-                       if (index != 7 or self.show_commands) and (index != 9 or self.show_measurements))
+                       if (index != 7 or self.show_commands) and (index != 9 or self.show_measurements)
+                       and (index != 10 or self.show_channels))
             try:
                 width = max(base, self.canvas.winfo_width())
                 self.canvas.itemconfigure(self.canvas_window, width=width)

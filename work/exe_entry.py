@@ -1,8 +1,10 @@
 """Windowed executable entry point; the bundled check never opens an instrument."""
 import json
 import sys
+import tempfile
 import traceback
 from pathlib import Path
+from unittest.mock import patch
 
 import fluke_5560a_controller as controller
 
@@ -10,6 +12,7 @@ import fluke_5560a_controller as controller
 def check_bundle(report_path):
     report = {}
     app = None
+    log_settings = None
     try:
         import ctypes
         report['frozen'] = bool(getattr(sys, 'frozen', False))
@@ -25,7 +28,10 @@ def check_bundle(report_path):
         finally:
             manager.close()
         controller.AutoNetworkAligner.list_ethernet_interfaces = classmethod(lambda cls, refresh=False: [])
-        app = controller.Fluke5560AControllerApp()
+        log_settings = tempfile.TemporaryDirectory(prefix="fluke-log-test-")
+        settings = Path(log_settings.name) / "settings" / "log-settings.json"
+        with patch.object(controller.Fluke5560AConnectionManager, "_log_settings_path", return_value=settings):
+            app = controller.Fluke5560AControllerApp()
         app.withdraw()
         app.update_idletasks()
         assert not app.conn_mgr.info.connected
@@ -37,6 +43,16 @@ def check_bundle(report_path):
         app.conn_mgr.record_event('EXE package verification: no instrument connection')
         assert Path(app.conn_mgr.log_path).is_file()
         report['log_path'] = app.conn_mgr.log_path
+        custom_folder = Path(log_settings.name) / "교정 기록"
+        custom_folder.mkdir()
+        with patch.object(controller.Fluke5560AConnectionManager, "_log_settings_path", return_value=settings):
+            with patch.object(controller.filedialog, "askdirectory", return_value=str(custom_folder)):
+                app.btn_log_folder.invoke()
+            assert str(custom_folder) in app.var_log_folder.get()
+            assert Path(app.conn_mgr.log_path).parent == custom_folder
+            assert Path(app.conn_mgr.log_path).is_file()
+            assert Path(controller.Fluke5560AConnectionManager().log_path).parent == custom_folder
+        report['custom_log_folder_persists'] = True
         rows = controller.SmartClipboardSequenceParser.build_sequence_steps(
             '120 V / 10 A\tLead\t\t60 Hz\t120 V\t10 A\t0.5\n1 kV')
         assert rows[0].nominal_raw == '0.5 LEAD' and 'DPF 0.5, LEAD' in rows[0].scpi_cmd
@@ -94,20 +110,19 @@ def check_bundle(report_path):
         assert app.notebook.tab(app.tab_dut, "text") == "DUT 연결"
         assert app._dut_modes[app.var_dut_mode.get()] == "AUTO"
         assert app.var_seq_dut_capture.get()
-        # Selecting the tab normally starts discovery; verify its trigger
-        # without letting this packaged test contact any USB/LAN instrument.
+        assert app.var_conn_mode.get() == 'AUTO' and app._connection_arguments()['model'] == 'AUTO'
+        # Only a Connect action starts discovery in the bundled GUI.
         searches = []
         start_dut = app._dut_start
         app._dut_start = lambda operation, settings=None: searches.append(operation)
         app.update()
         app.notebook.select(app.tab_dut)
-        # The self-check window is withdrawn; invoke the tab handler even
-        # when Tk doesn't deliver a tab-change event for an unmapped notebook.
-        app._dut_on_tab_open()
         app.update()
-        assert searches == ["discover"] and not app._dut_first_visit, searches
+        assert not searches, searches
+        app.btn_dut_connect.invoke()
+        assert searches == ["discover"], searches
         app._dut_start = start_dut
-        report['dut_auto_search_on_first_open'] = True
+        report['dut_auto_search_on_connect'] = True
         app.var_dut_mode.set('LAN · WT5000 TCP')
         app.var_dut_address.set('192.168.1.3')
         assert app._dut_settings().mode == 'WT5000_TCP'
@@ -132,6 +147,8 @@ def check_bundle(report_path):
     finally:
         if app is not None:
             app._on_close()
+        if log_settings is not None:
+            log_settings.cleanup()
         Path(report_path).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
 
 

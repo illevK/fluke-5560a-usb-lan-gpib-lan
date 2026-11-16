@@ -137,6 +137,14 @@ class InstrumentProtocolError(ConnectionError):
     pass
 
 
+class InstrumentReplyError(InstrumentProtocolError):
+    """A complete line was received, but it was not the expected reply."""
+
+
+class InstrumentResponseTimeout(TimeoutError):
+    """The command was sent, but its complete response did not arrive."""
+
+
 class OperationCancelled(RuntimeError):
     pass
 
@@ -164,7 +172,7 @@ def close_lan_socket(sock):
 class TelnetLineTransport:
     """Incremental Telnet parser + CR/LF framing; one transaction at a time."""
 
-    PROMPT = re.compile(r"^(?:(?:5[0-9]{3}A)?\s*[=!?>]>?\s*)", re.I)
+    PROMPT = re.compile(r"^(?:[0-9]+>\s*|(?:5[0-9]{3}A)?\s*[=!?>]>?\s*)", re.I)
 
     def __init__(self, sock, timeout=3.0, eol="CRLF"):
         self.sock = sock
@@ -213,11 +221,12 @@ class TelnetLineTransport:
     def clean_line(cls, line, command):
         text = line.decode("ascii", errors="replace").strip()
         if re.match(r"^[!?]>", text):
-            raise InstrumentProtocolError(f"장비 오류 응답: {text}")
+            raise InstrumentReplyError(f"장비 오류 응답: {text}")
         text = cls.PROMPT.sub("", text).strip()
         return "" if text.upper() == command.upper() else text
 
-    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None, *, expected_reply=None):
+    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None, *,
+              expected_reply=None, skip_terminal_interruption=False):
         limit = self.timeout if timeout is None else timeout
         # One query, one reply. Never retransmit OPC while a reply is pending.
         self.write(command)
@@ -233,9 +242,19 @@ class TelnetLineTransport:
                     break
                 line = bytes(self.buffer[:match.start()])
                 del self.buffer[:match.end()]
-                text = self.clean_line(line, command)
+                try:
+                    text = self.clean_line(line, command)
+                except InstrumentReplyError:
+                    if expected_reply is None:
+                        raise
+                    continue
                 if not text or text.upper() in self._recent_writes:
                     continue
+                if re.match(r"^Fault\s+-?\d+\s*:", text, re.I):
+                    if expected_reply is not None or (skip_terminal_interruption
+                            and re.fullmatch(r"Fault\s+-410\s*:\s*488\.2 interrupted query", text, re.I)):
+                        continue
+                    raise InstrumentReplyError(f"장비 오류 응답: {text}")
                 self.last_received = text
                 # Initial banners/prompts are not identification responses.
                 if identity and len(text.split(",")) < 4:
@@ -246,7 +265,7 @@ class TelnetLineTransport:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 partial = bytes(self.buffer[-120:]).decode("ascii", errors="replace")
-                raise TimeoutError(f"{command}: {limit:g}초 동안 완전한 응답 없음 (부분 수신: {partial or '없음'}).")
+                raise InstrumentResponseTimeout(f"{command}: {limit:g}초 동안 완전한 응답 없음 (부분 수신: {partial or '없음'}).")
             if progress and time.monotonic() >= next_progress:
                 progress(time.monotonic() - started, limit)
                 next_progress = time.monotonic() + 1
@@ -272,7 +291,8 @@ class Fluke5560AConnectionManager:
         self._visa_rm = None
         self._visa_inst = None
         self._lan_sock = None
-        self._first_lan_command_check = False
+        self._first_command_check = False
+        self.zero_adjustment_due = False
         self._transport = None
         self._serial_port = None
         self.expected_model = "5560A"
@@ -283,6 +303,7 @@ class Fluke5560AConnectionManager:
         self.last_error = ""
         self.source_ip = ""
         self._last_lan_source = None
+        self._connection_history = self._load_connection_history()
         self._lan_tcp_failures = []
         self.last_diagnostic = ""
         self.operation_timeout = 60.0
@@ -290,13 +311,94 @@ class Fluke5560AConnectionManager:
         self.events = queue.Queue()
         self._log_lock = threading.Lock()
         application_path = sys.executable if getattr(sys, "frozen", False) else __file__
-        self.log_path = os.path.join(os.path.dirname(os.path.abspath(application_path)), "logs",
-                                     f"fluke_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}.log")
+        self._log_filename = f"fluke_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}.log"
+        self._default_log_folder = os.path.join(os.path.dirname(os.path.abspath(application_path)), "logs")
+        self.log_path = os.path.join(self._default_log_folder, self._log_filename)
+        self.log_folder_warning = ""
+        self._load_log_folder()
+
+    @staticmethod
+    def _log_settings_path():
+        user_dir = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return Path(user_dir) / "FlukeController" / "log-settings.json"
+
+    @staticmethod
+    def _connection_history_path():
+        return Fluke5560AConnectionManager._log_settings_path().with_name("connections.json")
+
+    def _load_connection_history(self):
+        try:
+            history = json.loads(self._connection_history_path().read_text(encoding="utf-8"))
+            return history if isinstance(history, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _remember_connection(self, interface, *, history_key=None, **details):
+        model = history_key or self.profile.model
+        settings = self._connection_history_path()
+        history = self._load_connection_history()
+        previous = history.get(model)
+        previous = previous if isinstance(previous, dict) else {}
+        updated = {**previous, **details, "interface": interface}
+        self._connection_history[model] = updated
+        if updated == previous:
+            return
+        history[model] = updated
+        try:
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=settings.parent) as folder:
+                staged = Path(folder) / settings.name
+                staged.write_text(json.dumps(history), encoding="utf-8")
+                staged.replace(settings)
+        except OSError as exc:
+            self.record_event(f"[연결 기록 저장 실패] {exc}", notify=True)
+
+    def _load_log_folder(self):
+        try:
+            with self._log_settings_path().open(encoding="utf-8") as settings_file:
+                settings = json.load(settings_file)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            self.log_folder_warning = "로그 폴더 설정을 읽지 못해 기본 폴더에 저장합니다."
+            return
+        folder = settings.get("log_folder") if isinstance(settings, dict) else None
+        if not isinstance(folder, str) or not os.path.isabs(folder):
+            self.log_folder_warning = "저장된 로그 폴더 경로가 올바르지 않아 기본 폴더에 저장합니다."
+            return
+        target = Path(folder) / self._log_filename
+        try:
+            # Do not recreate a missing custom folder, which may be on a disconnected drive.
+            with target.open("a", encoding="utf-8"):
+                pass
+        except (OSError, ValueError):
+            self.log_folder_warning = f"저장된 로그 폴더를 사용할 수 없어 기본 폴더에 저장합니다. ({folder})"
+            return
+        self.log_path = str(target)
+
+    def set_log_folder(self, folder):
+        target_folder = Path(folder)
+        if not target_folder.is_absolute():
+            raise ValueError("로그를 저장할 폴더의 전체 경로를 선택하세요.")
+        settings = self._log_settings_path()
+        # Verify write access before saving the preference or changing the active log.
+        with tempfile.TemporaryFile(dir=target_folder):
+            pass
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_lock:
+            with tempfile.TemporaryDirectory(dir=settings.parent, prefix="log-settings-") as staging_dir:
+                staged = Path(staging_dir) / settings.name
+                staged.write_text(json.dumps({"log_folder": str(target_folder)}, ensure_ascii=False), encoding="utf-8")
+                staged.replace(settings)
+            self.log_path = str(target_folder / self._log_filename)
+            self.log_folder_warning = ""
 
     def record_event(self, message, notify=False):
         with self._log_lock:
             try:
-                os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+                folder = os.path.dirname(self.log_path)
+                if folder == self._default_log_folder:
+                    os.makedirs(folder, exist_ok=True)
                 with open(self.log_path, "a", encoding="utf-8") as log:
                     log.write(f"[{datetime.datetime.now().isoformat(timespec='milliseconds')}] {message}\n")
             except OSError:
@@ -319,7 +421,8 @@ class Fluke5560AConnectionManager:
     def _validate_idn(self, value):
         fields = [part.strip() for part in value.split(",")]
         return (len(fields) >= 4 and fields[0].upper() == "FLUKE"
-                and fields[1].upper() == self.expected_model)
+                and fields[1].upper() in MODEL_PROFILES
+                and self.expected_model in ("AUTO", fields[1].upper()))
 
     def _identify(self, value, interface):
         if not self._validate_idn(value):
@@ -334,12 +437,14 @@ class Fluke5560AConnectionManager:
         # and prompts are handled by the reader without changing saved settings.
         if self.profile.model == "5560A":
             port = "TELNET" if interface == "LAN" else "SERIAL"
-            mode = transport.query(f"COMM_MODE? {port}").strip().upper()
+            query = f"COMM_MODE? {port}"
+            skip_interruption = interface == "RS232"
+            mode = transport.query(query, skip_terminal_interruption=skip_interruption).upper()
             if mode == "TERM":
                 transport.write(f"COMM_MODE {port}, COMP")
-                mode = transport.query(f"COMM_MODE? {port}").strip().upper()
+                mode = transport.query(query, skip_terminal_interruption=skip_interruption).upper()
             if mode != "COMP":
-                raise InstrumentProtocolError("Computer 모드 전환을 확인하지 못했습니다.")
+                raise InstrumentProtocolError(f"Computer 모드 전환을 확인하지 못했습니다. 장비 응답: {mode[:120]!r}")
         transport.write("REMOTE")
         if transport.query("*OPC?").strip() != "1":
             raise InstrumentProtocolError("REMOTE 처리 완료 응답이 올바르지 않습니다.")
@@ -365,9 +470,14 @@ class Fluke5560AConnectionManager:
         primary = AutoNetworkAligner.select_source_ip(adapter_idx, ip)
         candidates = list(AutoNetworkAligner.link_local_source_ips(primary, ip, adapter_idx))
         previous = self._last_lan_source
-        if previous and previous[:2] == (ip, port) and previous[2] in candidates:
-            candidates.remove(previous[2])
-            candidates.insert(0, previous[2])
+        if previous and previous[:2] == (ip, port):
+            host = previous[2]
+        else:
+            saved = self._connection_history.get(self.expected_model)
+            host = saved.get("source_ip") if isinstance(saved, dict) and (saved.get("ip"), saved.get("port")) == (ip, port) else None
+        if host and host in candidates:
+            candidates.remove(host)
+            candidates.insert(0, host)
         return tuple(candidates[:3])
 
     def _open_lan_socket(self, ip, port, timeout, source_ips):
@@ -392,15 +502,17 @@ class Fluke5560AConnectionManager:
                               gpib_addr=1, timeout_sec=3.0, allow_raw_socket_fallback=False,
                               source_ip="", eol="CRLF", visa_resource="", adapter_idx="",
                               operation_timeout_sec=60.0, model="5560A", serial_port="",
-                              baudrate=9600, data_bits=8, parity="N", stop_bits=1, flow_control="XON/XOFF"):
+                              baudrate=9600, data_bits=8, parity="N", stop_bits=1, flow_control="XON/XOFF",
+                              excluded_com="", excluded_gpib=None, excluded_ip="", excluded_usb=None):
         # Legacy fallback argument is intentionally ignored: IDN verification is mandatory.
         mode = preferred_mode.strip().upper()
         if mode not in ("AUTO", "USB", "GPIB", "RS232", "LAN", "LAN (SOCKET)", "LAN (VISA)", "SIMULATION"):
             raise ValueError(f"지원하지 않는 연결 모드: {mode}")
         model = model.strip().upper()
-        if model not in MODEL_PROFILES:
+        automatic_model = mode == "AUTO" and model == "AUTO"
+        if model not in MODEL_PROFILES and not automatic_model:
             raise ValueError(f"지원하지 않는 모델: {model}")
-        profile = MODEL_PROFILES[model]
+        profile = MODEL_PROFILES.get(model, MODEL_PROFILES["5560A"])
         interface = "LAN" if mode.startswith("LAN") else mode
         if interface not in ("AUTO", "SIMULATION") and interface not in profile.interfaces:
             raise ValueError(f"{model} 연결 가능: {', '.join(profile.interfaces)}. USB–RS-232 컨버터는 RS232를 선택하세요.")
@@ -421,29 +533,117 @@ class Fluke5560AConnectionManager:
             self.info = ConnectionInfo(True, "SIMULATION (가상 장비 모드)", f"SIM::FLUKE_{model}::INSTR", f"FLUKE,{model},SIM-9901234,1.0")
             return self.info
         errors = []
-        # Explicit LAN address in AUTO takes precedence over unrelated instruments.
-        if "LAN" in profile.interfaces and mode in ("AUTO", "LAN", "LAN (SOCKET)", "LAN (VISA)") and lan_ip.strip():
-            ip = AutoNetworkAligner.normalize_ipv4(lan_ip)
-            port = self._validate_port(lan_port)
-            source_ips = self._lan_source_ips(ip, port, source_ip, adapter_idx)
-            result = self._try_lan_socket(ip, port, timeout_sec, eol=eol, source_ips=source_ips)
-            if result.connected:
-                return result
-            errors.append(self.last_error)
-            if mode != "AUTO":
-                raise ConnectionError(self.build_lan_diagnostic_report(ip, port))
-        elif mode.startswith("LAN"):
-            raise ValueError("5560A 본체 Ethernet 화면에 표시된 현재 IP 주소를 입력하세요.")
-        if mode == "RS232" or (mode == "AUTO" and serial_port.strip()):
-            result = self._try_serial(serial_port, timeout_sec, eol, baudrate, data_bits, parity, stop_bits, flow_control)
-            if result.connected:
-                return result
-            errors.append(self.last_error)
-        if mode in ("AUTO", "USB", "GPIB") and set(profile.interfaces) & {"USB", "GPIB"}:
-            result = self._try_visa_auto_scan(mode, gpib_addr, timeout_sec, visa_resource)
-            if result.connected:
-                return result
-            errors.append(self.last_error)
+        saved = self._connection_history.get(model)
+        saved = saved if isinstance(saved, dict) else {}
+        histories = [saved]
+        if automatic_model:
+            histories = [self._connection_history[key] for key in reversed(self._connection_history)
+                         if key in MODEL_PROFILES and isinstance(self._connection_history[key], dict)]
+        lan_candidates = []
+        if "LAN" in profile.interfaces and (mode == "AUTO" or mode.startswith("LAN")):
+            inputs = [(lan_ip, lan_port)]
+            if mode == "AUTO" or not lan_ip.strip():
+                inputs.extend((item.get("ip"), item.get("port")) for item in histories)
+            if automatic_model and not lan_ip.strip() and _dut_wired_source(
+                    "169.254.1.1", AutoNetworkAligner.list_ethernet_interfaces()):
+                inputs.append(("169.254.1.1", 3490))
+            for candidate_ip, candidate_port in inputs:
+                if not isinstance(candidate_ip, str) or not candidate_ip.strip():
+                    continue
+                try:
+                    address = AutoNetworkAligner.normalize_ipv4(candidate_ip), self._validate_port(candidate_port)
+                except (TypeError, ValueError) as exc:
+                    if mode != "AUTO":
+                        raise
+                    errors.append(f"[LAN 설정] {exc}")
+                    continue
+                if address[0] != excluded_ip and address not in lan_candidates:
+                    lan_candidates.append(address)
+            if mode.startswith("LAN") and not lan_candidates:
+                raise ValueError(f"{model} 본체 Ethernet 화면의 현재 IP 주소를 입력하세요.")
+
+        serial_first = mode == "AUTO" and (
+            bool(serial_port.strip()) or any(item.get("interface") == "RS232" for item in histories)
+        )
+        if automatic_model and lan_ip.strip():
+            serial_first = False
+        order = ("RS232", "LAN") if serial_first else ("LAN", "RS232")
+        if automatic_model and not serial_first:
+            order = ("LAN", "VISA", "RS232")
+        else:
+            order += ("VISA",)
+        for interface in order:
+            if self.cancel_event.is_set():
+                raise OperationCancelled("장비 검색을 중지했습니다.")
+            if interface == "LAN":
+                for ip, port in lan_candidates:
+                    self.record_event(f"[LAN 연결 시도] {ip}:{port}", notify=True)
+                    try:
+                        source_ips = self._lan_source_ips(ip, port, source_ip, adapter_idx)
+                    except (ConnectionError, ValueError) as exc:
+                        if mode != "AUTO":
+                            raise
+                        errors.append(f"[LAN 경로] {ip}:{port} · {exc}")
+                        continue
+                    result = self._try_lan_socket(ip, port, timeout_sec, eol=eol, source_ips=source_ips)
+                    if result.connected:
+                        self.expected_model = self.profile.model
+                        self._remember_connection("LAN", ip=ip, port=port, source_ip=self.source_ip)
+                        return result
+                    errors.append(self.last_error)
+                    if mode != "AUTO":
+                        raise ConnectionError(self.build_lan_diagnostic_report(ip, port))
+            elif interface == "VISA":
+                if mode in ("AUTO", "USB", "GPIB") and set(profile.interfaces) & {"USB", "GPIB"}:
+                    result = self._try_visa_auto_scan(mode, gpib_addr, timeout_sec, visa_resource,
+                                                      excluded_gpib=excluded_gpib, excluded_usb=excluded_usb)
+                    if result.connected:
+                        self.expected_model = self.profile.model
+                        return result
+                    errors.append(self.last_error)
+            elif mode in ("AUTO", "RS232") and "RS232" in profile.interfaces:
+                if mode == "RS232" and serial_port.strip():
+                    candidates = [serial_port.strip()]
+                else:
+                    previous_com = next((item["com"] for item in histories if item.get("com")), None)
+                    candidates = self._serial_candidates(serial_port, previous_com)
+                candidates = [port for port in candidates if port.upper() != excluded_com]
+                if not candidates:
+                    errors.append("검색할 COM 포트가 없습니다. USB–RS-232 컨버터를 확인하세요." if HAS_PYSERIAL else
+                                  dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
+                configured = (baudrate, data_bits, parity, stop_bits, flow_control, eol)
+                presets = [configured]
+                if automatic_model:
+                    if eol == "CRLF":
+                        presets.insert(0, (*configured[:-1], "LF"))
+                    presets.extend((rate, 8, "N", 1, flow, ending) for rate, flow, ending in
+                                   ((9600, "XON/XOFF", "CRLF"), (9600, "NONE", "LF"), (9600, "RTS/CTS", "CRLF"),
+                                    (19200, "NONE", "LF"), (38400, "NONE", "LF"), (115200, "NONE", "LF")))
+                    for item in reversed(histories):
+                        recent = item.get("serial_settings")
+                        if isinstance(recent, (tuple, list)) and len(recent) == 6 and all(isinstance(v, (str, int)) for v in recent):
+                            preset = tuple(recent)
+                            if item is self._connection_history.get("5560A") and preset[-1] == "CRLF":
+                                preset = (*preset[:-1], "LF")
+                            presets.insert(0, preset)
+                probe_timeout = min(timeout_sec, 1.0) if automatic_model else timeout_sec
+                serial_deadline = time.monotonic() + 12
+                for speed, bits, check, stop, flow, ending in dict.fromkeys(presets):
+                    for port in candidates:
+                        if self.cancel_event.is_set():
+                            raise OperationCancelled("장비 검색을 중지했습니다.")
+                        if automatic_model and time.monotonic() >= serial_deadline:
+                            break
+                        self.record_event(f"[RS232 연결 시도] {port} / {speed} / {bits}{check}{stop} / {flow} / {ending}", notify=True)
+                        result = self._try_serial(port, probe_timeout, ending, speed, bits, check, stop, flow)
+                        if result.connected:
+                            self.expected_model = self.profile.model
+                            ending = "LF" if self.profile.model == "5560A" and ending == "CRLF" else ending
+                            self._remember_connection("RS232", com=port, serial_settings=[speed, bits, check, stop, flow, ending])
+                            if self._transport is not None:
+                                self._transport.timeout = timeout_sec
+                            return result
+                        errors.append(self.last_error)
         self.last_error = "\n".join(errors)
         raise ConnectionError(self.last_error or "연결할 인터페이스와 장비 IP/리소스를 지정하세요.")
 
@@ -465,7 +665,7 @@ class Fluke5560AConnectionManager:
             stage = "Computer 통신 모드 확인"
             self._prepare_remote_stream(transport, "LAN")
             self._lan_sock, self._transport = sock, transport
-            self._first_lan_command_check = self.profile.model == "5560A"
+            self._first_command_check = True
             self.info = ConnectionInfo(True, "LAN (Ethernet Socket)", f"TCPIP::{ip}::{port}::SOCKET", idn, ip, port)
             self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = ""
@@ -486,6 +686,17 @@ class Fluke5560AConnectionManager:
             return []
         return [(p.device, p.description) for p in serial.tools.list_ports.comports()]
 
+    @staticmethod
+    def _serial_candidates(explicit, previous):
+        candidates = [explicit.strip().upper()] if explicit.strip() else []
+        if not HAS_PYSERIAL:
+            return candidates
+        ports = [port for port in serial.tools.list_ports.comports()
+                 if not (port.hwid or "").upper().startswith(("BTHENUM", "BTHLE", "BTHMODEM"))
+                 and "bluetooth" not in (port.description or "").casefold()]
+        ports.sort(key=lambda port: (port.device.upper() != previous, port.vid is None, port.device.upper()))
+        return list(dict.fromkeys(candidates + [port.device.upper() for port in ports]))
+
     def _try_serial(self, port, timeout, eol, baudrate, data_bits, parity, stop_bits, flow_control):
         if not HAS_PYSERIAL:
             self.last_error = dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR)
@@ -496,9 +707,9 @@ class Fluke5560AConnectionManager:
             if not port.strip():
                 raise ValueError("장치 관리자 또는 COM 목록에서 컨버터의 COM 번호를 선택하세요.")
             rates = (300, 600, 1200, 2400, 4800, 9600)
-            if self.profile.model in ("5560A", "5080A"):
+            if self.expected_model in ("AUTO", "5560A", "5080A"):
                 rates += (19200, 38400, 57600, 115200)
-            if self.profile.model == "5560A":
+            if self.expected_model == "5560A":
                 rates = rates[5:]
             if int(baudrate) not in rates or int(data_bits) not in (7, 8) or parity not in ("N", "E", "O") or float(stop_bits) not in (1, 2):
                 raise ValueError(f"{self.profile.model}의 속도/데이터/패리티/정지 비트 설정을 확인하세요.")
@@ -507,13 +718,26 @@ class Fluke5560AConnectionManager:
             handle = serial.Serial(port=port.strip(), baudrate=int(baudrate), bytesize=int(data_bits),
                                    parity=parity, stopbits=float(stop_bits), timeout=.2, write_timeout=timeout,
                                    xonxoff=flow_control == "XON/XOFF", rtscts=flow_control == "RTS/CTS", dsrdtr=False)
-            transport = SerialLineTransport(SerialEndpoint(handle), timeout, eol)
+            # 5560A firmware may process CR and LF as separate input messages.
+            # In Computer mode the extra empty message can interrupt the reply.
+            input_eol = "LF" if self.expected_model == "5560A" and eol == "CRLF" else eol
+            transport = SerialLineTransport(SerialEndpoint(handle), timeout, input_eol)
+            # Allow the 5560A to finish its RS232 response before sending another
+            # command. Bench checks at 9600 baud produced -410 without this gap.
+            if self.expected_model in ("5560A", "AUTO"):
+                transport.reply_gap = .12
             stage = "장비 식별 (*IDN?)"
             idn = transport.query("*IDN?", identity=True)
             self._identify(idn, "RS232")
+            if self.profile.model == "5560A":
+                if input_eol == "CRLF":
+                    transport.terminator = b"\n"
+            else:
+                transport.reply_gap = 0.0
             stage = "원격 제어 준비"
             self._prepare_remote_stream(transport, "RS232")
             self._serial_port, self._transport = handle, transport
+            self._first_command_check = True
             self.info = ConnectionInfo(True, "RS232 (COM / USB–RS-232)",
                                        f"{port} / {baudrate} / {data_bits}{parity}{stop_bits} / {flow_control}", idn)
             self.last_error = ""
@@ -523,12 +747,18 @@ class Fluke5560AConnectionManager:
                 handle.close()
             self._serial_port = self._transport = None
             self.info = ConnectionInfo()
-            self.last_error = (f"[{stage}] {port}: {type(exc).__name__}: {exc}\n"
-                               "본체의 RS-232 선택, 속도/데이터/패리티/정지 비트/흐름 제어/EOL 일치 여부를 확인하세요. "
-                               "5522A·5520A는 SERIAL 1 FROM HOST에 연결하고 null-modem 결선이 필요합니다.")
+            if stage == "원격 제어 준비":
+                hint = ("장비 식별은 성공했습니다. 본체 RS-232 메뉴의 Remote Interface를 Computer로 설정한 뒤 다시 연결하세요."
+                        if self.profile.model == "5560A" else "장비 식별은 성공했습니다. 원격 제어 모드와 본체 화면을 확인하세요.")
+            else:
+                hint = ("USB–RS-232 컨버터의 COM 번호와 본체의 속도, 데이터 비트, 패리티, 정지 비트, 흐름 제어, EOL을 확인하세요.")
+                if self.expected_model in ("5520A", "5522A"):
+                    hint += " 장비의 SERIAL 1 FROM HOST에 null-modem 결선으로 연결하세요."
+            self.last_error = f"[{stage}] {port}: {type(exc).__name__}: {exc}\n{hint}"
             return self.info
 
-    def _try_visa_auto_scan(self, filter_mode, gpib_addr, timeout_sec, visa_resource=""):
+    def _try_visa_auto_scan(self, filter_mode, gpib_addr, timeout_sec, visa_resource="",
+                            *, excluded_gpib=None, excluded_usb=None):
         if not HAS_PYVISA:
             self.last_error = dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR)
             return ConnectionInfo()
@@ -546,7 +776,10 @@ class Fluke5560AConnectionManager:
                 if not kind.startswith(("USB", "GPIB")):
                     continue
                 interface = "USB" if kind.startswith("USB") else "GPIB"
-                if interface not in self.profile.interfaces:
+                if self.expected_model != "AUTO" and interface not in self.profile.interfaces:
+                    continue
+                if (excluded_usb is not None and _dut_discovery_usb_key(resource) == excluded_usb
+                        or excluded_gpib is not None and _dut_gpib_key(resource) == excluded_gpib):
                     continue
                 if filter_mode in ("USB", "GPIB") and not kind.startswith(filter_mode):
                     continue
@@ -561,6 +794,7 @@ class Fluke5560AConnectionManager:
                     if interface == "GPIB":
                         inst.control_ren(pyvisa.constants.RENLineOperation.asrt_address)
                     self._visa_inst = inst
+                    self._first_command_check = True
                     # REMOTE/LOCAL strings are Ethernet/serial commands, not GPIB/USBTMC.
                     self.info = ConnectionInfo(True, "USB (USBTMC)" if kind.startswith("USB") else "GPIB (IEEE-488.2)", resource, idn)
                     return self.info
@@ -601,7 +835,7 @@ class Fluke5560AConnectionManager:
         """One read-only IDN session, no REMOTE, STBY, OUT, or configuration commands."""
         if self.info.connected:
             raise ConnectionError("현재 연결을 해제한 후 LAN 진단을 실행하세요.")
-        if "LAN" not in MODEL_PROFILES[self.expected_model].interfaces:
+        if self.expected_model != "AUTO" and "LAN" not in MODEL_PROFILES[self.expected_model].interfaces:
             raise ValueError(f"{self.expected_model}은 기본 LAN 포트를 지원하지 않습니다.")
         if not math.isfinite(timeout) or not 0.2 <= timeout <= 60:
             raise ValueError("통신 제한 시간은 0.2~60초 사이여야 합니다.")
@@ -614,10 +848,10 @@ class Fluke5560AConnectionManager:
             sock = self._open_lan_socket(ip, port, timeout, source_ips)
             stage = "TCP 성공, *IDN? 확인"
             idn = TelnetLineTransport(sock, timeout, eol).query("*IDN?", identity=True)
-            if not self._validate_idn(idn):
+            if not self._validate_idn(idn) or "LAN" not in MODEL_PROFILES[idn.split(",")[1].strip().upper()].interfaces:
                 raise InstrumentProtocolError(f"다른 장비 응답: {idn}")
             self._last_lan_source = (ip, port, self.source_ip)
-            self.last_error = f"[진단 성공] TCP 및 {self.expected_model} 식별 확인: {idn}"
+            self.last_error = f"[진단 성공] TCP 및 장비 식별 확인: {idn}"
         except Exception as exc:
             self.last_error = f"[{stage}] {type(exc).__name__}: {exc}"
         finally:
@@ -638,7 +872,8 @@ class Fluke5560AConnectionManager:
                 except Exception:
                     pass
         self._visa_inst = self._visa_rm = self._lan_sock = self._transport = None
-        self._first_lan_command_check = False
+        self._first_command_check = False
+        self.zero_adjustment_due = False
         self._serial_port = None
         self.info = ConnectionInfo()
 
@@ -665,6 +900,12 @@ class Fluke5560AConnectionManager:
         else:
             raise ConnectionError("유효한 통신 핸들이 없습니다.")
         self.record_event(f"RX << {response} | {command} | {time.monotonic() - started:.3f}s")
+        if command.upper() == "ERR?":
+            if not re.match(r"^(?:[+-]?\d+\s*,|\+?0$)", response):
+                raise InstrumentReplyError(f"장비 오류 응답 형식이 올바르지 않습니다: {response[:120]}")
+            if self.profile.model == "5560A" and re.match(r"^\+?8012\s*,", response):
+                self.zero_adjustment_due = True
+                self.record_event(f"[영점 조정 필요] {response} · 5560A 본체에서 Zero Adjustment를 실행하세요.", notify=True)
         return response
 
     def _write(self, command):
@@ -685,14 +926,12 @@ class Fluke5560AConnectionManager:
         self.record_event(f"RX << {self.info.idn_string} | STBY 복구")
         if self._query("OPER?", timeout=max(.001, deadline - time.monotonic()), cancellable=False) != "0":
             raise InstrumentProtocolError("본체의 STBY 상태를 확인하지 못했습니다.")
-        error = self._query("ERR?", timeout=max(.001, deadline - time.monotonic()), cancellable=False)
-        if not re.match(r"^[+-]?\d+\s*,", error):
-            raise InstrumentProtocolError(f"장비 오류 응답 형식이 올바르지 않습니다: {error[:120]}")
-        return error
+        return self._query("ERR?", timeout=max(.001, deadline - time.monotonic()), cancellable=False)
 
     def _can_recover_standby(self, exc):
-        return (self.profile.model == "5560A" and self._lan_sock is not None
-                and isinstance(exc, (OperationCancelled, TimeoutError)))
+        return (self._transport is not None
+                and (isinstance(exc, (OperationCancelled, InstrumentResponseTimeout))
+                     or (self.profile.model != "5560A" and isinstance(exc, InstrumentReplyError))))
 
     def _fail_control_session(self, context, exc, *, recover_standby=False):
         message = f"{context}: {type(exc).__name__}: {exc}"
@@ -708,7 +947,7 @@ class Fluke5560AConnectionManager:
                     message += f"\nSTBY 확인 실패: {recovery_error}"
                 else:
                     self.cancel_event.clear()
-                    message = f"{message}\n5560A 응답 {error}. STBY 확인 완료, LAN 연결 유지. 다음 행은 실행하지 않습니다."
+                    message = f"{message}\n{self.profile.model} 응답 {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
                     self.last_error = message
                     self.record_event(message, notify=True)
                     raise InstrumentCommandError(message) from exc
@@ -731,26 +970,50 @@ class Fluke5560AConnectionManager:
             try:
                 return self._query(command, timeout=self.operation_timeout if command.upper() == "*OPC?" else None)
             except Exception as exc:
-                recover_standby = command.upper() in ("OPER?", "*OPC?") and self._can_recover_standby(exc)
+                recover_standby = (command.upper() in ("OPER?", "*OPC?", "CUR_POST?", "ERR?")
+                                   and self._can_recover_standby(exc))
                 self._fail_control_session(f"조회 {command}", exc, recover_standby=recover_standby)
                 raise
 
+    def _is_protection_error(self, error):
+        codes = {4008, 4100, 4102, 4202} if self.profile.model == "5560A" else {1500, 1501, 1502, 1503, 1504}
+        return int(error.partition(",")[0]) in codes
+
     def _stop_after_command_error(self, error, phase):
         # A valid error reply means the stream is still synchronized.
-        protection = (self.profile.model == "5560A" and self._lan_sock is not None
-                      and re.match(r"^\+?(4008|4100|4102|4202)\s*,", error))
-        if not protection or self._query("OPER?") != "0":
+        if not self._is_protection_error(error) or self._query("OPER?", cancellable=False) != "0":
             self._write("STBY")
             if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
                 raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
+        hint = (" COM 포트의 속도·패리티·흐름 제어와 케이블을 확인하세요."
+                if int(error.partition(",")[0]) == -361 else "")
         raise InstrumentCommandError(
             f"{self.profile.model} 오류 ({phase}): {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
+            + hint
         )
 
-    def _check_initial_lan_error(self, error):
-        if re.match(r"^-410\s*,", error) and self._query("OPER?") == "0":
-            self.record_event(f"[LAN 최초 확인] STBY에서 이전 조회 중단 응답 확인: {error}")
-            return self._query("ERR?")
+    def _check_initial_error(self, error):
+        allowed = {-410, 8012} if self.profile.model == "5560A" else {1308}
+        serial_5560 = self.profile.model == "5560A" and self._serial_port is not None
+        if serial_5560:
+            allowed.add(-361)
+        serial_recovery = False
+        for _ in range(15):  # 5560A keeps up to 15 entries in its error queue.
+            code = int(error.partition(",")[0])
+            if code not in allowed or self._query("OPER?") != "0":
+                break
+            if serial_5560 and code in (-410, -361):
+                serial_recovery = True
+            else:
+                allowed.remove(code)
+            self.record_event(f"[첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: {error}")
+            error = self._query("ERR?")
+        if serial_recovery and int(error.partition(",")[0]) == 0:
+            if self._query("*IDN?") != self.info.idn_string or self._query("OPER?") != "0":
+                raise InstrumentProtocolError("RS232 재확인 중 장비 식별 또는 STBY 상태가 일치하지 않습니다.")
+            error = self._query("ERR?")
+            if int(error.partition(",")[0]) == 0:
+                self.record_event("[RS232 복구 확인] 동일 장비 · STBY · 오류 없음", notify=True)
         return error
 
     def send_command(self, cmd, *, check_before=False):
@@ -776,23 +1039,24 @@ class Fluke5560AConnectionManager:
             try:
                 if self.cancel_event.is_set():
                     raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
-                first_output = self._first_lan_command_check and any(
+                first_output = self._first_command_check and any(
                     re.match(r"^(?:OUT\s|OPER$)", part.strip(), re.I) for part in command.split(";"))
-                if first_output:
-                    self._first_lan_command_check = False
-                if check_before:
+                if check_before or (first_output and (self.profile.model != "5560A" or self._serial_port is not None)):
                     pending = self._query("ERR?")
                     if first_output:
-                        pending = self._check_initial_lan_error(pending)
+                        pending = self._check_initial_error(pending)
                     if not re.match(r"^\+?0\s*(?:,|$)", pending):
                         self._stop_after_command_error(pending, "출력 전 대기 중이던 오류")
+                if first_output:
+                    self._first_command_check = False
                 self._write(command)
-                if self._query("*OPC?", timeout=self.operation_timeout) != "1":
-                    raise InstrumentProtocolError("명령 처리 완료를 확인하지 못했습니다.")
+                completion = self._query("*OPC?", timeout=self.operation_timeout)
+                if completion != "1":
+                    raise InstrumentReplyError(f"명령 처리 완료를 확인하지 못했습니다. 장비 응답: {completion[:120]}")
                 error = self._query("ERR?")
-                if self._first_lan_command_check and command.upper() == "STBY":
-                    self._first_lan_command_check = False
-                    error = self._check_initial_lan_error(error)
+                if self._first_command_check and command.upper() == "STBY":
+                    self._first_command_check = False
+                    error = self._check_initial_error(error)
                 if not re.match(r"^\+?0\s*(?:,|$)", error):
                     self._stop_after_command_error(error, command)
                 self.record_event(f"[명령 완료] {command} | {time.monotonic() - started:.3f}s", notify=True)
@@ -809,20 +1073,52 @@ class Fluke5560AConnectionManager:
         error = self.query("ERR?")
         self.record_event(f"[연결 해제 · {phase}] {error}",
                           notify=not re.match(r"^\+?0\s*(?:,|$)", error))
+        if self.profile.model == "5560A" and self._is_protection_error(error):
+            return f"{phase}: {error}"
+        return None
+
+    def _leave_5560a_power_in_standby(self):
+        if self.query("FUNC?").upper() not in ("AC_POWER", "DC_POWER"):
+            return
+        # STBY was confirmed by disconnect(); keep output disabled while leaving dual output.
+        self.send_command("OUT 0 V, 0 HZ")
+        if self.query("OPER?") != "0":
+            self.send_command("STBY")
+            raise InstrumentProtocolError("전력 설정 해제 후 본체에서 STBY를 다시 확인하세요.")
+        readback = self.query("OUT?")
+        if not re.fullmatch(r"[+-]?0+(?:\.0+)?(?:E[+-]?\d+)?\s*,\s*V\s*,\s*"
+                            r"[+-]?0+(?:\.0+)?(?:E[+-]?\d+)?\s*,\s*0\s*,\s*"
+                            r"[+-]?0+(?:\.0+)?(?:E[+-]?\d+)?", readback, re.I):
+            raise InstrumentCommandError(f"5560A 0 V DC 설정 확인 실패: {readback[:120]}. STBY 확인 완료.")
+        self.record_event("[연결 해제] 전력 설정 해제 · 0 V DC / STBY 확인", notify=True)
 
     def disconnect(self, standby=True):
         with self._lock:
             try:
                 self.cancel_event.clear()
                 if self.info.connected and standby:
-                    checked_shutdown = self.profile.model == "5560A" and self._lan_sock is not None
+                    shutdown_issues = []
+                    checked_shutdown = not self.info.interface_type.startswith("SIMULATION")
                     if not checked_shutdown or self.query("OPER?") != "0":
-                        self.send_command("STBY")
+                        try:
+                            self.send_command("STBY")
+                        except InstrumentCommandError as exc:
+                            # STBY was confirmed, so remote control can still be released.
+                            if self.profile.model == "5560A":
+                                shutdown_issues.append(str(exc))
                         if checked_shutdown and self.query("OPER?") != "0":
                             raise InstrumentProtocolError("연결 해제 전 STBY를 확인하지 못했습니다.")
                     if checked_shutdown:
                         self.record_event("[연결 해제] STBY 확인")
-                        self._record_shutdown_error("LOCAL 전")
+                        error = self._record_shutdown_error("LOCAL 전")
+                        if error:
+                            shutdown_issues.append(error)
+                        if self.profile.model == "5560A":
+                            try:
+                                self._leave_5560a_power_in_standby()
+                            except InstrumentCommandError as exc:
+                                shutdown_issues.append(str(exc))
+                                self.record_event(f"[연결 해제 · 전력 설정] {exc}", notify=True)
                     if self._transport is not None:
                         self._write("LOCAL")
                         if self._query("*OPC?", timeout=self.operation_timeout) != "1":
@@ -830,12 +1126,16 @@ class Fluke5560AConnectionManager:
                         if checked_shutdown:
                             if self.query("OPER?") != "0":
                                 raise InstrumentProtocolError("LOCAL 이후 STBY를 확인하지 못했습니다.")
-                            self._record_shutdown_error("LOCAL 후")
+                            error = self._record_shutdown_error("LOCAL 후")
+                            if error:
+                                shutdown_issues.append(error)
                     elif self._visa_inst is not None:
                         try:
-                            self._visa_inst.control_ren(pyvisa.constants.RENLineOperation.deassert_gtl)
+                            self._visa_inst.control_ren(pyvisa.constants.RENLineOperation.address_gtl)
                         except Exception:
                             pass
+                    if shutdown_issues:
+                        raise InstrumentProtocolError("연결은 해제했습니다. 장비 응답을 확인하세요.\n" + "\n".join(shutdown_issues))
             finally:
                 self._drop_connection()
 

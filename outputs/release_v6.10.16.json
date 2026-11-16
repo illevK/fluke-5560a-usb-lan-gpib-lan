@@ -1,0 +1,14 @@
+{
+  "version": "v6.10.16",
+  "exe_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "5E1D62F7BCC9C70882690CA818EF9BF7419747FBD6C505B15F4D9C8CF16E0148",
+  "source_sha256": "C7F000EB9664179B2815AC2851CA341EA618070CBC060FD6989405D75E7A7CE1",
+  "desktop_copied": [],
+  "focused_tests_passed": 13,
+  "executable_self_check": true,
+  "physical_output_tested": false,
+  "standby_live_tests": [
+    "5560A RS-232 on COM11: Terminal-to-Computer transition, STBY and 2 connect/release cycles"
+  ],
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\AppData\\Local\\Temp\\fluke-v6.10.16-build-20261116090454566\\previous-project.exe"
+}

@@ -41,6 +41,36 @@
         return value, direction, f"{value:g} {direction}"
 
     @classmethod
+    def resolve_unsigned_pf_triplets(cls, rows):
+        """Apply the spreadsheet convention only to a complete unsigned PF trio."""
+        signatures = []
+        for voltage_current, frequency, pf, nominal in rows:
+            vi = cls.VI_SLASH_PATTERN.fullmatch(voltage_current.strip())
+            freq = cls.parse_value_and_unit(frequency)
+            text = SIUnits.clean(nominal).strip()
+            if (vi is None or freq is None or SIUnits.split(freq[1])[0] != "HZ"
+                    or pf != nominal or not re.fullmatch(SIUnits.NUMBER, text) or text.startswith(("+", "-"))):
+                signatures.append(None)
+                continue
+            try:
+                value = SIUnits.number(text)
+                conditions = (SIUnits.to_base(vi[1], vi[2], "V"),
+                              SIUnits.to_base(vi[3], vi[4], "A"),
+                              SIUnits.to_base(*freq, "HZ"))
+            except ValueError:
+                signatures.append(None)
+                continue
+            signatures.append((value, conditions) if conditions[2] > 0 else None)
+
+        resolved = list(rows)
+        for index, (first, second, third) in enumerate(zip(signatures, signatures[1:], signatures[2:])):
+            if first and first[0] == 1 and second == third == (0.5, first[1]):
+                for offset, label in enumerate(("1 LEAD", "0.5 LEAD", "0.5 LAG")):
+                    row = rows[index + offset]
+                    resolved[index + offset] = (*row[:2], label, label)
+        return resolved
+
+    @classmethod
     def parse_tabular_row(cls, line):
         *conditions, nominal = (cell.strip() for cell in line.split("\t"))
         pair = None
@@ -98,8 +128,8 @@
                 raise ValueError("한 역률 행에 Lead와 Lag를 동시에 지정할 수 없습니다.")
             if nominal and directions and not re.search(r"LEAD|LAG", nominal, re.I):
                 nominal += " " + next(iter(directions))
-            _, _, display = cls.parse_power_factor(nominal)
-            return vi_condition, frequency, display, display
+            cls.parse_power_factor(nominal)
+            return vi_condition, frequency, nominal, nominal
         if quantities:
             raise ValueError("마지막 열에 단위가 있는 명목값을 입력하세요.")
         return None
@@ -129,8 +159,8 @@
             raise ValueError("한 역률 행에 Lead와 Lag를 동시에 지정할 수 없습니다.")
         if directions and not re.search(r"LEAD|LAG", tail, re.I):
             tail += " " + next(iter(directions))
-        _, _, display = cls.parse_power_factor(tail)
-        return (f"{quantities['V']} / {quantities['A']}", quantities['HZ'], display, display)
+        cls.parse_power_factor(tail)
+        return (f"{quantities['V']} / {quantities['A']}", quantities['HZ'], tail, tail)
 
     @classmethod
     def build_power_factor_step(cls, step_no, vi_cond_raw, freq_cond_raw, nominal_raw,

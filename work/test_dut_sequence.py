@@ -1,6 +1,7 @@
 """Exercise linked capture with a local calibrator peer and a controlled DUT."""
 import datetime
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -14,6 +15,9 @@ import test_communications as local
 
 class LinkedDutTests(unittest.TestCase):
     def setUp(self):
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(f.Fluke5560AConnectionManager, "_connection_history_path",
+                                       return_value=folder / "connections.json"))
         self.release_read = threading.Event()
         self.started_read = threading.Event()
         self.read_calls = []
@@ -69,6 +73,8 @@ class LinkedDutTests(unittest.TestCase):
             nonlocal error, operating
             if command.startswith("OUT "):
                 error = setting_error
+                if command.endswith("; OPER"):
+                    operating = True
             elif command == "OPER":
                 operating = True
             elif command == "STBY":
@@ -81,6 +87,106 @@ class LinkedDutTests(unittest.TestCase):
                 conn.sendall((response + "\r\n").encode())
 
         return local.FakeInstrument(handler=reply)
+
+    def test_channel_preview_is_opt_in_and_assigns_three_repeating_blocks(self):
+        self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("\n".join(("1 V", "3 V", "5 V") * 3)))
+        self.app.dut_session.profile = f.identify_dut("HIOKI,PW3390-02,TEST,V1.01")
+        self.assertEqual(f.repeated_channel_blocks(self.app.seq_steps), [[0, 1, 2], [3, 4, 5], [6, 7, 8]])
+        self.assertFalse(self.app.excel_grid.show_channels)
+        with (patch.object(f.tk.Toplevel, "wait_visibility"), patch.object(f.tk.Toplevel, "grab_set")):
+            self.app.btn_channel_assignment.invoke()
+        dialog = next(child for child in self.app.winfo_children() if isinstance(child, f.tk.Toplevel))
+        body, = dialog.winfo_children()
+        buttons = {widget.cget("text"): widget for widget in body.winfo_children()[-1].winfo_children()}
+        self.assertIsNone(self.app.seq_steps[3].dut_channel)
+        self.assertNotIn("disabled", buttons["적용"].state())
+        buttons["적용"].invoke()
+        self.assertEqual([step.dut_channel for step in self.app.seq_steps], [1]*3 + [2]*3 + [3]*3)
+        self.assertEqual(self.app.excel_grid._row_widgets[3]["labels"][10].cget("text"), "CH2")
+        self.app._handle_excel_cell_edited(3, "-", "DC", "-", "2 V")
+        self.app._recalculate_all_grid_steps()
+        self.assertEqual(self.app.seq_steps[3].dut_channel, 2)
+        self.assertEqual(f.repeated_channel_blocks(self.app.seq_steps), [])
+        self.app._apply_channel_assignment(dict.fromkeys(range(9)))
+        self.assertFalse(self.app.excel_grid.show_channels)
+
+    def test_auto_assigns_each_of_seven_measurement_types_and_frequencies(self):
+        steps = []
+        expected = []
+        for kind, unit in (("DCV", "V"), ("ACV", "V"), ("DCI", "A"), ("ACI", "A"),
+                           ("DCP", "W"), ("ACP", "W"), ("PF", "")):
+            frequencies = ("50 Hz", "60 Hz") if kind == "ACV" else (("60 Hz",) if kind.startswith("AC") or kind == "PF" else ("DC",))
+            for frequency in frequencies:
+                first = len(steps)
+                values = ("1", "0.5") if kind == "PF" else ("1", "3")
+                for target in values * 2:
+                    steps.append(f.SequenceStep(len(steps) + 1, "-", frequency, "-", f"{target} {unit}".strip(),
+                                                kind, "", ""))
+                label = f.CHANNEL_MEASUREMENT_NAMES[kind]
+                if kind == "ACV":
+                    label += f" · {frequency}"
+                expected.append((label, [[first, first + 1], [first + 2, first + 3]]))
+        # An unmatched section should not prevent the other six from being assigned.
+        self.assertEqual(f.detect_channel_sections(steps), expected)
+        steps[-1].nominal_raw = "0.8"
+        self.assertEqual(f.detect_channel_sections(steps), expected[:-1])
+
+    def test_out_of_range_rows_keep_measurement_type_for_pattern_matching(self):
+        self.app._handle_excel_paste_at_cell("1 A\n40 A\n1 A\n40 A", 0, 2, replace_all=True)
+        steps = self.app.seq_steps
+        self.assertEqual([step.func_type for step in steps], ["DCI", "OUT_OF_RANGE", "DCI", "OUT_OF_RANGE"])
+        self.assertEqual(f.detect_channel_sections(steps), [("DC 전류", [[0, 1], [2, 3]])])
+
+    def test_channel_assignment_records_from_each_row_channel(self):
+        self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("1 V\n2 V\n3 V\n4 V"))
+        self.app.dut_session.profile = f.identify_dut("HIOKI,PW3390-02,TEST,V1.01")
+        self.app.dut_session.input_channels = (1, 3)
+        self.app._apply_channel_assignment({0: 1, 1: 3, 2: 1, 3: 3})
+
+        def read(channel, **_):
+            self.read_calls.append(channel)
+            return self.sample(channel, dc_voltage=float(channel))
+
+        self.app.dut_session.read = read
+        with self.acv_peer() as peer:
+            self.connect(peer)
+            self.app._start_filtered_sequence(0, 3)
+            self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy, timeout=8)
+            self.assertEqual([cmd for cmd in peer.commands if cmd.startswith("OUT ")],
+                             [f"OUT {i} V, 0 HZ; OPER" for i in (1, 3, 2, 4)])
+        self.assertEqual(self.read_calls, [1, 1, 3, 3])
+        self.assertEqual([step.measured_raw for step in self.app.seq_steps], ["1 V", "3 V", "1 V", "3 V"])
+        self.assertEqual([step.nominal_raw for step in self.app.seq_steps], ["1 V", "2 V", "3 V", "4 V"])
+
+    def test_channel_breakpoint_resume_uses_remaining_plan_including_earlier_rows(self):
+        self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("1 V\n2 V\n3 V\n4 V"))
+        self.app.dut_session.profile = f.identify_dut("HIOKI,PW3390-02,TEST,V1.01")
+        self.app._apply_channel_assignment({0: 1, 1: 2, 2: 1, 3: 2})
+        self.app.seq_steps[0].breakpoint = True
+        self.app.dut_session.read = lambda channel, **_: self.sample(channel, dc_voltage=float(channel))
+        with self.acv_peer() as peer:
+            self.connect(peer)
+            self.app._start_filtered_sequence(0, 3)
+            self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy)
+            self.assertEqual(self.app.seq_paused_idx, 2)
+            self.assertFalse(self.app.is_operating)
+            self.app._on_seq_resume_from_paused()
+            self.pump_until(lambda: not self.app.seq_running and not self.app._io_busy, timeout=8)
+            self.assertEqual([cmd for cmd in peer.commands if cmd.startswith("OUT ")],
+                             [f"OUT {i} V, 0 HZ; OPER" for i in (1, 3, 2, 4)])
+            self.assertEqual(self.app.seq_paused_idx, -1)
+
+    def test_invalid_assigned_channel_rejects_sequence_before_output(self):
+        self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("1 V\n3 V"))
+        self.app.dut_session.input_channels = (1,)
+        self.app._apply_channel_assignment({0: 1, 1: 2})
+        with self.acv_peer() as peer:
+            self.connect(peer)
+            with patch.object(self.app, "_show_report") as report:
+                self.app._start_filtered_sequence(0, 1)
+            self.assertIn("CH2", report.call_args.args[1])
+            self.assertFalse(any(cmd.startswith("OUT ") for cmd in peer.commands))
+            self.assertFalse(self.app.seq_running)
 
     def test_dual_current_records_current_instead_of_companion_voltage(self):
         self.set_rows(f.SmartClipboardSequenceParser.build_sequence_steps("60 Hz\t1 A"))
@@ -210,7 +316,7 @@ class LinkedDutTests(unittest.TestCase):
             self.assertFalse(self.app.is_operating)
             self.assertNotIn("OUT 2 V, 0 HZ; OPER", peer.commands)
 
-    def test_standby_does_not_wait_for_dut_and_rejects_late_reply(self):
+    def test_stop_button_does_not_wait_for_dut_and_rejects_late_reply(self):
         row = f.SequenceStep(1, "-", "DC", "-", "1 V", "DCV", "OUT 1 V, 0 HZ", "1 V",
                              measured_raw="0.9 V")
         self.set_rows([row])
@@ -224,7 +330,7 @@ class LinkedDutTests(unittest.TestCase):
             self.app._on_seq_step_next()
             self.pump_until(self.started_read.is_set)
             self.app.var_operation_timeout.set("")
-            self.app._on_stby_clicked()
+            self.app.btn_seq_stop.invoke()
             self.pump_until(lambda: "STBY" in peer.commands and not self.app._io_busy, timeout=2)
             self.assertTrue(self.app._dut_busy)
             self.assertFalse(self.app.is_operating)
@@ -232,6 +338,7 @@ class LinkedDutTests(unittest.TestCase):
             self.pump_until(lambda: not self.app._dut_busy)
             self.assertEqual(row.measured_raw, "0.9 V")
             self.assertIsNone(self.app._seq_dut_pending)
+            self.assertEqual(row.status, "정지됨")
 
     def test_close_requests_standby_while_dut_is_waiting(self):
         row = f.SequenceStep(1, "-", "DC", "-", "1 V", "DCV", "OUT 1 V, 0 HZ", "1 V")

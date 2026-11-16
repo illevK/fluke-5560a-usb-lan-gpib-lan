@@ -1,0 +1,133 @@
+        def _open_channel_assignment(self):
+            if self._io_busy or self.seq_running or self._sequence_dut_reserved() or self._seq_dut_reading:
+                self.var_active_row_banner.set("측정을 멈춘 뒤 채널을 배정하세요.")
+                return
+            if not self.seq_steps:
+                self.var_active_row_banner.set("측정 조건을 붙여넣은 뒤 채널을 배정하세요.")
+                return
+
+            dialog = tk.Toplevel(self)
+            dialog.title("DUT 채널 배정")
+            dialog.transient(self)
+            dialog.resizable(False, False)
+            body = ttk.Frame(dialog, padding=14)
+            body.pack(fill="both", expand=True)
+            channels = self.dut_session.available_channels or tuple(range(1, 8))
+            start = tk.StringVar(dialog, value="1")
+            end = tk.StringVar(dialog, value=str(len(self.seq_steps)))
+            first_channel = tk.StringVar(dialog, value=str(channels[0]))
+            mode = tk.StringVar(dialog, value="7항목 자동 감지")
+            preview = tk.StringVar(dialog, value="배정할 행 범위와 첫 채널을 정한 뒤 미리보기를 누르세요.")
+            plan = {}
+
+            settings = ttk.Frame(body)
+            settings.pack(fill="x")
+            self._ui_combo(settings, mode, ("7항목 자동 감지", "한 채널 지정", "배정 해제"), 16)
+            self._ui_entry(settings, start, 5)
+            self._ui_label(settings, "–")
+            self._ui_entry(settings, end, 5)
+            self._ui_label(settings, "행")
+            self._ui_label(settings, "첫 채널")
+            channel_input = self._ui_combo(settings, first_channel, channels, 4)
+            review_frame = ttk.Frame(body)
+            review_frame.pack(fill="x", pady=12)
+            display = tk.Text(review_frame, height=11, width=62, wrap="word", relief="flat", padx=5, pady=5)
+            scroll = ttk.Scrollbar(review_frame, orient="vertical", command=display.yview)
+            scroll.pack(side="right", fill="y")
+            display.configure(yscrollcommand=scroll.set)
+            display.pack(fill="both", expand=True)
+
+            def show_preview(*_):
+                display.configure(state="normal")
+                display.delete("1.0", "end")
+                display.insert("1.0", preview.get())
+                display.configure(state="disabled")
+
+            preview.trace_add("write", show_preview)
+            actions = ttk.Frame(body)
+            actions.pack(fill="x")
+
+            def invalidate(*_):
+                plan.clear()
+                preview.set("미리보기를 눌러 배정을 확인하세요.")
+                apply_button.state(["disabled"])
+                channel_input.configure(state="disabled" if mode.get() == "배정 해제" else "readonly")
+
+            def review():
+                invalidate()
+                automatic = mode.get() == "7항목 자동 감지"
+                clear = mode.get() == "배정 해제"
+                try:
+                    left, right = int(start.get()) - 1, int(end.get())
+                    if not 0 <= left < right <= len(self.seq_steps):
+                        raise ValueError("측정표에 있는 행 범위를 입력하세요.")
+                    selection = self.seq_steps[left:right]
+                    if automatic:
+                        sections = detect_channel_sections(selection)
+                        if not sections:
+                            raise ValueError("일곱 항목에서 채널을 구분할 반복 조건을 찾지 못했습니다. ‘한 채널 지정’을 사용할 수 있습니다.")
+                    else:
+                        rows = [i for i, step in enumerate(selection) if clear or step.func_type != "BLANK"]
+                        if not rows:
+                            raise ValueError("배정할 측정 행이 없습니다.")
+                        sections = [("배정 해제" if clear else "선택 범위", [rows])]
+                    available = (None,) if clear else channels[channels.index(int(first_channel.get())):]
+                except ValueError as exc:
+                    preview.set(str(exc))
+                    return
+                descriptions = []
+                for name, blocks in sections:
+                    if len(blocks) > len(available):
+                        descriptions.append(f"{name} · 반복 {len(blocks)}개, 사용 가능한 채널 {len(available)}개 · 배정 보류")
+                        continue
+                    ranges = []
+                    for block, channel in zip(blocks, available):
+                        indices = [index + left for index in block]
+                        plan.update((index, channel) for index in indices)
+                        prefix = f"CH{channel} " if channel is not None else ""
+                        ranges.append(f"{prefix}{channel_row_ranges(indices)}행")
+                    descriptions.append(f"{name} · {' / '.join(ranges)}")
+                if automatic:
+                    rows = sum(_channel_measurement_kind(step) is not None for step in selection)
+                    if rows > len(plan):
+                        descriptions.append(f"자동 배정 보류 {rows - len(plan)}행")
+                recorded = sum(bool(self.seq_steps[index].measured_raw)
+                               for index, channel in plan.items() if self.seq_steps[index].dut_channel != channel)
+                if recorded:
+                    descriptions.append(f"측정값이 있는 {recorded}행의 채널 배정이 바뀝니다. 기존 측정값은 유지됩니다.")
+                preview.set("\n".join(descriptions))
+                if plan:
+                    apply_button.state(["!disabled"])
+
+            def apply():
+                if self._io_busy or self.seq_running or self._sequence_dut_reserved() or self._seq_dut_reading:
+                    preview.set("측정을 멈춘 뒤 다시 시도하세요.")
+                    return
+                self._apply_channel_assignment(plan)
+                dialog.destroy()
+
+            self._ui_button(actions, "미리보기", review)
+            apply_button = self._ui_button(actions, "적용", apply, "Primary.TButton")
+            apply_button.state(["disabled"])
+            self._ui_button(actions, "닫기", dialog.destroy, side="right")
+            for field in (start, end, first_channel, mode):
+                field.trace_add("write", invalidate)
+            review()
+            dialog.wait_visibility()
+            dialog.grab_set()
+
+        def _apply_channel_assignment(self, plan):
+            for index, channel in plan.items():
+                self.seq_steps[index].dut_channel = channel
+            self.excel_grid.render_steps(self.seq_steps, active_idx=self.seq_current_idx)
+            channels = sorted({channel for channel in plan.values() if channel is not None})
+            summary = " · ".join(f"CH{channel}" for channel in channels) or "채널 배정 해제"
+            self.var_active_row_banner.set(f"{summary} · {len(plan)}행 적용")
+            self._log(f"[DUT 채널 배정] {summary} · {len(plan)}행")
+
+        def _dut_channel_for_step(self, step):
+            channel = step.dut_channel if step.dut_channel is not None else int(self.var_dut_channel.get())
+            if channel not in self.dut_session.available_channels:
+                raise ValueError(f"#{step.step_no}행 CH{channel}은 연결된 DUT에서 사용할 수 없습니다.")
+            return channel
+

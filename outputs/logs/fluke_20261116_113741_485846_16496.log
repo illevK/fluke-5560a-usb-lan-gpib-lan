@@ -1,0 +1,5 @@
+[2026-11-16T11:37:43.156] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\logs\fluke_20261116_113741_485846_16496.log
+[2026-11-16T11:37:43.315] 실행 Python: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv\Scripts\python.exe | PyVISA=True | pyserial=True
+[2026-11-16T11:37:43.444] 시스템 준비 완료 (현재 내 PC IP: 감지 안 됨). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.
+[2026-11-16T11:37:47.161] [DUT 채널 배정] CH1 · CH2 · CH3 · 9행
+[2026-11-16T11:37:48.045] [DUT 채널 배정] 채널 배정 해제 · 9행

@@ -2,6 +2,7 @@ import importlib.util
 import socket
 import sys
 import threading
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -81,7 +82,7 @@ class FakeInstrument:
                             self.mode = 'COMP'
                         response = {'*IDN?': self.identity, 'COMM_MODE? TELNET': self.mode,
                                     '*OPC?': '1', 'ERR?': '0,"No error"', 'OPER?': '0',
-                                    'OUT?': '1.000 V,0 HZ'}.get(command)
+                                    'OUT?': '1.000 V,0 HZ', 'FUNC?': 'DCV'}.get(command)
                         if response is not None:
                             payload = (response + '\r\n').encode('ascii')
                             if self.fragmented:
@@ -212,8 +213,8 @@ class TransportTests(unittest.TestCase):
                 mgr.scan_and_auto_connect('LAN','127.0.0.1',server.port,timeout_sec=1)
                 mgr.disconnect()
                 self.assertFalse(mgr.info.connected)
-                self.assertEqual(server.commands[-6:],
-                                 ['OPER?', 'ERR?', 'LOCAL', '*OPC?', 'OPER?', 'ERR?'])
+                self.assertEqual(server.commands[-7:],
+                                 ['OPER?', 'ERR?', 'FUNC?', 'LOCAL', '*OPC?', 'OPER?', 'ERR?'])
                 self.assertNotIn('STBY', server.commands)
 
 
@@ -286,6 +287,9 @@ class LinkLocalReconnectTests(unittest.TestCase):
         inventory = patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=adapters)
         inventory.start()
         self.addCleanup(inventory.stop)
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(f.Fluke5560AConnectionManager, "_connection_history_path",
+                                       return_value=folder / "connections.json"))
         self.mgr = f.Fluke5560AConnectionManager()
         self.mgr.record_event = Mock()
         self.socket = Mock()
@@ -353,7 +357,8 @@ class SlowOutputTests(unittest.TestCase):
                     return
                 time.sleep(delay)
             response = {'*IDN?': IDN, 'COMM_MODE? TELNET': 'COMP', '*OPC?': '1',
-                        'OPER?': '1' if state['output'] else '0', 'OUT?': '100 V,0 HZ'}.get(command)
+                        'OPER?': '1' if state['output'] else '0', 'OUT?': '100 V,0 HZ',
+                        'FUNC?': 'DCV'}.get(command)
             if command == 'ERR?':
                 response = state['error']
                 state['error'] = '0,"No error"'
@@ -373,10 +378,74 @@ class SlowOutputTests(unittest.TestCase):
             mgr.send_command('OUT 1 V, 50 HZ; OPER')
             mgr.disconnect()
             self.assertFalse(mgr.info.connected)
-            self.assertEqual(server.commands[-10:], [
-                'OPER?', 'STBY', '*OPC?', 'ERR?', 'OPER?', 'ERR?',
+            self.assertEqual(server.commands[-11:], [
+                'OPER?', 'STBY', '*OPC?', 'ERR?', 'OPER?', 'ERR?', 'FUNC?',
                 'LOCAL', '*OPC?', 'OPER?', 'ERR?'
             ])
+
+    def test_5560a_power_disconnect_leaves_zero_dc_in_standby_before_local(self):
+        for function, shutdown_fault in (("AC_POWER", False), ("DC_POWER", False), ("AC_POWER", True)):
+            with self.subTest(function=function, shutdown_fault=shutdown_fault), self.peer() as server:
+                respond = server.handler
+                shutdown_faults = ['4100,"Compliance voltage exceeded"'] if shutdown_fault else []
+                zero_selected = False
+
+                def shutdown(conn, command):
+                    nonlocal zero_selected
+                    if command == 'FUNC?':
+                        conn.sendall((function + '\r\n').encode())
+                    elif command == 'OUT 0 V, 0 HZ':
+                        zero_selected = True
+                    elif command == 'OUT?' and zero_selected:
+                        conn.sendall(b'0.00000E+00,V,0E+00,0,0.00E+00\r\n')
+                    elif command == 'ERR?' and zero_selected and shutdown_faults:
+                        conn.sendall((shutdown_faults.pop(0) + '\r\n').encode())
+                    else:
+                        respond(conn, command)
+
+                server.handler = shutdown
+                mgr = self.connect(server)
+                output = 'OUT 120 V, 1 A, 50 HZ; OPER'
+                mgr.send_command(output, check_before=True)
+                first_shutdown_command = len(server.commands)
+                if shutdown_fault:
+                    with self.assertRaisesRegex(f.InstrumentProtocolError, '4100'):
+                        mgr.disconnect()
+                else:
+                    mgr.disconnect()
+                    self.assertIn('OUT?', server.commands[first_shutdown_command:])
+                    self.assertTrue(any('0 V DC / STBY 확인' in event for event in mgr.events.queue))
+                self.assertFalse(mgr.info.connected)
+                commands = server.commands[first_shutdown_command:]
+                self.assertEqual(commands[:8], ['OPER?', 'STBY', '*OPC?', 'ERR?', 'OPER?',
+                                                'ERR?', 'FUNC?', 'OUT 0 V, 0 HZ'])
+                self.assertGreater(commands.index('LOCAL'), commands.index('OUT 0 V, 0 HZ'))
+                self.assertNotIn('OPER', commands)
+                self.assertNotIn('*RST', commands)
+                self.assertEqual(server.commands.count(output), 1)
+
+    def test_initial_zero_reminder_does_not_mask_a_following_protection_error(self):
+        with self.peer() as server:
+            respond = server.handler
+            errors = ['-410,"Interrupted query"', '+8012,"Zero adjustment is required every 14 days"',
+                      '4100,"Compliance voltage exceeded"']
+
+            def error_queue(conn, command):
+                if command == 'ERR?' and errors:
+                    conn.sendall((errors.pop(0) + '\r\n').encode())
+                else:
+                    respond(conn, command)
+
+            server.handler = error_queue
+            mgr = self.connect(server)
+            with self.assertRaisesRegex(f.InstrumentCommandError, '4100'):
+                mgr.send_command('OUT 1 V, 0 HZ; OPER', check_before=True)
+            self.assertTrue(mgr.info.connected)
+            self.assertTrue(mgr.zero_adjustment_due)
+            self.assertFalse(any(cmd.startswith("OUT ") for cmd in server.commands))
+            self.assertNotIn('*CLS', server.commands)
+            mgr.disconnect(standby=False)
+            self.assertFalse(mgr.zero_adjustment_due)
 
     def test_reply_after_original_three_second_limit_is_accepted_once(self):
         with self.peer(delay=3.4) as server:

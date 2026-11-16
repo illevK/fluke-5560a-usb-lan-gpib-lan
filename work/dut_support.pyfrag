@@ -34,6 +34,12 @@ def identify_dut(identity):
             # A new PPA can use the documented records if its replies match.
             # Model-specific configuration and freshness checks require a profile.
             return DUTProfile("PPA", "PPA" + number, 1, ppa_common_only=True)
+    if maker in ("HIOKI", "HIOKIEE", "HIOKIEECORPORATION"):
+        if re.fullmatch(r"PW3390(?:0[1-3])?", model):
+            return DUTProfile("HIOKI", "PW3390", 4)
+        variant = re.fullmatch(r"PW6001[01]([1-6])", model)
+        if variant:
+            return DUTProfile("HIOKI", "PW6001", int(variant[1]))
     if maker.startswith("YOKOGAWA"):
         # WT3000(E) includes the option suffix in the model field of *IDN?.
         model_code = parts[1].split("-", 1)[0].strip()
@@ -55,7 +61,7 @@ def identify_dut(identity):
         if model == "WT500":
             return DUTProfile("WT", model, 3)
     raise ValueError(f"아직 등록되지 않은 DUT입니다: {identity[:160]}\n"
-                     "PPA 5xx/15xx/25xx/26xx/35xx/45xx/55xx, WT300/300E/500/1800/3000/3000E/5000 계열을 지원합니다. "
+                     "PPA 5xx/15xx/25xx/26xx/35xx/45xx/55xx, WT300/300E/500/1800/3000/3000E/5000과 Hioki PW3390/PW6001을 지원합니다. "
                      "다른 모델은 해당 통신 명령 확인 후 추가할 수 있습니다.")
 
 
@@ -94,6 +100,16 @@ class DUTSample:
     raw_values: dict[str, str] | None = None
 
 
+def _dut_gpib_key(address):
+    match = re.fullmatch(r"GPIB(\d*)::(\d{1,2})(?:::(\d{1,2}))?::INSTR", address.strip(), re.I)
+    if match is None:
+        return None
+    board, primary, secondary = match.groups()
+    if int(primary) > 30 or (secondary is not None and int(secondary) > 30):
+        return None
+    return int(board or 0), int(primary), int(secondary) if secondary is not None else None
+
+
 @dataclass(frozen=True)
 class DUTSettings:
     mode: str = "VISA"
@@ -106,9 +122,10 @@ class DUTSettings:
     parity: str = "N"
     stop_bits: int = 1
     flow: str = "NONE"
+    source_ip: str = ""
 
     def validate(self):
-        if self.mode not in ("VISA", "WT_LAN", "WT5000_TCP", "PPA_LAN", "SERIAL", "DEMO"):
+        if self.mode not in ("VISA", "GPIB", "WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN", "SERIAL", "DEMO"):
             raise ValueError("DUT 연결 방식을 선택하세요.")
         if not math.isfinite(self.timeout) or not 1 <= self.timeout <= 60:
             raise ValueError("DUT 응답 대기는 1~60초로 입력하세요.")
@@ -118,10 +135,14 @@ class DUTSettings:
             return
         if not self.address.strip() or any(c in self.address for c in '\r\n\x00'):
             raise ValueError("DUT 주소 또는 COM/VISA 리소스를 입력하세요.")
-        if self.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN"):
+        if self.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN"):
             AutoNetworkAligner.normalize_ipv4(self.address)
+        if self.mode == "HIOKI_LAN" and self.port not in (23, 3390):
+            raise ValueError("Hioki 포트는 PW3390은 3390, PW6001은 23을 입력하세요.")
         if self.mode == "PPA_LAN" and not 1 <= self.port <= 65535:
             raise ValueError("PPA 본체의 TCP 포트 번호를 입력하세요 (1~65535).")
+        if self.mode == "GPIB" and _dut_gpib_key(self.address) is None:
+            raise ValueError("GPIB 주소는 0~30 사이 번호 또는 GPIB0::4::INSTR 형식으로 입력하세요.")
         if self.mode == "SERIAL":
             if not re.fullmatch(r"COM[1-9]\d*", self.address, re.I):
                 raise ValueError("COM 포트 형식으로 입력하세요. 예: COM5")
@@ -139,6 +160,7 @@ class DUTTransport:
         self.settings, self.cancel = settings, cancel
         self.resource = self.manager = self.sock = self.serial_port = None
         self.buffer = bytearray()
+        self._gpib_remote = False
         self.eol = "\n" if settings.mode == "WT5000_TCP" else {"LF": "\n", "CRLF": "\r\n", "CR": "\r"}[settings.eol]
 
     def _check_cancel(self):
@@ -149,7 +171,7 @@ class DUTTransport:
         s = self.settings
         self._check_cancel()
         try:
-            if s.mode in ("VISA", "WT_LAN"):
+            if s.mode in ("VISA", "GPIB", "WT_LAN"):
                 if not HAS_PYVISA:
                     raise RuntimeError(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
                 self.manager = SharedVisaManager()
@@ -157,11 +179,23 @@ class DUTTransport:
                 self.resource = self.manager.open_resource(address, open_timeout=int(s.timeout * 1000))
                 self.resource.timeout = int(s.timeout * 1000)
                 self.resource.write_termination = self.eol
-                self.resource.read_termination = self.eol[-1]
+                # WT and PPA both signal GPIB EOI, while their reply terminators differ.
+                self.resource.read_termination = None if s.mode == "GPIB" else self.eol[-1]
                 self.resource.encoding = "ascii"
-            elif s.mode in ("PPA_LAN", "WT5000_TCP"):
+            elif s.mode in ("PPA_LAN", "WT5000_TCP", "HIOKI_LAN"):
                 port = 10002 if s.mode == "WT5000_TCP" else s.port
-                self.sock = socket.create_connection((s.address, port), timeout=s.timeout)
+                source = (s.source_ip, 0) if s.source_ip else None
+                try:
+                    self.sock = socket.create_connection((s.address, port), timeout=s.timeout, source_address=source)
+                except TimeoutError as exc:
+                    if s.mode == "HIOKI_LAN":
+                        raise TimeoutError(f"Hioki TCP {s.address}:{port} 연결 시간 초과. 본체 SYSTEM → Interface에서 IP를 확인하고, "
+                                           "랜선 직결이면 PC 유선 IP와 본체 IP를 같은 서브넷에 맞추세요.") from exc
+                    raise
+                except ConnectionRefusedError as exc:
+                    if s.mode == "HIOKI_LAN":
+                        raise ConnectionRefusedError(f"Hioki TCP {s.address}:{port} 연결 거부. 본체 IP·포트와 다른 원격 연결을 확인하세요.") from exc
+                    raise
             elif s.mode == "SERIAL":
                 if not HAS_PYSERIAL:
                     raise RuntimeError(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
@@ -207,8 +241,9 @@ class DUTTransport:
                 if byte in (10, 13):
                     line = bytes(self.buffer[:index])
                     del self.buffer[:index + 1]
-                    if line.strip():
-                        return line.decode('ascii').strip()
+                    text = line.decode("ascii").strip()
+                    if text and (self.serial_port is None or text.upper() != command.upper()):
+                        return text
                     break
             else:
                 remaining = deadline - time.monotonic()
@@ -228,7 +263,19 @@ class DUTTransport:
                 if len(self.buffer) > 65536:
                     raise ValueError("DUT 응답이 너무 큽니다.")
 
+    def enable_gpib_remote(self):
+        ren = pyvisa.constants.RENLineOperation
+        self.resource.control_ren(ren.asrt_address)
+        self._gpib_remote = True
+
     def close(self):
+        if self._gpib_remote:
+            try:
+                # Address only this DUT so another instrument on the bus can stay remote.
+                self.resource.control_ren(pyvisa.constants.RENLineOperation.address_gtl)
+            except Exception:
+                pass
+            self._gpib_remote = False
         self.resource = None  # Its manager lease closes this session only.
         for name in ("sock", "serial_port", "manager"):
             obj = getattr(self, name)
@@ -249,6 +296,7 @@ class DUTSession:
         self.identity = ""
         self.simulated = False
         self.input_channels = ()
+        self.settings = None
 
     @property
     def connected(self):
@@ -256,7 +304,13 @@ class DUTSession:
 
     @property
     def supports_fresh_capture(self):
-        return self.connected and self.profile.family in ("WT", "PPA") and not self.profile.ppa_common_only
+        return self.connected and self.profile.family in ("WT", "PPA", "HIOKI") and not self.profile.ppa_common_only
+
+    @property
+    def available_channels(self):
+        if not self.connected:
+            return ()
+        return self.input_channels or tuple(range(1, self.profile.channels + 1))
 
     @staticmethod
     def _wt_reply_value(reply):
@@ -295,11 +349,59 @@ class DUTSession:
                 mode_command = ":DISPLAY:MODE"
             self._set_wt_default(mode_command, "NUMERIC", "NUM", "NUME", "NUMERIC")
 
+    def _apply_hioki_defaults(self):
+        t, model = self.transport, self.profile.model
+        answer = self._wt_reply_value(t.query(":RS232:ANSWER?")).replace(";", ",").split(",", 1)[0].strip()
+        if answer != "OFF":
+            raise ValueError(f"{model} 통신 설정의 실행 확인 응답을 OFF로 설정하세요 (현재 {answer}).")
+        self._set_wt_default(":HEADER", "OFF")
+
+        channels = tuple(range(1, self.profile.channels + 1))
+        wiring = self._wt_reply_value(t.query(":MODE?"))
+        valid_wirings = {f"TYPE{index}" for index in range(1, 9 if model == "PW3390" else 8)}
+        if wiring not in valid_wirings:
+            raise ValueError(f"{model} 결선 모드를 확인할 수 없습니다: {wiring}")
+        if wiring != "TYPE1":
+            self._set_wt_default(":MODE", "TYPE1")
+
+        rate = "50 ms 기본 갱신"
+        if model == "PW6001":
+            for channel in channels:
+                actual = self._wt_reply_value(t.query(f":WIRING{channel}?"))
+                if actual != "1P2W":
+                    raise ValueError(f"PW6001 CH{channel} 1P2W 독립 결선 확인 실패: {actual}")
+            self._set_wt_default(":RATE", "50MS")
+            rate = "50 ms 갱신"
+
+        for channel in channels:
+            self._set_wt_default(f":VOLTAGE{channel}:AUTO", "ON")
+            self._set_wt_default(f":CURRENT{channel}:AUTO", "ON")
+            self._set_wt_default(f":SOURCE{channel}", f"U{channel}")
+        self.input_channels = channels
+        return f"1P2W 독립 {len(channels)}CH · {rate} · 채널별 전압 동기 · V/I 자동 범위"
+
+    def _read_hioki_fields(self, channel, metrics, include_dc, fresh):
+        items = ("Urms", "Irms", "P", "S", "Q", "PF", "FREQ")
+        if include_dc:
+            items += ("Udc", "Idc")
+            metrics += ("dc_voltage", "dc_current")
+        query = ":MEAS? " + ",".join(f"{item}{channel}" for item in items)
+        if fresh:
+            if self._wt_reply_value(self.transport.query(":HOLD?")) != "OFF":
+                raise ValueError("Hioki 본체의 HOLD 또는 PEAK HOLD를 해제하세요.")
+            query = "*WAI;" + query
+        reply = self.transport.query(query).replace(";", ",")
+        return dict(zip(metrics, dut_number_fields(reply, len(items))))
+
     def apply_measurement_defaults(self):
         """Apply only after the UI has verified the connected DUT's identity."""
         if self.transport is None:
             return ""
         t, profile = self.transport, self.profile
+        if self.settings is not None and self.settings.mode == "GPIB":
+            t.enable_gpib_remote()
+        if profile.family == "HIOKI":
+            return self._apply_hioki_defaults()
         if profile.family == "PPA":
             if profile.ppa_common_only:
                 return "PPA 공통 조회 · 장비 설정 유지 · 자동 기록은 모델 확인 필요"
@@ -379,11 +481,16 @@ class DUTSession:
             self.profile = identify_dut(self.identity)
             if settings.mode in ("PPA_LAN", "WT_LAN") and self.profile.family != settings.mode.split('_')[0]:
                 raise ValueError("선택한 LAN 방식과 DUT 제조사가 다릅니다.")
+            if settings.mode == "HIOKI_LAN":
+                expected_model = "PW3390" if settings.port == 3390 else "PW6001"
+                if self.profile.family != "HIOKI" or self.profile.model != expected_model:
+                    raise ValueError(f"선택한 LAN 포트 {settings.port}은 {expected_model}용입니다.")
             if settings.mode == "WT5000_TCP" and self.profile.model != "WT5000":
                 raise ValueError("이 TCP 연결은 WT5000용입니다. 본체 Remote Control의 Command Type을 WT5000으로 확인하세요.")
             if self.profile.ppa_common_only:
                 dut_number_fields(self.transport.query("POWER,PHASE1,RMS?"), 5)
                 dut_number_fields(self.transport.query("POWER,PHASE1,WATTS?"), 11)
+            self.settings = settings
             return self.identity
         except Exception:
             self.disconnect()
@@ -465,7 +572,7 @@ class DUTSession:
         if self.cancel.is_set():
             self.disconnect()
             raise InterruptedError("DUT 조회를 중지했습니다.")
-        channels = self.input_channels or range(1, self.profile.channels + 1)
+        channels = self.available_channels
         if channel not in channels:
             raise ValueError(f"{self.profile.model}: 사용 가능한 입력 채널은 {', '.join(map(str, channels))}입니다.")
         try:
@@ -477,6 +584,9 @@ class DUTSession:
                     raise ValueError("미리보기 값을 실제 측정표에 자동 기록할 수 없습니다.")
                 fields = {key: (value, "") for key, value in zip(metrics, (120., 1., 60., 120., 103.923048, .5, 60.))}
                 note = "미리보기 · 실제 측정값이 아닙니다."
+            elif self.profile.family == "HIOKI":
+                fields = self._read_hioki_fields(channel, metrics, include_dc, fresh)
+                note = "Hioki 새 데이터 갱신 확인 · 본체 배율 적용값" if fresh else "Hioki RMS·전력·역률 조회"
             elif self.profile.family == "PPA":
                 # A POWER result read clears DAV bit 0. Discard the current
                 # result and the next update so neither can predate the dwell.
@@ -591,5 +701,6 @@ class DUTSession:
         self.identity = ""
         self.simulated = False
         self.input_channels = ()
+        self.settings = None
 
 

@@ -1,5 +1,6 @@
 """GUI integration tests with local TCP peers only; never connect real hardware."""
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -13,6 +14,9 @@ import test_communications as peers
 
 class AsyncGuiTests(unittest.TestCase):
     def setUp(self):
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(f.Fluke5560AConnectionManager, "_connection_history_path",
+                                       return_value=folder / "connections.json"))
         adapters=[dict(idx='17',name='Test Ethernet',state='Up',wired=True,hardware=True,
                        addresses=[dict(ip='127.0.0.1',prefix=8)])]
         self.adapter_patch=patch.object(f.AutoNetworkAligner,'list_ethernet_interfaces',return_value=adapters)
@@ -25,6 +29,7 @@ class AsyncGuiTests(unittest.TestCase):
         self.app.var_lan_ip.set('127.0.0.1')
         self.app.var_timeout.set('0.2')
         self.app.var_operation_timeout.set('2')
+        self.app.var_seq_dwell_sec.set('0.2')
         self.app.var_seq_auto_oper.set(True)
         self.app.seq_steps=[f.SequenceStep(i,'-','DC','-',f'{i} V','DCV',f'OUT {i} V, 0 HZ',f'{i} V') for i in (1,2)]
         self.app.excel_grid.render_steps(self.app.seq_steps)
@@ -53,8 +58,7 @@ class AsyncGuiTests(unittest.TestCase):
         with peers.SlowOutputTests().peer(delay=.4) as server:
             self.connect(server)
             heartbeat=[]
-            self.app.seq_running=True
-            self.app._run_next_auto_step(0,1,200)
+            self.app._start_filtered_sequence(0, 1)
             self.app.after(30,lambda:heartbeat.append(True))
             self.pump_until(lambda:bool(heartbeat))
             self.assertTrue(self.app._io_busy)
@@ -71,8 +75,7 @@ class AsyncGuiTests(unittest.TestCase):
         with peers.SlowOutputTests().peer(missing=True) as server:
             self.connect(server)
             self.app.var_operation_timeout.set('1')
-            self.app.seq_running=True
-            self.app._run_next_auto_step(0,1,200)
+            self.app._start_filtered_sequence(0, 1)
             self.pump_until(lambda:not self.app._io_busy)
             self.assertFalse(self.app.seq_running)
             self.assertTrue(self.app.conn_mgr.info.connected)
@@ -114,8 +117,7 @@ class AsyncGuiTests(unittest.TestCase):
             try:
                 self.connect(server)
                 self.app.var_operation_timeout.set('5')
-                self.app.seq_running = True
-                self.app._run_next_auto_step(0, 0, 200)
+                self.app._start_filtered_sequence(0, 0)
                 self.pump_until(standby_waiting.is_set)
                 self.app._on_stby_clicked()
                 self.assertFalse(self.app.conn_mgr.cancel_event.is_set())
@@ -127,11 +129,23 @@ class AsyncGuiTests(unittest.TestCase):
             self.assertTrue(self.app.conn_mgr.info.connected)
             self.assertIn('STBY 확인 완료', self.app.var_active_row_banner.get())
 
+    def test_initial_zero_reminder_continues_first_row_and_shows_warning(self):
+        with peers.SlowOutputTests().peer(error='8012,"Zero adjustment is required every 14 days"') as server:
+            self.connect(server)
+            self.assertTrue(self.app._execute_sequence_step(0))
+            self.pump_until(lambda: not self.app._io_busy)
+            self.assertEqual(self.app.seq_steps[0].status, '▶ 측정 진행 중')
+            self.assertTrue(self.app.is_operating)
+            self.assertTrue(self.app.conn_mgr.info.connected)
+            self.assertEqual(self.app.lbl_zero_adjustment.winfo_manager(), 'pack')
+            self.assertEqual(server.commands.count('OUT 1 V, 0 HZ; OPER'), 1)
+            self.assertNotIn('STBY', server.commands)
+            self.assertEqual(self.reports, [])
+
     def test_device_error_stops_rows_but_keeps_confirmed_standby(self):
         with peers.SlowOutputTests().peer(error='4103,"Output settling timed out"') as server:
             self.connect(server)
-            self.app.seq_running=True
-            self.app._run_next_auto_step(0,1,200)
+            self.app._start_filtered_sequence(0, 1)
             self.pump_until(lambda:not self.app._io_busy)
             self.assertFalse(self.app.seq_running)
             self.assertTrue(self.app.conn_mgr.info.connected)
@@ -139,15 +153,51 @@ class AsyncGuiTests(unittest.TestCase):
             self.assertNotIn('OUT 2 V, 0 HZ; OPER',server.commands)
             self.assertIn('4103',self.app._last_report)
 
-    def test_pause_prevents_scheduling_next_row_after_late_reply(self):
+    def test_stop_button_cancels_dwell_and_confirms_standby(self):
+        with peers.SlowOutputTests().peer() as server:
+            self.connect(server)
+            self.app.var_seq_dwell_sec.set("0.3")
+            self.app._start_filtered_sequence(0, 1)
+            self.pump_until(lambda: self.app.seq_after_id is not None)
+            self.assertTrue(self.app.is_operating)
+            self.app.btn_seq_stop.invoke()
+            self.pump_until(lambda: not self.app._io_busy)
+            self.assertFalse(self.app.seq_running)
+            self.assertIsNone(self.app.seq_after_id)
+            self.assertEqual(self.app.seq_paused_idx, 0)
+            self.assertEqual(self.app.seq_steps[0].status, "정지됨")
+            self.assertFalse(self.app.is_operating)
+            self.assertEqual(server.commands.count("STBY"), 1)
+            self.assertNotIn("OUT 2 V, 0 HZ; OPER", server.commands)
+
+    def test_stop_button_aborts_pending_output_and_keeps_stopped_row(self):
+        with peers.SlowOutputTests().peer(missing=True, late_completion=True) as server:
+            self.connect(server)
+            self.app._start_filtered_sequence(0, 1)
+            self.pump_until(lambda: server.commands.count("*OPC?") == 2)
+            self.app.btn_seq_stop.invoke()
+            self.pump_until(lambda: not self.app._io_busy)
+            self.assertEqual(self.app.seq_steps[0].status, "정지됨")
+            self.assertIsNone(self.app.seq_after_id)
+            self.assertFalse(self.app.seq_running)
+            self.assertFalse(self.app.is_operating)
+            self.assertTrue(self.app.conn_mgr.info.connected)
+            self.assertEqual(server.commands.count("STBY"), 1)
+            self.assertNotIn("OUT 2 V, 0 HZ; OPER", server.commands)
+
+    def test_hold_button_keeps_output_and_prevents_next_row_after_late_reply(self):
         with peers.SlowOutputTests().peer(delay=.3) as server:
             self.connect(server)
-            self.app.seq_running=True
-            self.app._run_next_auto_step(0,1,200)
-            self.app._on_seq_stop_auto(silent=True)
-            self.pump_until(lambda:not self.app._io_busy)
+            self.app._start_filtered_sequence(0, 1)
+            self.pump_until(lambda: server.commands.count("*OPC?") == 2)
+            self.app.btn_seq_hold.invoke()
+            self.pump_until(lambda: not self.app._io_busy)
             self.assertIsNone(self.app.seq_after_id)
-            self.assertNotIn('OUT 2 V, 0 HZ; OPER',server.commands)
+            self.assertEqual(self.app.seq_steps[0].status, "출력 유지")
+            self.assertEqual(self.app.seq_paused_idx, 0)
+            self.assertNotIn("OUT 2 V, 0 HZ; OPER", server.commands)
+            self.assertNotIn("STBY", server.commands)
+            self.assertTrue(self.app.is_operating)
             self.assertTrue(self.app.conn_mgr.info.connected)
 
 

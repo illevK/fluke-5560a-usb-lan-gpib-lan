@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fluke 5560A / 5522A / 5520A / 5080A Controller v6.10.10
+Fluke 5560A / 5522A / 5520A / 5080A Controller v6.10.26
 LAN: verified physical adapter, source-IP binding, Telnet stream framing,
 strict *IDN? validation, read-only diagnosis, background connection tasks.
 USB/GPIB: PyVISA with backend diagnostics and correct interface handling.
@@ -20,11 +20,13 @@ from decimal import Decimal, DecimalException
 import sys
 import time
 import socket
+import tempfile
 import ipaddress
 import json
 import threading
 import queue
 import argparse
+from pathlib import Path
 import subprocess
 import datetime
 from dataclasses import dataclass
@@ -175,11 +177,105 @@ class SequenceStep:
     status: str = "대기"
     breakpoint: bool = False
     measured_raw: str = ""
+    dut_channel: int | None = None
 
 
 # =====================================================================
 # 2. SCPI 명령 생성 및 턴코일/전력 연산 엔진 (비즈니스 로직)
 # =====================================================================
+CHANNEL_MEASUREMENT_NAMES = {
+    "DCV": "DC 전압", "ACV": "AC 전압", "DCI": "DC 전류", "ACI": "AC 전류",
+    "DCP": "DC 전력", "ACP": "AC 전력", "PF": "역률",
+}
+
+
+def _channel_frequency(step):
+    parsed = SmartClipboardSequenceParser.parse_value_and_unit(step.freq_cond_raw)
+    if parsed:
+        base, scale = SIUnits.split(parsed[1])
+        if base == "HZ":
+            return parsed[0] * scale
+    if step.freq_cond_raw.strip().upper() in ("", "-", "DC", "0"):
+        return 0.0
+    return step.freq_cond_raw.strip()
+
+
+def _channel_measurement_kind(step):
+    if step.func_type in CHANNEL_MEASUREMENT_NAMES:
+        return step.func_type
+    if step.func_type != "OUT_OF_RANGE":
+        return None
+    target = SmartClipboardSequenceParser.parse_value_and_unit(step.nominal_raw)
+    if target is None:
+        return "PF" if SmartClipboardSequenceParser.VI_SLASH_PATTERN.fullmatch(step.vi_cond_raw.strip()) else None
+    base, _ = SIUnits.split(target[1])
+    quantity = {"V": "V", "A": "I", "W": "P"}.get(base)
+    frequency = _channel_frequency(step)
+    if quantity and isinstance(frequency, (float, int)):
+        return ("AC" if frequency > 0 else "DC") + quantity
+    return None
+
+
+def repeated_channel_blocks(steps):
+    """Return row indices for exact repeated blocks of measurement conditions."""
+    rows = [index for index, step in enumerate(steps) if step.func_type != "BLANK"]
+    keys = [
+        (_channel_measurement_kind(step), _channel_frequency(step),
+         *(re.sub(r"\s+", "", value) for value in (step.vi_cond_raw, step.pf_cond_raw, step.nominal_raw)))
+        for step in (steps[index] for index in rows)
+    ]
+    for size in range(2, len(keys) // 2 + 1):
+        if len(keys) % size:
+            continue
+        pattern = keys[:size]
+        if len(set(pattern)) > 1 and keys == pattern * (len(keys) // size):
+            return [rows[start:start + size] for start in range(0, len(rows), size)]
+    return []
+
+
+def detect_channel_sections(steps):
+    """Find a repeated sequence for each measurement type, then per frequency."""
+    by_kind = {kind: [] for kind in CHANNEL_MEASUREMENT_NAMES}
+    for index, step in enumerate(steps):
+        kind = _channel_measurement_kind(step)
+        if kind:
+            by_kind[kind].append(index)
+
+    def find_blocks(indices):
+        positions = repeated_channel_blocks([steps[i] for i in indices])
+        return [[indices[i] for i in block] for block in positions]
+
+    sections = []
+    for kind, indices in by_kind.items():
+        name = CHANNEL_MEASUREMENT_NAMES[kind]
+        blocks = find_blocks(indices)
+        if blocks:
+            sections.append((name, blocks))
+            continue
+        frequencies = {}
+        for index in indices:
+            frequencies.setdefault(_channel_frequency(steps[index]), []).append(index)
+        if len(frequencies) < 2:
+            continue
+        for frequency, subset in frequencies.items():
+            blocks = find_blocks(subset)
+            if blocks:
+                label = f"{frequency:g} Hz" if isinstance(frequency, (float, int)) and frequency else frequency or "DC"
+                sections.append((f"{name} · {label}", blocks))
+    return sections
+
+
+def channel_row_ranges(indices):
+    ranges = []
+    for index in indices:
+        row = index + 1
+        if ranges and ranges[-1][1] + 1 == row:
+            ranges[-1][1] = row
+        else:
+            ranges.append([row, row])
+    return ", ".join(str(start) if start == end else f"{start}~{end}" for start, end in ranges)
+
+
 class SIUnits:
     """User-facing SI notation. Prefix case is significant, especially m versus M."""
     PREFIXES = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "m": 1e-3,
@@ -578,6 +674,36 @@ class SmartClipboardSequenceParser:
         return value, direction, f"{value:g} {direction}"
 
     @classmethod
+    def resolve_unsigned_pf_triplets(cls, rows):
+        """Apply the spreadsheet convention only to a complete unsigned PF trio."""
+        signatures = []
+        for voltage_current, frequency, pf, nominal in rows:
+            vi = cls.VI_SLASH_PATTERN.fullmatch(voltage_current.strip())
+            freq = cls.parse_value_and_unit(frequency)
+            text = SIUnits.clean(nominal).strip()
+            if (vi is None or freq is None or SIUnits.split(freq[1])[0] != "HZ"
+                    or pf != nominal or not re.fullmatch(SIUnits.NUMBER, text) or text.startswith(("+", "-"))):
+                signatures.append(None)
+                continue
+            try:
+                value = SIUnits.number(text)
+                conditions = (SIUnits.to_base(vi[1], vi[2], "V"),
+                              SIUnits.to_base(vi[3], vi[4], "A"),
+                              SIUnits.to_base(*freq, "HZ"))
+            except ValueError:
+                signatures.append(None)
+                continue
+            signatures.append((value, conditions) if conditions[2] > 0 else None)
+
+        resolved = list(rows)
+        for index, (first, second, third) in enumerate(zip(signatures, signatures[1:], signatures[2:])):
+            if first and first[0] == 1 and second == third == (0.5, first[1]):
+                for offset, label in enumerate(("1 LEAD", "0.5 LEAD", "0.5 LAG")):
+                    row = rows[index + offset]
+                    resolved[index + offset] = (*row[:2], label, label)
+        return resolved
+
+    @classmethod
     def parse_tabular_row(cls, line):
         *conditions, nominal = (cell.strip() for cell in line.split("\t"))
         pair = None
@@ -635,8 +761,8 @@ class SmartClipboardSequenceParser:
                 raise ValueError("한 역률 행에 Lead와 Lag를 동시에 지정할 수 없습니다.")
             if nominal and directions and not re.search(r"LEAD|LAG", nominal, re.I):
                 nominal += " " + next(iter(directions))
-            _, _, display = cls.parse_power_factor(nominal)
-            return vi_condition, frequency, display, display
+            cls.parse_power_factor(nominal)
+            return vi_condition, frequency, nominal, nominal
         if quantities:
             raise ValueError("마지막 열에 단위가 있는 명목값을 입력하세요.")
         return None
@@ -666,8 +792,8 @@ class SmartClipboardSequenceParser:
             raise ValueError("한 역률 행에 Lead와 Lag를 동시에 지정할 수 없습니다.")
         if directions and not re.search(r"LEAD|LAG", tail, re.I):
             tail += " " + next(iter(directions))
-        _, _, display = cls.parse_power_factor(tail)
-        return (f"{quantities['V']} / {quantities['A']}", quantities['HZ'], display, display)
+        cls.parse_power_factor(tail)
+        return (f"{quantities['V']} / {quantities['A']}", quantities['HZ'], tail, tail)
 
     @classmethod
     def build_power_factor_step(cls, step_no, vi_cond_raw, freq_cond_raw, nominal_raw,
@@ -958,8 +1084,8 @@ class SmartClipboardSequenceParser:
                 return (vi_cond_str, freq_str, pf_str, power_nom_str)
             if pf_match and any(
                     SIUnits.split(token[2])[0] == "HZ" for token in cls.TOKEN_FINDER.finditer(rest)):
-                _, _, display = cls.parse_power_factor(pf_str)
-                return vi_cond_str, freq_str, display, display
+                cls.parse_power_factor(pf_str)
+                return vi_cond_str, freq_str, pf_str, pf_str
             dc = cls.parse_dc_power_row(vi_cond_str)
             return vi_cond_str, freq_str, "1", dc[3]
 
@@ -1006,11 +1132,8 @@ class SmartClipboardSequenceParser:
         steps: List[SequenceStep] = []
         step_counter = 0
 
-        for raw_line in raw_text.splitlines():
-            parsed_fields = cls.parse_line_to_fields(raw_line)
-            if parsed_fields is None:
-                continue
-            vi_c, fq_c, pf_c, nom_c = parsed_fields
+        rows = [fields for line in raw_text.splitlines() if (fields := cls.parse_line_to_fields(line)) is not None]
+        for vi_c, fq_c, pf_c, nom_c in cls.resolve_unsigned_pf_triplets(rows):
             step_counter += 1
             steps.append(
                 cls.build_Single_step_from_fields(
@@ -1413,6 +1536,14 @@ class InstrumentProtocolError(ConnectionError):
     pass
 
 
+class InstrumentReplyError(InstrumentProtocolError):
+    """A complete line was received, but it was not the expected reply."""
+
+
+class InstrumentResponseTimeout(TimeoutError):
+    """The command was sent, but its complete response did not arrive."""
+
+
 class OperationCancelled(RuntimeError):
     pass
 
@@ -1440,7 +1571,7 @@ def close_lan_socket(sock):
 class TelnetLineTransport:
     """Incremental Telnet parser + CR/LF framing; one transaction at a time."""
 
-    PROMPT = re.compile(r"^(?:(?:5[0-9]{3}A)?\s*[=!?>]>?\s*)", re.I)
+    PROMPT = re.compile(r"^(?:[0-9]+>\s*|(?:5[0-9]{3}A)?\s*[=!?>]>?\s*)", re.I)
 
     def __init__(self, sock, timeout=3.0, eol="CRLF"):
         self.sock = sock
@@ -1489,11 +1620,12 @@ class TelnetLineTransport:
     def clean_line(cls, line, command):
         text = line.decode("ascii", errors="replace").strip()
         if re.match(r"^[!?]>", text):
-            raise InstrumentProtocolError(f"장비 오류 응답: {text}")
+            raise InstrumentReplyError(f"장비 오류 응답: {text}")
         text = cls.PROMPT.sub("", text).strip()
         return "" if text.upper() == command.upper() else text
 
-    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None, *, expected_reply=None):
+    def query(self, command, identity=False, timeout=None, cancel_event=None, progress=None, *,
+              expected_reply=None, skip_terminal_interruption=False):
         limit = self.timeout if timeout is None else timeout
         # One query, one reply. Never retransmit OPC while a reply is pending.
         self.write(command)
@@ -1509,9 +1641,19 @@ class TelnetLineTransport:
                     break
                 line = bytes(self.buffer[:match.start()])
                 del self.buffer[:match.end()]
-                text = self.clean_line(line, command)
+                try:
+                    text = self.clean_line(line, command)
+                except InstrumentReplyError:
+                    if expected_reply is None:
+                        raise
+                    continue
                 if not text or text.upper() in self._recent_writes:
                     continue
+                if re.match(r"^Fault\s+-?\d+\s*:", text, re.I):
+                    if expected_reply is not None or (skip_terminal_interruption
+                            and re.fullmatch(r"Fault\s+-410\s*:\s*488\.2 interrupted query", text, re.I)):
+                        continue
+                    raise InstrumentReplyError(f"장비 오류 응답: {text}")
                 self.last_received = text
                 # Initial banners/prompts are not identification responses.
                 if identity and len(text.split(",")) < 4:
@@ -1522,7 +1664,7 @@ class TelnetLineTransport:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 partial = bytes(self.buffer[-120:]).decode("ascii", errors="replace")
-                raise TimeoutError(f"{command}: {limit:g}초 동안 완전한 응답 없음 (부분 수신: {partial or '없음'}).")
+                raise InstrumentResponseTimeout(f"{command}: {limit:g}초 동안 완전한 응답 없음 (부분 수신: {partial or '없음'}).")
             if progress and time.monotonic() >= next_progress:
                 progress(time.monotonic() - started, limit)
                 next_progress = time.monotonic() + 1
@@ -1577,6 +1719,18 @@ class SerialEndpoint:
 
 
 class SerialLineTransport(TelnetLineTransport):
+    reply_gap = 0.0
+
+    def query(self, *args, **kwargs):
+        reply = super().query(*args, **kwargs)
+        if self.reply_gap:
+            cancel = kwargs.get("cancel_event")
+            if cancel is None:
+                time.sleep(self.reply_gap)
+            elif cancel.wait(self.reply_gap):
+                raise OperationCancelled("사용자가 현재 응답 대기를 중단했습니다.")
+        return reply
+
     def _feed(self, raw):
         # RS-232 is not Telnet. Never send IAC negotiation bytes to a serial port.
         self.buffer.extend(raw)
@@ -1620,6 +1774,12 @@ def identify_dut(identity):
             # A new PPA can use the documented records if its replies match.
             # Model-specific configuration and freshness checks require a profile.
             return DUTProfile("PPA", "PPA" + number, 1, ppa_common_only=True)
+    if maker in ("HIOKI", "HIOKIEE", "HIOKIEECORPORATION"):
+        if re.fullmatch(r"PW3390(?:0[1-3])?", model):
+            return DUTProfile("HIOKI", "PW3390", 4)
+        variant = re.fullmatch(r"PW6001[01]([1-6])", model)
+        if variant:
+            return DUTProfile("HIOKI", "PW6001", int(variant[1]))
     if maker.startswith("YOKOGAWA"):
         # WT3000(E) includes the option suffix in the model field of *IDN?.
         model_code = parts[1].split("-", 1)[0].strip()
@@ -1641,7 +1801,7 @@ def identify_dut(identity):
         if model == "WT500":
             return DUTProfile("WT", model, 3)
     raise ValueError(f"아직 등록되지 않은 DUT입니다: {identity[:160]}\n"
-                     "PPA 5xx/15xx/25xx/26xx/35xx/45xx/55xx, WT300/300E/500/1800/3000/3000E/5000 계열을 지원합니다. "
+                     "PPA 5xx/15xx/25xx/26xx/35xx/45xx/55xx, WT300/300E/500/1800/3000/3000E/5000과 Hioki PW3390/PW6001을 지원합니다. "
                      "다른 모델은 해당 통신 명령 확인 후 추가할 수 있습니다.")
 
 
@@ -1680,6 +1840,16 @@ class DUTSample:
     raw_values: dict[str, str] | None = None
 
 
+def _dut_gpib_key(address):
+    match = re.fullmatch(r"GPIB(\d*)::(\d{1,2})(?:::(\d{1,2}))?::INSTR", address.strip(), re.I)
+    if match is None:
+        return None
+    board, primary, secondary = match.groups()
+    if int(primary) > 30 or (secondary is not None and int(secondary) > 30):
+        return None
+    return int(board or 0), int(primary), int(secondary) if secondary is not None else None
+
+
 @dataclass(frozen=True)
 class DUTSettings:
     mode: str = "VISA"
@@ -1692,9 +1862,10 @@ class DUTSettings:
     parity: str = "N"
     stop_bits: int = 1
     flow: str = "NONE"
+    source_ip: str = ""
 
     def validate(self):
-        if self.mode not in ("VISA", "WT_LAN", "WT5000_TCP", "PPA_LAN", "SERIAL", "DEMO"):
+        if self.mode not in ("VISA", "GPIB", "WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN", "SERIAL", "DEMO"):
             raise ValueError("DUT 연결 방식을 선택하세요.")
         if not math.isfinite(self.timeout) or not 1 <= self.timeout <= 60:
             raise ValueError("DUT 응답 대기는 1~60초로 입력하세요.")
@@ -1704,10 +1875,14 @@ class DUTSettings:
             return
         if not self.address.strip() or any(c in self.address for c in '\r\n\x00'):
             raise ValueError("DUT 주소 또는 COM/VISA 리소스를 입력하세요.")
-        if self.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN"):
+        if self.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN"):
             AutoNetworkAligner.normalize_ipv4(self.address)
+        if self.mode == "HIOKI_LAN" and self.port not in (23, 3390):
+            raise ValueError("Hioki 포트는 PW3390은 3390, PW6001은 23을 입력하세요.")
         if self.mode == "PPA_LAN" and not 1 <= self.port <= 65535:
             raise ValueError("PPA 본체의 TCP 포트 번호를 입력하세요 (1~65535).")
+        if self.mode == "GPIB" and _dut_gpib_key(self.address) is None:
+            raise ValueError("GPIB 주소는 0~30 사이 번호 또는 GPIB0::4::INSTR 형식으로 입력하세요.")
         if self.mode == "SERIAL":
             if not re.fullmatch(r"COM[1-9]\d*", self.address, re.I):
                 raise ValueError("COM 포트 형식으로 입력하세요. 예: COM5")
@@ -1725,6 +1900,7 @@ class DUTTransport:
         self.settings, self.cancel = settings, cancel
         self.resource = self.manager = self.sock = self.serial_port = None
         self.buffer = bytearray()
+        self._gpib_remote = False
         self.eol = "\n" if settings.mode == "WT5000_TCP" else {"LF": "\n", "CRLF": "\r\n", "CR": "\r"}[settings.eol]
 
     def _check_cancel(self):
@@ -1735,7 +1911,7 @@ class DUTTransport:
         s = self.settings
         self._check_cancel()
         try:
-            if s.mode in ("VISA", "WT_LAN"):
+            if s.mode in ("VISA", "GPIB", "WT_LAN"):
                 if not HAS_PYVISA:
                     raise RuntimeError(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
                 self.manager = SharedVisaManager()
@@ -1743,11 +1919,23 @@ class DUTTransport:
                 self.resource = self.manager.open_resource(address, open_timeout=int(s.timeout * 1000))
                 self.resource.timeout = int(s.timeout * 1000)
                 self.resource.write_termination = self.eol
-                self.resource.read_termination = self.eol[-1]
+                # WT and PPA both signal GPIB EOI, while their reply terminators differ.
+                self.resource.read_termination = None if s.mode == "GPIB" else self.eol[-1]
                 self.resource.encoding = "ascii"
-            elif s.mode in ("PPA_LAN", "WT5000_TCP"):
+            elif s.mode in ("PPA_LAN", "WT5000_TCP", "HIOKI_LAN"):
                 port = 10002 if s.mode == "WT5000_TCP" else s.port
-                self.sock = socket.create_connection((s.address, port), timeout=s.timeout)
+                source = (s.source_ip, 0) if s.source_ip else None
+                try:
+                    self.sock = socket.create_connection((s.address, port), timeout=s.timeout, source_address=source)
+                except TimeoutError as exc:
+                    if s.mode == "HIOKI_LAN":
+                        raise TimeoutError(f"Hioki TCP {s.address}:{port} 연결 시간 초과. 본체 SYSTEM → Interface에서 IP를 확인하고, "
+                                           "랜선 직결이면 PC 유선 IP와 본체 IP를 같은 서브넷에 맞추세요.") from exc
+                    raise
+                except ConnectionRefusedError as exc:
+                    if s.mode == "HIOKI_LAN":
+                        raise ConnectionRefusedError(f"Hioki TCP {s.address}:{port} 연결 거부. 본체 IP·포트와 다른 원격 연결을 확인하세요.") from exc
+                    raise
             elif s.mode == "SERIAL":
                 if not HAS_PYSERIAL:
                     raise RuntimeError(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
@@ -1793,8 +1981,9 @@ class DUTTransport:
                 if byte in (10, 13):
                     line = bytes(self.buffer[:index])
                     del self.buffer[:index + 1]
-                    if line.strip():
-                        return line.decode('ascii').strip()
+                    text = line.decode("ascii").strip()
+                    if text and (self.serial_port is None or text.upper() != command.upper()):
+                        return text
                     break
             else:
                 remaining = deadline - time.monotonic()
@@ -1814,7 +2003,19 @@ class DUTTransport:
                 if len(self.buffer) > 65536:
                     raise ValueError("DUT 응답이 너무 큽니다.")
 
+    def enable_gpib_remote(self):
+        ren = pyvisa.constants.RENLineOperation
+        self.resource.control_ren(ren.asrt_address)
+        self._gpib_remote = True
+
     def close(self):
+        if self._gpib_remote:
+            try:
+                # Address only this DUT so another instrument on the bus can stay remote.
+                self.resource.control_ren(pyvisa.constants.RENLineOperation.address_gtl)
+            except Exception:
+                pass
+            self._gpib_remote = False
         self.resource = None  # Its manager lease closes this session only.
         for name in ("sock", "serial_port", "manager"):
             obj = getattr(self, name)
@@ -1835,6 +2036,7 @@ class DUTSession:
         self.identity = ""
         self.simulated = False
         self.input_channels = ()
+        self.settings = None
 
     @property
     def connected(self):
@@ -1842,7 +2044,13 @@ class DUTSession:
 
     @property
     def supports_fresh_capture(self):
-        return self.connected and self.profile.family in ("WT", "PPA") and not self.profile.ppa_common_only
+        return self.connected and self.profile.family in ("WT", "PPA", "HIOKI") and not self.profile.ppa_common_only
+
+    @property
+    def available_channels(self):
+        if not self.connected:
+            return ()
+        return self.input_channels or tuple(range(1, self.profile.channels + 1))
 
     @staticmethod
     def _wt_reply_value(reply):
@@ -1881,11 +2089,59 @@ class DUTSession:
                 mode_command = ":DISPLAY:MODE"
             self._set_wt_default(mode_command, "NUMERIC", "NUM", "NUME", "NUMERIC")
 
+    def _apply_hioki_defaults(self):
+        t, model = self.transport, self.profile.model
+        answer = self._wt_reply_value(t.query(":RS232:ANSWER?")).replace(";", ",").split(",", 1)[0].strip()
+        if answer != "OFF":
+            raise ValueError(f"{model} 통신 설정의 실행 확인 응답을 OFF로 설정하세요 (현재 {answer}).")
+        self._set_wt_default(":HEADER", "OFF")
+
+        channels = tuple(range(1, self.profile.channels + 1))
+        wiring = self._wt_reply_value(t.query(":MODE?"))
+        valid_wirings = {f"TYPE{index}" for index in range(1, 9 if model == "PW3390" else 8)}
+        if wiring not in valid_wirings:
+            raise ValueError(f"{model} 결선 모드를 확인할 수 없습니다: {wiring}")
+        if wiring != "TYPE1":
+            self._set_wt_default(":MODE", "TYPE1")
+
+        rate = "50 ms 기본 갱신"
+        if model == "PW6001":
+            for channel in channels:
+                actual = self._wt_reply_value(t.query(f":WIRING{channel}?"))
+                if actual != "1P2W":
+                    raise ValueError(f"PW6001 CH{channel} 1P2W 독립 결선 확인 실패: {actual}")
+            self._set_wt_default(":RATE", "50MS")
+            rate = "50 ms 갱신"
+
+        for channel in channels:
+            self._set_wt_default(f":VOLTAGE{channel}:AUTO", "ON")
+            self._set_wt_default(f":CURRENT{channel}:AUTO", "ON")
+            self._set_wt_default(f":SOURCE{channel}", f"U{channel}")
+        self.input_channels = channels
+        return f"1P2W 독립 {len(channels)}CH · {rate} · 채널별 전압 동기 · V/I 자동 범위"
+
+    def _read_hioki_fields(self, channel, metrics, include_dc, fresh):
+        items = ("Urms", "Irms", "P", "S", "Q", "PF", "FREQ")
+        if include_dc:
+            items += ("Udc", "Idc")
+            metrics += ("dc_voltage", "dc_current")
+        query = ":MEAS? " + ",".join(f"{item}{channel}" for item in items)
+        if fresh:
+            if self._wt_reply_value(self.transport.query(":HOLD?")) != "OFF":
+                raise ValueError("Hioki 본체의 HOLD 또는 PEAK HOLD를 해제하세요.")
+            query = "*WAI;" + query
+        reply = self.transport.query(query).replace(";", ",")
+        return dict(zip(metrics, dut_number_fields(reply, len(items))))
+
     def apply_measurement_defaults(self):
         """Apply only after the UI has verified the connected DUT's identity."""
         if self.transport is None:
             return ""
         t, profile = self.transport, self.profile
+        if self.settings is not None and self.settings.mode == "GPIB":
+            t.enable_gpib_remote()
+        if profile.family == "HIOKI":
+            return self._apply_hioki_defaults()
         if profile.family == "PPA":
             if profile.ppa_common_only:
                 return "PPA 공통 조회 · 장비 설정 유지 · 자동 기록은 모델 확인 필요"
@@ -1965,11 +2221,16 @@ class DUTSession:
             self.profile = identify_dut(self.identity)
             if settings.mode in ("PPA_LAN", "WT_LAN") and self.profile.family != settings.mode.split('_')[0]:
                 raise ValueError("선택한 LAN 방식과 DUT 제조사가 다릅니다.")
+            if settings.mode == "HIOKI_LAN":
+                expected_model = "PW3390" if settings.port == 3390 else "PW6001"
+                if self.profile.family != "HIOKI" or self.profile.model != expected_model:
+                    raise ValueError(f"선택한 LAN 포트 {settings.port}은 {expected_model}용입니다.")
             if settings.mode == "WT5000_TCP" and self.profile.model != "WT5000":
                 raise ValueError("이 TCP 연결은 WT5000용입니다. 본체 Remote Control의 Command Type을 WT5000으로 확인하세요.")
             if self.profile.ppa_common_only:
                 dut_number_fields(self.transport.query("POWER,PHASE1,RMS?"), 5)
                 dut_number_fields(self.transport.query("POWER,PHASE1,WATTS?"), 11)
+            self.settings = settings
             return self.identity
         except Exception:
             self.disconnect()
@@ -2051,7 +2312,7 @@ class DUTSession:
         if self.cancel.is_set():
             self.disconnect()
             raise InterruptedError("DUT 조회를 중지했습니다.")
-        channels = self.input_channels or range(1, self.profile.channels + 1)
+        channels = self.available_channels
         if channel not in channels:
             raise ValueError(f"{self.profile.model}: 사용 가능한 입력 채널은 {', '.join(map(str, channels))}입니다.")
         try:
@@ -2063,6 +2324,9 @@ class DUTSession:
                     raise ValueError("미리보기 값을 실제 측정표에 자동 기록할 수 없습니다.")
                 fields = {key: (value, "") for key, value in zip(metrics, (120., 1., 60., 120., 103.923048, .5, 60.))}
                 note = "미리보기 · 실제 측정값이 아닙니다."
+            elif self.profile.family == "HIOKI":
+                fields = self._read_hioki_fields(channel, metrics, include_dc, fresh)
+                note = "Hioki 새 데이터 갱신 확인 · 본체 배율 적용값" if fresh else "Hioki RMS·전력·역률 조회"
             elif self.profile.family == "PPA":
                 # A POWER result read clears DAV bit 0. Discard the current
                 # result and the next update so neither can predate the dwell.
@@ -2177,6 +2441,7 @@ class DUTSession:
         self.identity = ""
         self.simulated = False
         self.input_channels = ()
+        self.settings = None
 
 import select
 import struct
@@ -2283,6 +2548,8 @@ def _dut_discovery_usb_key(resource):
 
 
 def _dut_discovery_ipv4(address):
+    if not isinstance(address, str):
+        return None
     try:
         ip = ipaddress.IPv4Address(AutoNetworkAligner.normalize_ipv4(address))
     except ValueError:
@@ -2297,6 +2564,25 @@ def _dut_discovery_resource_ip(resource):
     return None
 
 
+def _dut_wired_source(host, adapters):
+    target = ipaddress.IPv4Address(host)
+    interfaces = []
+    for adapter in adapters:
+        if adapter.get("state") != "Up" or not adapter.get("wired") or not adapter.get("hardware", True):
+            continue
+        for address in adapter.get("addresses") or ():
+            try:
+                interfaces.append(ipaddress.IPv4Interface(f"{address['ip']}/{address['prefix']}"))
+            except (KeyError, ValueError):
+                continue
+    if any(target == item.ip for item in interfaces):
+        return ""
+    networks = (item for item in interfaces if target in item.network
+                and target not in (item.network.network_address, item.network.broadcast_address))
+    best = max(networks, key=lambda item: item.network.prefixlen, default=None)
+    return str(best.ip) if best else ""
+
+
 def _dut_serial_targets(excluded_resource, diagnostics):
     if not HAS_PYSERIAL:
         diagnostics.append(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
@@ -2307,30 +2593,35 @@ def _dut_serial_targets(excluded_resource, diagnostics):
         diagnostics.append(f"COM 포트 목록을 읽지 못했습니다: {exc}")
         return {}
     excluded_com = excluded_resource.split(" / ", 1)[0]
-    addresses = sorted({port.device.upper() for port in ports if port.vid not in (None, 0x0F7E)
-                        and port.device.upper() != excluded_com})
-    diagnostics.append(f"자동 검색용 USB COM 포트 {len(addresses)}개를 확인했습니다.")
+    ports = [port for port in ports if port.vid != 0x0F7E
+             and not (getattr(port, "hwid", "") or "").upper().startswith(("BTHENUM", "BTHLE", "BTHMODEM"))
+             and "bluetooth" not in (getattr(port, "description", "") or "").casefold()]
+    ports.sort(key=lambda port: (port.vid is None, port.device.upper()))
+    addresses = list(dict.fromkeys(port.device.upper() for port in ports if port.device.upper() != excluded_com))
+    diagnostics.append(f"자동 검색용 COM 포트 {len(addresses)}개를 확인했습니다.")
     # PPA RS232 / USB virtual COM, then common serial defaults. Other
-    # settings and onboard serial ports remain available via manual COM.
+    # settings remain available via manual COM.
     presets = ((19200, "RTS/CTS", "CR"), (19200, "NONE", "CR"),
+               (38400, "RTS/CTS", "CRLF"), (9600, "XON/XOFF", "LF"),
                (9600, "RTS/CTS", "CRLF"), (9600, "NONE", "CRLF"))
     return {(address, baud, flow): DUTSettings(mode="SERIAL", address=address, baudrate=baud, flow=flow, eol=eol)
             for baud, flow, eol in presets for address in addresses}
 
 
 def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=True, include_lan=True,
-                  include_serial=False, adapters=None):
+                  include_serial=False, include_gpib=False, adapters=None, lan_ip="", saved_lan=None):
     """Return all recognized, closed probe sessions and discovery diagnostics.
 
     Discovery never needs network configuration changes or address-range scans.
     Literal IPv4 VISA resources avoid probing DNS aliases for the calibrator.
-    Raw PPA/WT5000 sockets are considered only when explicitly listed in VISA.
+    An entered LAN address is checked using the supported DUT protocols.
+    The factory PW3390 address is tried on a matching wired subnet.
     """
     _dut_discovery_check_cancel(cancel)
     diagnostics, candidates = [], []
     resources = ()
     visa_ready = False
-    if include_usb or include_lan:
+    if include_usb or include_lan or include_gpib:
         if not HAS_PYVISA:
             diagnostics.append(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
         else:
@@ -2345,15 +2636,17 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
                 diagnostics.append(f"VISA 장치 목록을 읽지 못했습니다: {exc}")
                 if not visa_ready:
                     diagnostics.append("VISA 드라이버를 시작할 수 없습니다. NI-VISA 설치 상태를 확인하세요.")
-    if not (visa_ready or include_serial):
+    if not (visa_ready or include_serial or include_lan):
         return candidates, diagnostics
 
     _dut_discovery_check_cancel(cancel)
     excluded_resource = excluded_resource.strip().upper()
     excluded_usb = _dut_discovery_usb_key(excluded_resource)
+    excluded_gpib = _dut_gpib_key(excluded_resource)
     excluded_hosts = {_dut_discovery_ipv4(excluded_ip), _dut_discovery_resource_ip(excluded_resource)}
 
     targets = {}
+    listed_gpib = {}
     listed_lan = {}
     for resource in resources:
         resource = resource.strip()
@@ -2363,6 +2656,9 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         usb_key = _dut_discovery_usb_key(resource) if include_usb else None
         if usb_key is not None and usb_key != excluded_usb and usb_key[0] != 0x0F7E:
             targets.setdefault(("VISA", usb_key), DUTSettings(mode="VISA", address=resource, eol="LF"))
+        gpib_key = _dut_gpib_key(resource) if include_gpib else None
+        if gpib_key is not None and gpib_key != excluded_gpib:
+            listed_gpib.setdefault(gpib_key, DUTSettings(mode="GPIB", address=resource, eol="LF"))
         if not include_lan:
             continue
         match = re.fullmatch(r"TCPIP\d*::([^:]+)(?:::([^:]+))?::(INSTR|SOCKET)", upper)
@@ -2378,32 +2674,70 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
             settings = DUTSettings(mode="PPA_LAN", address=host)
         elif kind == "SOCKET" and endpoint == "10002":
             settings = DUTSettings(mode="WT5000_TCP", address=host, port=10002, eol="LF")
+        elif kind == "SOCKET" and endpoint in ("23", "3390"):
+            settings = DUTSettings(mode="HIOKI_LAN", address=host, port=int(endpoint))
         else:
             continue
-        listed_lan.setdefault((settings.mode, host), settings)
+        listed_lan.setdefault((settings.mode, host, settings.port), settings)
 
     usb_count = len(targets)
     if include_usb and visa_ready:
         diagnostics.append(f"VISA USB-TMC 후보 {usb_count}개를 확인했습니다.")
-    if include_lan and visa_ready:
+    lan_issues = []
+    entered_host = _dut_discovery_ipv4(lan_ip) if lan_ip else None
+    if include_lan:
         if adapters is None:
             adapters = AutoNetworkAligner.list_ethernet_interfaces()
             if AutoNetworkAligner.last_error:
                 diagnostics.append(AutoNetworkAligner.last_error)
-        for host in _dut_discover_vxi11(cancel, adapters, diagnostics):
-            if host not in excluded_hosts:
-                targets.setdefault(("WT_LAN", host), DUTSettings(mode="WT_LAN", address=host, eol="LF"))
+        preferred = {}
+        if entered_host and entered_host not in excluded_hosts:
+            source = _dut_wired_source(entered_host, adapters)
+            if saved_lan and _dut_discovery_ipv4(saved_lan.get("ip", "")) == entered_host:
+                try:
+                    previous = DUTSettings(mode=saved_lan["mode"], address=entered_host,
+                                           port=int(saved_lan["port"]), eol=saved_lan["eol"], source_ip=source)
+                    previous.validate()
+                except (KeyError, TypeError, ValueError):
+                    pass
+                else:
+                    if previous.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN") and (visa_ready or previous.mode != "WT_LAN"):
+                        preferred[(previous.mode, entered_host, previous.port)] = previous
+            protocols = [("HIOKI_LAN", 3390, "CRLF"), ("PPA_LAN", 10001, "CRLF"), ("HIOKI_LAN", 23, "CRLF")]
+            if visa_ready:
+                protocols.append(("WT_LAN", 10001, "LF"))
+            for mode, port, eol in protocols:
+                preferred.setdefault((mode, entered_host, port), DUTSettings(
+                    mode=mode, address=entered_host, port=port, eol=eol, source_ip=source))
+            diagnostics.append(f"DUT LAN 후보 {entered_host} 확인 · PC {source or 'Windows 기본 경로'}")
+        elif not lan_ip and "192.168.1.1" not in excluded_hosts:
+            source = _dut_wired_source("192.168.1.1", adapters)
+            if source:
+                preferred[("HIOKI_LAN", "192.168.1.1", 3390)] = DUTSettings(
+                    mode="HIOKI_LAN", address="192.168.1.1", port=3390, source_ip=source)
+        if visa_ready:
+            for host in _dut_discover_vxi11(cancel, adapters, diagnostics):
+                if host not in excluded_hosts:
+                    settings = DUTSettings(mode="WT_LAN", address=host, eol="LF")
+                    targets.setdefault(("WT_LAN", host, settings.port), settings)
         for key, settings in listed_lan.items():
             targets.setdefault(key, settings)
+        for key, settings in targets.items():
+            preferred.setdefault(key, settings)
+        targets = preferred
+    if include_gpib and visa_ready:
+        diagnostics.append(f"VISA GPIB 후보 {len(listed_gpib)}개를 확인했습니다.")
+        targets.update({("GPIB", key): settings for key, settings in listed_gpib.items()})
     if include_serial:
         targets.update(_dut_serial_targets(excluded_resource, diagnostics))
 
     deadline = time.monotonic() + 8.0
-    identified_com = set()
+    identified_addresses = set()
     attempts = 0
     for settings in targets.values():
         _dut_discovery_check_cancel(cancel)
-        if settings.mode == "SERIAL" and settings.address in identified_com:
+        address_key = settings.address if settings.mode != "VISA" else None
+        if address_key is not None and address_key in identified_addresses:
             continue
         if attempts >= 12 or time.monotonic() >= deadline:
             diagnostics.append("자동 확인 범위에 도달했습니다. 표시되지 않은 장비는 주소를 직접 입력하세요.")
@@ -2414,12 +2748,15 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         try:
             identity = probe.connect(replace(settings, timeout=1.0))
             candidates.append(DUTDiscoveryCandidate(settings, probe.profile, identity))
-            if settings.mode == "SERIAL":
-                identified_com.add(settings.address)
+            if address_key is not None:
+                identified_addresses.add(address_key)
         except InterruptedError:
             raise
         except Exception as exc:
-            diagnostics.append(f"{settings.address}: {str(exc).splitlines()[0][:160] if str(exc) else type(exc).__name__}")
+            reason = str(exc).splitlines()[0][:160] if str(exc) else type(exc).__name__
+            diagnostics.append(f"{settings.address}: {reason}")
+            if entered_host and settings.address == entered_host:
+                lan_issues.append(reason)
         finally:
             probe.disconnect()
 
@@ -2432,10 +2769,14 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
             message = ("USB 계측기는 목록에 있지만 지원 DUT로 식별되지 않았습니다. 본체의 USB 원격 설정과 통신 기록을 확인하세요."
                        if usb_count else
                        "VISA 목록에 USB DUT가 없습니다. 케이블과 본체의 USB 원격 설정을 확인하세요.")
-        if include_lan and visa_ready:
-            message += (" " if message else "") + "LAN에서 찾지 못한 DUT는 연결 방식을 선택해 IP를 직접 입력하세요."
+        if include_lan:
+            message += (" " if message else "") + "LAN 연결이면 LAN 설정의 IP에 본체 주소를 입력하고 다시 연결하세요."
+        if include_gpib and visa_ready:
+            message += (" " if message else "") + "GPIB에서 찾지 못한 DUT는 본체 주소를 직접 입력하세요."
         if include_serial:
             message += (" " if message else "") + "COM에서 찾지 못한 DUT는 RS232 방식을 선택해 본체 통신 설정과 맞추세요."
+        if lan_issues:
+            message = f"LAN {entered_host}에서 장비 응답을 확인하지 못했습니다. {lan_issues[0]} {message}"
         diagnostics.append(message)
     return candidates, diagnostics
 
@@ -2445,7 +2786,8 @@ class Fluke5560AConnectionManager:
         self._visa_rm = None
         self._visa_inst = None
         self._lan_sock = None
-        self._first_lan_command_check = False
+        self._first_command_check = False
+        self.zero_adjustment_due = False
         self._transport = None
         self._serial_port = None
         self.expected_model = "5560A"
@@ -2456,6 +2798,7 @@ class Fluke5560AConnectionManager:
         self.last_error = ""
         self.source_ip = ""
         self._last_lan_source = None
+        self._connection_history = self._load_connection_history()
         self._lan_tcp_failures = []
         self.last_diagnostic = ""
         self.operation_timeout = 60.0
@@ -2463,13 +2806,94 @@ class Fluke5560AConnectionManager:
         self.events = queue.Queue()
         self._log_lock = threading.Lock()
         application_path = sys.executable if getattr(sys, "frozen", False) else __file__
-        self.log_path = os.path.join(os.path.dirname(os.path.abspath(application_path)), "logs",
-                                     f"fluke_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}.log")
+        self._log_filename = f"fluke_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}_{os.getpid()}.log"
+        self._default_log_folder = os.path.join(os.path.dirname(os.path.abspath(application_path)), "logs")
+        self.log_path = os.path.join(self._default_log_folder, self._log_filename)
+        self.log_folder_warning = ""
+        self._load_log_folder()
+
+    @staticmethod
+    def _log_settings_path():
+        user_dir = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return Path(user_dir) / "FlukeController" / "log-settings.json"
+
+    @staticmethod
+    def _connection_history_path():
+        return Fluke5560AConnectionManager._log_settings_path().with_name("connections.json")
+
+    def _load_connection_history(self):
+        try:
+            history = json.loads(self._connection_history_path().read_text(encoding="utf-8"))
+            return history if isinstance(history, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _remember_connection(self, interface, *, history_key=None, **details):
+        model = history_key or self.profile.model
+        settings = self._connection_history_path()
+        history = self._load_connection_history()
+        previous = history.get(model)
+        previous = previous if isinstance(previous, dict) else {}
+        updated = {**previous, **details, "interface": interface}
+        self._connection_history[model] = updated
+        if updated == previous:
+            return
+        history[model] = updated
+        try:
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=settings.parent) as folder:
+                staged = Path(folder) / settings.name
+                staged.write_text(json.dumps(history), encoding="utf-8")
+                staged.replace(settings)
+        except OSError as exc:
+            self.record_event(f"[연결 기록 저장 실패] {exc}", notify=True)
+
+    def _load_log_folder(self):
+        try:
+            with self._log_settings_path().open(encoding="utf-8") as settings_file:
+                settings = json.load(settings_file)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            self.log_folder_warning = "로그 폴더 설정을 읽지 못해 기본 폴더에 저장합니다."
+            return
+        folder = settings.get("log_folder") if isinstance(settings, dict) else None
+        if not isinstance(folder, str) or not os.path.isabs(folder):
+            self.log_folder_warning = "저장된 로그 폴더 경로가 올바르지 않아 기본 폴더에 저장합니다."
+            return
+        target = Path(folder) / self._log_filename
+        try:
+            # Do not recreate a missing custom folder, which may be on a disconnected drive.
+            with target.open("a", encoding="utf-8"):
+                pass
+        except (OSError, ValueError):
+            self.log_folder_warning = f"저장된 로그 폴더를 사용할 수 없어 기본 폴더에 저장합니다. ({folder})"
+            return
+        self.log_path = str(target)
+
+    def set_log_folder(self, folder):
+        target_folder = Path(folder)
+        if not target_folder.is_absolute():
+            raise ValueError("로그를 저장할 폴더의 전체 경로를 선택하세요.")
+        settings = self._log_settings_path()
+        # Verify write access before saving the preference or changing the active log.
+        with tempfile.TemporaryFile(dir=target_folder):
+            pass
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_lock:
+            with tempfile.TemporaryDirectory(dir=settings.parent, prefix="log-settings-") as staging_dir:
+                staged = Path(staging_dir) / settings.name
+                staged.write_text(json.dumps({"log_folder": str(target_folder)}, ensure_ascii=False), encoding="utf-8")
+                staged.replace(settings)
+            self.log_path = str(target_folder / self._log_filename)
+            self.log_folder_warning = ""
 
     def record_event(self, message, notify=False):
         with self._log_lock:
             try:
-                os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+                folder = os.path.dirname(self.log_path)
+                if folder == self._default_log_folder:
+                    os.makedirs(folder, exist_ok=True)
                 with open(self.log_path, "a", encoding="utf-8") as log:
                     log.write(f"[{datetime.datetime.now().isoformat(timespec='milliseconds')}] {message}\n")
             except OSError:
@@ -2492,7 +2916,8 @@ class Fluke5560AConnectionManager:
     def _validate_idn(self, value):
         fields = [part.strip() for part in value.split(",")]
         return (len(fields) >= 4 and fields[0].upper() == "FLUKE"
-                and fields[1].upper() == self.expected_model)
+                and fields[1].upper() in MODEL_PROFILES
+                and self.expected_model in ("AUTO", fields[1].upper()))
 
     def _identify(self, value, interface):
         if not self._validate_idn(value):
@@ -2507,12 +2932,14 @@ class Fluke5560AConnectionManager:
         # and prompts are handled by the reader without changing saved settings.
         if self.profile.model == "5560A":
             port = "TELNET" if interface == "LAN" else "SERIAL"
-            mode = transport.query(f"COMM_MODE? {port}").strip().upper()
+            query = f"COMM_MODE? {port}"
+            skip_interruption = interface == "RS232"
+            mode = transport.query(query, skip_terminal_interruption=skip_interruption).upper()
             if mode == "TERM":
                 transport.write(f"COMM_MODE {port}, COMP")
-                mode = transport.query(f"COMM_MODE? {port}").strip().upper()
+                mode = transport.query(query, skip_terminal_interruption=skip_interruption).upper()
             if mode != "COMP":
-                raise InstrumentProtocolError("Computer 모드 전환을 확인하지 못했습니다.")
+                raise InstrumentProtocolError(f"Computer 모드 전환을 확인하지 못했습니다. 장비 응답: {mode[:120]!r}")
         transport.write("REMOTE")
         if transport.query("*OPC?").strip() != "1":
             raise InstrumentProtocolError("REMOTE 처리 완료 응답이 올바르지 않습니다.")
@@ -2538,9 +2965,14 @@ class Fluke5560AConnectionManager:
         primary = AutoNetworkAligner.select_source_ip(adapter_idx, ip)
         candidates = list(AutoNetworkAligner.link_local_source_ips(primary, ip, adapter_idx))
         previous = self._last_lan_source
-        if previous and previous[:2] == (ip, port) and previous[2] in candidates:
-            candidates.remove(previous[2])
-            candidates.insert(0, previous[2])
+        if previous and previous[:2] == (ip, port):
+            host = previous[2]
+        else:
+            saved = self._connection_history.get(self.expected_model)
+            host = saved.get("source_ip") if isinstance(saved, dict) and (saved.get("ip"), saved.get("port")) == (ip, port) else None
+        if host and host in candidates:
+            candidates.remove(host)
+            candidates.insert(0, host)
         return tuple(candidates[:3])
 
     def _open_lan_socket(self, ip, port, timeout, source_ips):
@@ -2565,15 +2997,17 @@ class Fluke5560AConnectionManager:
                               gpib_addr=1, timeout_sec=3.0, allow_raw_socket_fallback=False,
                               source_ip="", eol="CRLF", visa_resource="", adapter_idx="",
                               operation_timeout_sec=60.0, model="5560A", serial_port="",
-                              baudrate=9600, data_bits=8, parity="N", stop_bits=1, flow_control="XON/XOFF"):
+                              baudrate=9600, data_bits=8, parity="N", stop_bits=1, flow_control="XON/XOFF",
+                              excluded_com="", excluded_gpib=None, excluded_ip="", excluded_usb=None):
         # Legacy fallback argument is intentionally ignored: IDN verification is mandatory.
         mode = preferred_mode.strip().upper()
         if mode not in ("AUTO", "USB", "GPIB", "RS232", "LAN", "LAN (SOCKET)", "LAN (VISA)", "SIMULATION"):
             raise ValueError(f"지원하지 않는 연결 모드: {mode}")
         model = model.strip().upper()
-        if model not in MODEL_PROFILES:
+        automatic_model = mode == "AUTO" and model == "AUTO"
+        if model not in MODEL_PROFILES and not automatic_model:
             raise ValueError(f"지원하지 않는 모델: {model}")
-        profile = MODEL_PROFILES[model]
+        profile = MODEL_PROFILES.get(model, MODEL_PROFILES["5560A"])
         interface = "LAN" if mode.startswith("LAN") else mode
         if interface not in ("AUTO", "SIMULATION") and interface not in profile.interfaces:
             raise ValueError(f"{model} 연결 가능: {', '.join(profile.interfaces)}. USB–RS-232 컨버터는 RS232를 선택하세요.")
@@ -2594,29 +3028,117 @@ class Fluke5560AConnectionManager:
             self.info = ConnectionInfo(True, "SIMULATION (가상 장비 모드)", f"SIM::FLUKE_{model}::INSTR", f"FLUKE,{model},SIM-9901234,1.0")
             return self.info
         errors = []
-        # Explicit LAN address in AUTO takes precedence over unrelated instruments.
-        if "LAN" in profile.interfaces and mode in ("AUTO", "LAN", "LAN (SOCKET)", "LAN (VISA)") and lan_ip.strip():
-            ip = AutoNetworkAligner.normalize_ipv4(lan_ip)
-            port = self._validate_port(lan_port)
-            source_ips = self._lan_source_ips(ip, port, source_ip, adapter_idx)
-            result = self._try_lan_socket(ip, port, timeout_sec, eol=eol, source_ips=source_ips)
-            if result.connected:
-                return result
-            errors.append(self.last_error)
-            if mode != "AUTO":
-                raise ConnectionError(self.build_lan_diagnostic_report(ip, port))
-        elif mode.startswith("LAN"):
-            raise ValueError("5560A 본체 Ethernet 화면에 표시된 현재 IP 주소를 입력하세요.")
-        if mode == "RS232" or (mode == "AUTO" and serial_port.strip()):
-            result = self._try_serial(serial_port, timeout_sec, eol, baudrate, data_bits, parity, stop_bits, flow_control)
-            if result.connected:
-                return result
-            errors.append(self.last_error)
-        if mode in ("AUTO", "USB", "GPIB") and set(profile.interfaces) & {"USB", "GPIB"}:
-            result = self._try_visa_auto_scan(mode, gpib_addr, timeout_sec, visa_resource)
-            if result.connected:
-                return result
-            errors.append(self.last_error)
+        saved = self._connection_history.get(model)
+        saved = saved if isinstance(saved, dict) else {}
+        histories = [saved]
+        if automatic_model:
+            histories = [self._connection_history[key] for key in reversed(self._connection_history)
+                         if key in MODEL_PROFILES and isinstance(self._connection_history[key], dict)]
+        lan_candidates = []
+        if "LAN" in profile.interfaces and (mode == "AUTO" or mode.startswith("LAN")):
+            inputs = [(lan_ip, lan_port)]
+            if mode == "AUTO" or not lan_ip.strip():
+                inputs.extend((item.get("ip"), item.get("port")) for item in histories)
+            if automatic_model and not lan_ip.strip() and _dut_wired_source(
+                    "169.254.1.1", AutoNetworkAligner.list_ethernet_interfaces()):
+                inputs.append(("169.254.1.1", 3490))
+            for candidate_ip, candidate_port in inputs:
+                if not isinstance(candidate_ip, str) or not candidate_ip.strip():
+                    continue
+                try:
+                    address = AutoNetworkAligner.normalize_ipv4(candidate_ip), self._validate_port(candidate_port)
+                except (TypeError, ValueError) as exc:
+                    if mode != "AUTO":
+                        raise
+                    errors.append(f"[LAN 설정] {exc}")
+                    continue
+                if address[0] != excluded_ip and address not in lan_candidates:
+                    lan_candidates.append(address)
+            if mode.startswith("LAN") and not lan_candidates:
+                raise ValueError(f"{model} 본체 Ethernet 화면의 현재 IP 주소를 입력하세요.")
+
+        serial_first = mode == "AUTO" and (
+            bool(serial_port.strip()) or any(item.get("interface") == "RS232" for item in histories)
+        )
+        if automatic_model and lan_ip.strip():
+            serial_first = False
+        order = ("RS232", "LAN") if serial_first else ("LAN", "RS232")
+        if automatic_model and not serial_first:
+            order = ("LAN", "VISA", "RS232")
+        else:
+            order += ("VISA",)
+        for interface in order:
+            if self.cancel_event.is_set():
+                raise OperationCancelled("장비 검색을 중지했습니다.")
+            if interface == "LAN":
+                for ip, port in lan_candidates:
+                    self.record_event(f"[LAN 연결 시도] {ip}:{port}", notify=True)
+                    try:
+                        source_ips = self._lan_source_ips(ip, port, source_ip, adapter_idx)
+                    except (ConnectionError, ValueError) as exc:
+                        if mode != "AUTO":
+                            raise
+                        errors.append(f"[LAN 경로] {ip}:{port} · {exc}")
+                        continue
+                    result = self._try_lan_socket(ip, port, timeout_sec, eol=eol, source_ips=source_ips)
+                    if result.connected:
+                        self.expected_model = self.profile.model
+                        self._remember_connection("LAN", ip=ip, port=port, source_ip=self.source_ip)
+                        return result
+                    errors.append(self.last_error)
+                    if mode != "AUTO":
+                        raise ConnectionError(self.build_lan_diagnostic_report(ip, port))
+            elif interface == "VISA":
+                if mode in ("AUTO", "USB", "GPIB") and set(profile.interfaces) & {"USB", "GPIB"}:
+                    result = self._try_visa_auto_scan(mode, gpib_addr, timeout_sec, visa_resource,
+                                                      excluded_gpib=excluded_gpib, excluded_usb=excluded_usb)
+                    if result.connected:
+                        self.expected_model = self.profile.model
+                        return result
+                    errors.append(self.last_error)
+            elif mode in ("AUTO", "RS232") and "RS232" in profile.interfaces:
+                if mode == "RS232" and serial_port.strip():
+                    candidates = [serial_port.strip()]
+                else:
+                    previous_com = next((item["com"] for item in histories if item.get("com")), None)
+                    candidates = self._serial_candidates(serial_port, previous_com)
+                candidates = [port for port in candidates if port.upper() != excluded_com]
+                if not candidates:
+                    errors.append("검색할 COM 포트가 없습니다. USB–RS-232 컨버터를 확인하세요." if HAS_PYSERIAL else
+                                  dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
+                configured = (baudrate, data_bits, parity, stop_bits, flow_control, eol)
+                presets = [configured]
+                if automatic_model:
+                    if eol == "CRLF":
+                        presets.insert(0, (*configured[:-1], "LF"))
+                    presets.extend((rate, 8, "N", 1, flow, ending) for rate, flow, ending in
+                                   ((9600, "XON/XOFF", "CRLF"), (9600, "NONE", "LF"), (9600, "RTS/CTS", "CRLF"),
+                                    (19200, "NONE", "LF"), (38400, "NONE", "LF"), (115200, "NONE", "LF")))
+                    for item in reversed(histories):
+                        recent = item.get("serial_settings")
+                        if isinstance(recent, (tuple, list)) and len(recent) == 6 and all(isinstance(v, (str, int)) for v in recent):
+                            preset = tuple(recent)
+                            if item is self._connection_history.get("5560A") and preset[-1] == "CRLF":
+                                preset = (*preset[:-1], "LF")
+                            presets.insert(0, preset)
+                probe_timeout = min(timeout_sec, 1.0) if automatic_model else timeout_sec
+                serial_deadline = time.monotonic() + 12
+                for speed, bits, check, stop, flow, ending in dict.fromkeys(presets):
+                    for port in candidates:
+                        if self.cancel_event.is_set():
+                            raise OperationCancelled("장비 검색을 중지했습니다.")
+                        if automatic_model and time.monotonic() >= serial_deadline:
+                            break
+                        self.record_event(f"[RS232 연결 시도] {port} / {speed} / {bits}{check}{stop} / {flow} / {ending}", notify=True)
+                        result = self._try_serial(port, probe_timeout, ending, speed, bits, check, stop, flow)
+                        if result.connected:
+                            self.expected_model = self.profile.model
+                            ending = "LF" if self.profile.model == "5560A" and ending == "CRLF" else ending
+                            self._remember_connection("RS232", com=port, serial_settings=[speed, bits, check, stop, flow, ending])
+                            if self._transport is not None:
+                                self._transport.timeout = timeout_sec
+                            return result
+                        errors.append(self.last_error)
         self.last_error = "\n".join(errors)
         raise ConnectionError(self.last_error or "연결할 인터페이스와 장비 IP/리소스를 지정하세요.")
 
@@ -2638,7 +3160,7 @@ class Fluke5560AConnectionManager:
             stage = "Computer 통신 모드 확인"
             self._prepare_remote_stream(transport, "LAN")
             self._lan_sock, self._transport = sock, transport
-            self._first_lan_command_check = self.profile.model == "5560A"
+            self._first_command_check = True
             self.info = ConnectionInfo(True, "LAN (Ethernet Socket)", f"TCPIP::{ip}::{port}::SOCKET", idn, ip, port)
             self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = ""
@@ -2659,6 +3181,17 @@ class Fluke5560AConnectionManager:
             return []
         return [(p.device, p.description) for p in serial.tools.list_ports.comports()]
 
+    @staticmethod
+    def _serial_candidates(explicit, previous):
+        candidates = [explicit.strip().upper()] if explicit.strip() else []
+        if not HAS_PYSERIAL:
+            return candidates
+        ports = [port for port in serial.tools.list_ports.comports()
+                 if not (port.hwid or "").upper().startswith(("BTHENUM", "BTHLE", "BTHMODEM"))
+                 and "bluetooth" not in (port.description or "").casefold()]
+        ports.sort(key=lambda port: (port.device.upper() != previous, port.vid is None, port.device.upper()))
+        return list(dict.fromkeys(candidates + [port.device.upper() for port in ports]))
+
     def _try_serial(self, port, timeout, eol, baudrate, data_bits, parity, stop_bits, flow_control):
         if not HAS_PYSERIAL:
             self.last_error = dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR)
@@ -2669,9 +3202,9 @@ class Fluke5560AConnectionManager:
             if not port.strip():
                 raise ValueError("장치 관리자 또는 COM 목록에서 컨버터의 COM 번호를 선택하세요.")
             rates = (300, 600, 1200, 2400, 4800, 9600)
-            if self.profile.model in ("5560A", "5080A"):
+            if self.expected_model in ("AUTO", "5560A", "5080A"):
                 rates += (19200, 38400, 57600, 115200)
-            if self.profile.model == "5560A":
+            if self.expected_model == "5560A":
                 rates = rates[5:]
             if int(baudrate) not in rates or int(data_bits) not in (7, 8) or parity not in ("N", "E", "O") or float(stop_bits) not in (1, 2):
                 raise ValueError(f"{self.profile.model}의 속도/데이터/패리티/정지 비트 설정을 확인하세요.")
@@ -2680,13 +3213,26 @@ class Fluke5560AConnectionManager:
             handle = serial.Serial(port=port.strip(), baudrate=int(baudrate), bytesize=int(data_bits),
                                    parity=parity, stopbits=float(stop_bits), timeout=.2, write_timeout=timeout,
                                    xonxoff=flow_control == "XON/XOFF", rtscts=flow_control == "RTS/CTS", dsrdtr=False)
-            transport = SerialLineTransport(SerialEndpoint(handle), timeout, eol)
+            # 5560A firmware may process CR and LF as separate input messages.
+            # In Computer mode the extra empty message can interrupt the reply.
+            input_eol = "LF" if self.expected_model == "5560A" and eol == "CRLF" else eol
+            transport = SerialLineTransport(SerialEndpoint(handle), timeout, input_eol)
+            # Allow the 5560A to finish its RS232 response before sending another
+            # command. Bench checks at 9600 baud produced -410 without this gap.
+            if self.expected_model in ("5560A", "AUTO"):
+                transport.reply_gap = .12
             stage = "장비 식별 (*IDN?)"
             idn = transport.query("*IDN?", identity=True)
             self._identify(idn, "RS232")
+            if self.profile.model == "5560A":
+                if input_eol == "CRLF":
+                    transport.terminator = b"\n"
+            else:
+                transport.reply_gap = 0.0
             stage = "원격 제어 준비"
             self._prepare_remote_stream(transport, "RS232")
             self._serial_port, self._transport = handle, transport
+            self._first_command_check = True
             self.info = ConnectionInfo(True, "RS232 (COM / USB–RS-232)",
                                        f"{port} / {baudrate} / {data_bits}{parity}{stop_bits} / {flow_control}", idn)
             self.last_error = ""
@@ -2696,12 +3242,18 @@ class Fluke5560AConnectionManager:
                 handle.close()
             self._serial_port = self._transport = None
             self.info = ConnectionInfo()
-            self.last_error = (f"[{stage}] {port}: {type(exc).__name__}: {exc}\n"
-                               "본체의 RS-232 선택, 속도/데이터/패리티/정지 비트/흐름 제어/EOL 일치 여부를 확인하세요. "
-                               "5522A·5520A는 SERIAL 1 FROM HOST에 연결하고 null-modem 결선이 필요합니다.")
+            if stage == "원격 제어 준비":
+                hint = ("장비 식별은 성공했습니다. 본체 RS-232 메뉴의 Remote Interface를 Computer로 설정한 뒤 다시 연결하세요."
+                        if self.profile.model == "5560A" else "장비 식별은 성공했습니다. 원격 제어 모드와 본체 화면을 확인하세요.")
+            else:
+                hint = ("USB–RS-232 컨버터의 COM 번호와 본체의 속도, 데이터 비트, 패리티, 정지 비트, 흐름 제어, EOL을 확인하세요.")
+                if self.expected_model in ("5520A", "5522A"):
+                    hint += " 장비의 SERIAL 1 FROM HOST에 null-modem 결선으로 연결하세요."
+            self.last_error = f"[{stage}] {port}: {type(exc).__name__}: {exc}\n{hint}"
             return self.info
 
-    def _try_visa_auto_scan(self, filter_mode, gpib_addr, timeout_sec, visa_resource=""):
+    def _try_visa_auto_scan(self, filter_mode, gpib_addr, timeout_sec, visa_resource="",
+                            *, excluded_gpib=None, excluded_usb=None):
         if not HAS_PYVISA:
             self.last_error = dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR)
             return ConnectionInfo()
@@ -2719,7 +3271,10 @@ class Fluke5560AConnectionManager:
                 if not kind.startswith(("USB", "GPIB")):
                     continue
                 interface = "USB" if kind.startswith("USB") else "GPIB"
-                if interface not in self.profile.interfaces:
+                if self.expected_model != "AUTO" and interface not in self.profile.interfaces:
+                    continue
+                if (excluded_usb is not None and _dut_discovery_usb_key(resource) == excluded_usb
+                        or excluded_gpib is not None and _dut_gpib_key(resource) == excluded_gpib):
                     continue
                 if filter_mode in ("USB", "GPIB") and not kind.startswith(filter_mode):
                     continue
@@ -2734,6 +3289,7 @@ class Fluke5560AConnectionManager:
                     if interface == "GPIB":
                         inst.control_ren(pyvisa.constants.RENLineOperation.asrt_address)
                     self._visa_inst = inst
+                    self._first_command_check = True
                     # REMOTE/LOCAL strings are Ethernet/serial commands, not GPIB/USBTMC.
                     self.info = ConnectionInfo(True, "USB (USBTMC)" if kind.startswith("USB") else "GPIB (IEEE-488.2)", resource, idn)
                     return self.info
@@ -2774,7 +3330,7 @@ class Fluke5560AConnectionManager:
         """One read-only IDN session, no REMOTE, STBY, OUT, or configuration commands."""
         if self.info.connected:
             raise ConnectionError("현재 연결을 해제한 후 LAN 진단을 실행하세요.")
-        if "LAN" not in MODEL_PROFILES[self.expected_model].interfaces:
+        if self.expected_model != "AUTO" and "LAN" not in MODEL_PROFILES[self.expected_model].interfaces:
             raise ValueError(f"{self.expected_model}은 기본 LAN 포트를 지원하지 않습니다.")
         if not math.isfinite(timeout) or not 0.2 <= timeout <= 60:
             raise ValueError("통신 제한 시간은 0.2~60초 사이여야 합니다.")
@@ -2787,10 +3343,10 @@ class Fluke5560AConnectionManager:
             sock = self._open_lan_socket(ip, port, timeout, source_ips)
             stage = "TCP 성공, *IDN? 확인"
             idn = TelnetLineTransport(sock, timeout, eol).query("*IDN?", identity=True)
-            if not self._validate_idn(idn):
+            if not self._validate_idn(idn) or "LAN" not in MODEL_PROFILES[idn.split(",")[1].strip().upper()].interfaces:
                 raise InstrumentProtocolError(f"다른 장비 응답: {idn}")
             self._last_lan_source = (ip, port, self.source_ip)
-            self.last_error = f"[진단 성공] TCP 및 {self.expected_model} 식별 확인: {idn}"
+            self.last_error = f"[진단 성공] TCP 및 장비 식별 확인: {idn}"
         except Exception as exc:
             self.last_error = f"[{stage}] {type(exc).__name__}: {exc}"
         finally:
@@ -2811,7 +3367,8 @@ class Fluke5560AConnectionManager:
                 except Exception:
                     pass
         self._visa_inst = self._visa_rm = self._lan_sock = self._transport = None
-        self._first_lan_command_check = False
+        self._first_command_check = False
+        self.zero_adjustment_due = False
         self._serial_port = None
         self.info = ConnectionInfo()
 
@@ -2838,6 +3395,12 @@ class Fluke5560AConnectionManager:
         else:
             raise ConnectionError("유효한 통신 핸들이 없습니다.")
         self.record_event(f"RX << {response} | {command} | {time.monotonic() - started:.3f}s")
+        if command.upper() == "ERR?":
+            if not re.match(r"^(?:[+-]?\d+\s*,|\+?0$)", response):
+                raise InstrumentReplyError(f"장비 오류 응답 형식이 올바르지 않습니다: {response[:120]}")
+            if self.profile.model == "5560A" and re.match(r"^\+?8012\s*,", response):
+                self.zero_adjustment_due = True
+                self.record_event(f"[영점 조정 필요] {response} · 5560A 본체에서 Zero Adjustment를 실행하세요.", notify=True)
         return response
 
     def _write(self, command):
@@ -2858,14 +3421,12 @@ class Fluke5560AConnectionManager:
         self.record_event(f"RX << {self.info.idn_string} | STBY 복구")
         if self._query("OPER?", timeout=max(.001, deadline - time.monotonic()), cancellable=False) != "0":
             raise InstrumentProtocolError("본체의 STBY 상태를 확인하지 못했습니다.")
-        error = self._query("ERR?", timeout=max(.001, deadline - time.monotonic()), cancellable=False)
-        if not re.match(r"^[+-]?\d+\s*,", error):
-            raise InstrumentProtocolError(f"장비 오류 응답 형식이 올바르지 않습니다: {error[:120]}")
-        return error
+        return self._query("ERR?", timeout=max(.001, deadline - time.monotonic()), cancellable=False)
 
     def _can_recover_standby(self, exc):
-        return (self.profile.model == "5560A" and self._lan_sock is not None
-                and isinstance(exc, (OperationCancelled, TimeoutError)))
+        return (self._transport is not None
+                and (isinstance(exc, (OperationCancelled, InstrumentResponseTimeout))
+                     or (self.profile.model != "5560A" and isinstance(exc, InstrumentReplyError))))
 
     def _fail_control_session(self, context, exc, *, recover_standby=False):
         message = f"{context}: {type(exc).__name__}: {exc}"
@@ -2881,7 +3442,7 @@ class Fluke5560AConnectionManager:
                     message += f"\nSTBY 확인 실패: {recovery_error}"
                 else:
                     self.cancel_event.clear()
-                    message = f"{message}\n5560A 응답 {error}. STBY 확인 완료, LAN 연결 유지. 다음 행은 실행하지 않습니다."
+                    message = f"{message}\n{self.profile.model} 응답 {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
                     self.last_error = message
                     self.record_event(message, notify=True)
                     raise InstrumentCommandError(message) from exc
@@ -2904,26 +3465,50 @@ class Fluke5560AConnectionManager:
             try:
                 return self._query(command, timeout=self.operation_timeout if command.upper() == "*OPC?" else None)
             except Exception as exc:
-                recover_standby = command.upper() in ("OPER?", "*OPC?") and self._can_recover_standby(exc)
+                recover_standby = (command.upper() in ("OPER?", "*OPC?", "CUR_POST?", "ERR?")
+                                   and self._can_recover_standby(exc))
                 self._fail_control_session(f"조회 {command}", exc, recover_standby=recover_standby)
                 raise
 
+    def _is_protection_error(self, error):
+        codes = {4008, 4100, 4102, 4202} if self.profile.model == "5560A" else {1500, 1501, 1502, 1503, 1504}
+        return int(error.partition(",")[0]) in codes
+
     def _stop_after_command_error(self, error, phase):
         # A valid error reply means the stream is still synchronized.
-        protection = (self.profile.model == "5560A" and self._lan_sock is not None
-                      and re.match(r"^\+?(4008|4100|4102|4202)\s*,", error))
-        if not protection or self._query("OPER?") != "0":
+        if not self._is_protection_error(error) or self._query("OPER?", cancellable=False) != "0":
             self._write("STBY")
             if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
                 raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
+        hint = (" COM 포트의 속도·패리티·흐름 제어와 케이블을 확인하세요."
+                if int(error.partition(",")[0]) == -361 else "")
         raise InstrumentCommandError(
             f"{self.profile.model} 오류 ({phase}): {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
+            + hint
         )
 
-    def _check_initial_lan_error(self, error):
-        if re.match(r"^-410\s*,", error) and self._query("OPER?") == "0":
-            self.record_event(f"[LAN 최초 확인] STBY에서 이전 조회 중단 응답 확인: {error}")
-            return self._query("ERR?")
+    def _check_initial_error(self, error):
+        allowed = {-410, 8012} if self.profile.model == "5560A" else {1308}
+        serial_5560 = self.profile.model == "5560A" and self._serial_port is not None
+        if serial_5560:
+            allowed.add(-361)
+        serial_recovery = False
+        for _ in range(15):  # 5560A keeps up to 15 entries in its error queue.
+            code = int(error.partition(",")[0])
+            if code not in allowed or self._query("OPER?") != "0":
+                break
+            if serial_5560 and code in (-410, -361):
+                serial_recovery = True
+            else:
+                allowed.remove(code)
+            self.record_event(f"[첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: {error}")
+            error = self._query("ERR?")
+        if serial_recovery and int(error.partition(",")[0]) == 0:
+            if self._query("*IDN?") != self.info.idn_string or self._query("OPER?") != "0":
+                raise InstrumentProtocolError("RS232 재확인 중 장비 식별 또는 STBY 상태가 일치하지 않습니다.")
+            error = self._query("ERR?")
+            if int(error.partition(",")[0]) == 0:
+                self.record_event("[RS232 복구 확인] 동일 장비 · STBY · 오류 없음", notify=True)
         return error
 
     def send_command(self, cmd, *, check_before=False):
@@ -2949,23 +3534,24 @@ class Fluke5560AConnectionManager:
             try:
                 if self.cancel_event.is_set():
                     raise OperationCancelled("사용자가 현재 작업을 중단했습니다.")
-                first_output = self._first_lan_command_check and any(
+                first_output = self._first_command_check and any(
                     re.match(r"^(?:OUT\s|OPER$)", part.strip(), re.I) for part in command.split(";"))
-                if first_output:
-                    self._first_lan_command_check = False
-                if check_before:
+                if check_before or (first_output and (self.profile.model != "5560A" or self._serial_port is not None)):
                     pending = self._query("ERR?")
                     if first_output:
-                        pending = self._check_initial_lan_error(pending)
+                        pending = self._check_initial_error(pending)
                     if not re.match(r"^\+?0\s*(?:,|$)", pending):
                         self._stop_after_command_error(pending, "출력 전 대기 중이던 오류")
+                if first_output:
+                    self._first_command_check = False
                 self._write(command)
-                if self._query("*OPC?", timeout=self.operation_timeout) != "1":
-                    raise InstrumentProtocolError("명령 처리 완료를 확인하지 못했습니다.")
+                completion = self._query("*OPC?", timeout=self.operation_timeout)
+                if completion != "1":
+                    raise InstrumentReplyError(f"명령 처리 완료를 확인하지 못했습니다. 장비 응답: {completion[:120]}")
                 error = self._query("ERR?")
-                if self._first_lan_command_check and command.upper() == "STBY":
-                    self._first_lan_command_check = False
-                    error = self._check_initial_lan_error(error)
+                if self._first_command_check and command.upper() == "STBY":
+                    self._first_command_check = False
+                    error = self._check_initial_error(error)
                 if not re.match(r"^\+?0\s*(?:,|$)", error):
                     self._stop_after_command_error(error, command)
                 self.record_event(f"[명령 완료] {command} | {time.monotonic() - started:.3f}s", notify=True)
@@ -2982,20 +3568,52 @@ class Fluke5560AConnectionManager:
         error = self.query("ERR?")
         self.record_event(f"[연결 해제 · {phase}] {error}",
                           notify=not re.match(r"^\+?0\s*(?:,|$)", error))
+        if self.profile.model == "5560A" and self._is_protection_error(error):
+            return f"{phase}: {error}"
+        return None
+
+    def _leave_5560a_power_in_standby(self):
+        if self.query("FUNC?").upper() not in ("AC_POWER", "DC_POWER"):
+            return
+        # STBY was confirmed by disconnect(); keep output disabled while leaving dual output.
+        self.send_command("OUT 0 V, 0 HZ")
+        if self.query("OPER?") != "0":
+            self.send_command("STBY")
+            raise InstrumentProtocolError("전력 설정 해제 후 본체에서 STBY를 다시 확인하세요.")
+        readback = self.query("OUT?")
+        if not re.fullmatch(r"[+-]?0+(?:\.0+)?(?:E[+-]?\d+)?\s*,\s*V\s*,\s*"
+                            r"[+-]?0+(?:\.0+)?(?:E[+-]?\d+)?\s*,\s*0\s*,\s*"
+                            r"[+-]?0+(?:\.0+)?(?:E[+-]?\d+)?", readback, re.I):
+            raise InstrumentCommandError(f"5560A 0 V DC 설정 확인 실패: {readback[:120]}. STBY 확인 완료.")
+        self.record_event("[연결 해제] 전력 설정 해제 · 0 V DC / STBY 확인", notify=True)
 
     def disconnect(self, standby=True):
         with self._lock:
             try:
                 self.cancel_event.clear()
                 if self.info.connected and standby:
-                    checked_shutdown = self.profile.model == "5560A" and self._lan_sock is not None
+                    shutdown_issues = []
+                    checked_shutdown = not self.info.interface_type.startswith("SIMULATION")
                     if not checked_shutdown or self.query("OPER?") != "0":
-                        self.send_command("STBY")
+                        try:
+                            self.send_command("STBY")
+                        except InstrumentCommandError as exc:
+                            # STBY was confirmed, so remote control can still be released.
+                            if self.profile.model == "5560A":
+                                shutdown_issues.append(str(exc))
                         if checked_shutdown and self.query("OPER?") != "0":
                             raise InstrumentProtocolError("연결 해제 전 STBY를 확인하지 못했습니다.")
                     if checked_shutdown:
                         self.record_event("[연결 해제] STBY 확인")
-                        self._record_shutdown_error("LOCAL 전")
+                        error = self._record_shutdown_error("LOCAL 전")
+                        if error:
+                            shutdown_issues.append(error)
+                        if self.profile.model == "5560A":
+                            try:
+                                self._leave_5560a_power_in_standby()
+                            except InstrumentCommandError as exc:
+                                shutdown_issues.append(str(exc))
+                                self.record_event(f"[연결 해제 · 전력 설정] {exc}", notify=True)
                     if self._transport is not None:
                         self._write("LOCAL")
                         if self._query("*OPC?", timeout=self.operation_timeout) != "1":
@@ -3003,12 +3621,16 @@ class Fluke5560AConnectionManager:
                         if checked_shutdown:
                             if self.query("OPER?") != "0":
                                 raise InstrumentProtocolError("LOCAL 이후 STBY를 확인하지 못했습니다.")
-                            self._record_shutdown_error("LOCAL 후")
+                            error = self._record_shutdown_error("LOCAL 후")
+                            if error:
+                                shutdown_issues.append(error)
                     elif self._visa_inst is not None:
                         try:
-                            self._visa_inst.control_ren(pyvisa.constants.RENLineOperation.deassert_gtl)
+                            self._visa_inst.control_ren(pyvisa.constants.RENLineOperation.address_gtl)
                         except Exception:
                             pass
+                    if shutdown_issues:
+                        raise InstrumentProtocolError("연결은 해제했습니다. 장비 응답을 확인하세요.\n" + "\n".join(shutdown_issues))
             finally:
                 self._drop_connection()
 
@@ -3026,6 +3648,7 @@ if HAS_TKINTER:
             ("실제 출력", 240, "w", False), ("전송 명령", 230, "w", False),
             ("상태", 110, "center", False),
             ("측정값", 130, "e", True),
+            ("채널", 55, "center", False),
         ]
 
         def __init__(
@@ -3052,6 +3675,7 @@ if HAS_TKINTER:
             self._rendering_measurements = False
             self.show_commands = False
             self.show_measurements = True
+            self.show_channels = False
             self._init_measurement_selection()
             self._build_grid_skeleton()
             self._bind_measurement_header()
@@ -3062,7 +3686,11 @@ if HAS_TKINTER:
 
         @staticmethod
         def _display_column(index):
-            return 6 if index == 9 else (index + 1 if index >= 6 else index)
+            if index == 9:
+                return 6
+            if index == 10:
+                return 7
+            return index + 2 if index >= 6 else index
 
         def set_measurement_visibility(self, visible):
             self.show_measurements = bool(visible)
@@ -3075,7 +3703,7 @@ if HAS_TKINTER:
                     self._row_widgets[self.selected_row_idx]["entries"][5].focus_set()
 
         def _apply_optional_columns(self):
-            for column, visible in ((7, self.show_commands), (9, self.show_measurements)):
+            for column, visible in ((7, self.show_commands), (9, self.show_measurements), (10, self.show_channels)):
                 cells = [self.header_frame.winfo_children()[column]] + [row["frames"][column] for row in self._row_widgets]
                 for cell in cells:
                     if visible:
@@ -3364,8 +3992,8 @@ if HAS_TKINTER:
             self.canvas_window = self.canvas.create_window((0, 0), window=self.cells_frame, anchor="nw")
 
             self.cells_frame.bind("<Configure>", self._on_frame_configure)
-            self.header_frame.grid_columnconfigure(7, weight=1)
-            self.cells_frame.grid_columnconfigure(7, weight=1)
+            self.header_frame.grid_columnconfigure(8, weight=1)
+            self.cells_frame.grid_columnconfigure(8, weight=1)
             self.canvas.bind("<Configure>", self._resize_columns)
             self.canvas.bind("<Enter>", lambda _e: self._bind_mousewheel(True))
             self.canvas.bind("<Leave>", lambda _e: self._bind_mousewheel(False))
@@ -3380,7 +4008,8 @@ if HAS_TKINTER:
 
         def _resize_columns(self, _event=None):
             base = sum(spec[1] for index, spec in enumerate(self.COL_SPECS)
-                       if (index != 7 or self.show_commands) and (index != 9 or self.show_measurements))
+                       if (index != 7 or self.show_commands) and (index != 9 or self.show_measurements)
+                       and (index != 10 or self.show_channels))
             try:
                 width = max(base, self.canvas.winfo_width())
                 self.canvas.itemconfigure(self.canvas_window, width=width)
@@ -3428,6 +4057,7 @@ if HAS_TKINTER:
             for r_idx, st in enumerate(steps):
                 self._update_single_row_visual(r_idx, st, is_active=(r_idx == active_idx))
 
+            self.show_channels = any(step.dut_channel is not None for step in steps)
             self.set_command_visibility(self.show_commands)
             self.cells_frame.update_idletasks()
             self._on_frame_configure()
@@ -3486,8 +4116,8 @@ if HAS_TKINTER:
                         command=lambda r=r_idx: self.on_row_breakpoint_callback(r),
                     )
                     btn_bp.pack(side="right", fill="y", padx=(0, 1), pady=1)
-                    labels[10] = btn_go
-                    labels[11] = btn_bp
+                    labels["start"] = btn_go
+                    labels["breakpoint"] = btn_bp
 
                 elif is_editable:
                     justify_map = {"center": "center", "e": "right", "w": "left"}
@@ -3570,7 +4200,7 @@ if HAS_TKINTER:
             num_txt = f"▶{st.step_no}" if is_active else (f"🛑{st.step_no}" if st.breakpoint else str(st.step_no))
             num_bg = "#FACC15" if is_active else ("#FCA5A5" if st.breakpoint else "#E2E8F0")
             labels[0].configure(text=num_txt, bg=num_bg, fg="#0F172A")
-            labels[11].configure(bg="#DC2626" if st.breakpoint else "#E2E8F0", fg="#FFFFFF" if st.breakpoint else "#475569")
+            labels["breakpoint"].configure(bg="#DC2626" if st.breakpoint else "#E2E8F0", fg="#FFFFFF" if st.breakpoint else "#475569")
 
             col_vals = {
                 2: st.vi_cond_raw,
@@ -3593,6 +4223,8 @@ if HAS_TKINTER:
             output, command = preview(st) if preview else (st.actual_out_desc, st.scpi_cmd)
             labels[6].configure(text=output, bg=row_bg, fg="#0369A1" if not is_active else "#000000", font=row_font)
             labels[7].configure(text=command, bg=row_bg, fg="#334155" if not is_active else "#000000", font=row_font)
+            channel = f"CH{st.dut_channel}" if st.dut_channel is not None else ""
+            labels[10].configure(text=channel, bg=row_bg, fg=row_fg, font=row_font)
             labels[8].configure(text=st.status, bg=row_bg, fg=row_fg, font=("Malgun Gothic", 9, "bold"))
 
         def _select_row(self, r_idx: int) -> None:
@@ -3663,11 +4295,11 @@ if HAS_TKINTER:
 # =====================================================================
 if HAS_TKINTER:
     class Fluke5560AControllerApp(tk.Tk):
-        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.10.10"""
+        """Fluke 5560A 통합 원격 제어 GUI 프로그램 v6.10.26"""
 
         def __init__(self) -> None:
             super().__init__()
-            self.title("Fluke 교정기 통합 제어 프로그램 v6.10.10 (USB / LAN / RS232 / GPIB)")
+            self.title("Fluke 교정기 통합 제어 프로그램 v6.10.26 (USB / LAN / RS232 / GPIB)")
             self.geometry("1280x930")
             self.minsize(1140, 840)
             self.configure(bg="#F4F6F9")
@@ -3695,6 +4327,8 @@ if HAS_TKINTER:
             self._refresh_current_group_preview()
 
             self._log(f"통신 기록 자동 저장: {self.conn_mgr.log_path}")
+            if self.conn_mgr.log_folder_warning:
+                self._log(self.conn_mgr.log_folder_warning)
             self._log(f"실행 Python: {sys.executable} | PyVISA={HAS_PYVISA} | pyserial={HAS_PYSERIAL}")
             local_ips = self.conn_mgr.get_local_pc_ipv4_list()
             pc_ip_info = ", ".join(local_ips) if local_ips else "감지 안 됨"
@@ -3737,15 +4371,21 @@ if HAS_TKINTER:
             self._dut_next_read = self._dut_received_monotonic = 0
             self._dut_old = False
             self._dut_candidates = {}
-            self._dut_first_visit = True
             self._dut_modes = {
-                "자동 · USB / LAN / COM": "AUTO",
-                "USB / GPIB · VISA": "VISA", "LAN · WT": "WT_LAN",
+                "AUTO": "AUTO",
+                "USB · VISA": "VISA", "GPIB · VISA": "GPIB", "LAN · WT": "WT_LAN",
                 "LAN · WT5000 TCP": "WT5000_TCP",
-                "LAN · PPA": "PPA_LAN", "COM · USB / RS232": "SERIAL", "미리보기 · 가상 DUT": "DEMO",
+                "LAN · PPA": "PPA_LAN", "LAN · Hioki PW": "HIOKI_LAN", "RS232 · COM": "SERIAL",
+                "미리보기 · 가상 DUT": "DEMO",
             }
-            self.var_dut_mode = tk.StringVar(value="자동 · USB / LAN / COM")
+            self.var_dut_mode = tk.StringVar(value="AUTO")
             self.var_dut_address = tk.StringVar()
+            saved_lan = self.conn_mgr._connection_history.get("DUT-LAN")
+            if not isinstance(saved_lan, dict):
+                legacy = self.conn_mgr._connection_history.get("DUT-PW3390")
+                saved_lan = {"ip": legacy["ip"], "mode": "HIOKI_LAN", "port": 3390, "eol": "CRLF"} if isinstance(legacy, dict) and legacy.get("ip") else {}
+            self._dut_saved_lan = saved_lan
+            self.var_dut_lan_ip = tk.StringVar(value=_dut_discovery_ipv4(saved_lan.get("ip")) or "")
             self.var_dut_port = tk.StringVar(value="10001")
             self.var_dut_channel = tk.StringVar(value="1")
             self.var_dut_auto = tk.BooleanVar(value=False)
@@ -3758,8 +4398,8 @@ if HAS_TKINTER:
             self.var_dut_stop = tk.StringVar(value="1")
             self.var_dut_flow = tk.StringVar(value="RTS/CTS")
             self.var_dut_status = tk.StringVar(value="연결 안 됨 · 캘리브레이터와 별도로 연결합니다.")
-            self.var_dut_identity = tk.StringVar(value="USB, LAN 또는 USB COM으로 연결한 DUT를 찾습니다.")
-            self.var_dut_note = tk.StringVar(value="WT310 계열, WT3000·WT3000E, WT5000, PPA 등 지원 장비의 채널별 측정값을 조회합니다.")
+            self.var_dut_identity = tk.StringVar(value="USB, LAN, GPIB 또는 USB COM으로 연결한 DUT를 찾습니다.")
+            self.var_dut_note = tk.StringVar(value="WT 계열, PPA, Hioki PW3390·PW6001 등 지원 장비의 채널별 측정값을 조회합니다.")
             self.var_dut_time = tk.StringVar(value="수신 기록 없음")
             self.var_dut_hint = tk.StringVar()
             self.dut_canvas = tk.Canvas(self.tab_dut, bg="white", highlightthickness=0)
@@ -3775,26 +4415,31 @@ if HAS_TKINTER:
             ttk.Label(pad, text="DUT 연결", style="SubHeader.TLabel").pack(anchor="w", pady=(0, 10))
             bar = ttk.Frame(pad, style="Card.TFrame")
             bar.pack(fill="x")
-            self.combo_dut_mode = self._ui_combo(bar, self.var_dut_mode, tuple(self._dut_modes), 24)
+            self.combo_dut_mode = self._ui_combo(bar, self.var_dut_mode, tuple(self._dut_modes), 30)
             self.combo_dut_mode.bind("<<ComboboxSelected>>", self._dut_mode_changed)
             self.combo_dut_address = ttk.Combobox(bar, textvariable=self.var_dut_address, width=40)
             self.combo_dut_address.pack(side="left", fill="x", expand=True, padx=(0, 8))
-            self.btn_dut_scan = self._ui_button(bar, "자동 검색", self._dut_scan)
+            self.btn_dut_scan = self._ui_button(bar, "목록", self._dut_scan)
             self.btn_dut_connect = self._ui_button(bar, "연결", self._dut_connect, "Primary.TButton")
             self.btn_dut_disconnect = self._ui_button(bar, "해제", self._dut_disconnect)
             ttk.Label(pad, textvariable=self.var_dut_hint, foreground="#64748B", wraplength=940).pack(anchor="w", pady=(8, 4))
-            self._ui_button(bar, "설정", self._dut_toggle_details)
+            self.btn_dut_details = self._ui_button(bar, "LAN 설정", self._dut_toggle_details)
             self.dut_details = ttk.Frame(pad, style="Card.TFrame")
             self._dut_details_open = False
             self._dut_config_widgets = []
-            row = ttk.Frame(self.dut_details, style="Card.TFrame")
+            self.dut_lan_row = ttk.Frame(self.dut_details, style="Card.TFrame")
+            self._ui_label(self.dut_lan_row, "LAN IP")
+            self.entry_dut_lan_ip = self._ui_entry(self.dut_lan_row, self.var_dut_lan_ip, 16)
+            self.entry_dut_lan_ip.bind("<Return>", lambda _event: self._dut_scan())
+            self._ui_label(self.dut_lan_row, "장비의 통신 메뉴에 표시된 IP · PW3390은 SYSTEM → Interface")
+            row = self.dut_common_row = ttk.Frame(self.dut_details, style="Card.TFrame")
             row.pack(fill="x", pady=4)
-            for title, variable, width in (("응답 대기(초)", self.var_dut_timeout, 5), ("PPA TCP 포트", self.var_dut_port, 6)):
+            for title, variable, width in (("응답 대기(초)", self.var_dut_timeout, 5), ("TCP 포트", self.var_dut_port, 6)):
                 self._ui_label(row, title)
                 self._dut_config_widgets.append(self._ui_entry(row, variable, width))
             self._ui_label(row, "줄 끝")
             self._dut_config_widgets.append(self._ui_combo(row, self.var_dut_eol, ("CRLF", "LF", "CR"), 6))
-            row = ttk.Frame(self.dut_details, style="Card.TFrame")
+            row = self.dut_serial_row = ttk.Frame(self.dut_details, style="Card.TFrame")
             row.pack(fill="x", pady=4)
             for title, variable, options, width in (
                     ("속도", self.var_dut_baud, (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200), 8),
@@ -3838,14 +4483,6 @@ if HAS_TKINTER:
                     bind_wheel(child)
             bind_wheel(self.dut_canvas)
             self._dut_poll_id = self.after(100, self._dut_poll)
-            self.notebook.bind("<<NotebookTabChanged>>", self._dut_on_tab_open, add="+")
-
-        def _dut_on_tab_open(self, _event=None):
-            if not self._dut_first_visit or self.notebook.select() != str(self.tab_dut):
-                return
-            if (not self._dut_busy and not self._dut_closing and not self.dut_session.connected
-                    and self._dut_modes[self.var_dut_mode.get()] == "AUTO"):
-                self._dut_scan()
 
         def _dut_scroll(self, event):
             if self.dut_content.winfo_height() > self.dut_canvas.winfo_height():
@@ -3855,22 +4492,40 @@ if HAS_TKINTER:
         def _dut_mode_changed(self, _event=None):
             mode = self._dut_modes[self.var_dut_mode.get()]
             hints = {
-                "AUTO": "USB, LAN 및 USB COM의 DUT를 찾습니다. 한 대면 바로 연결합니다. COM 검색에 실패하면 RS232 방식에서 본체 설정과 맞추세요.",
-                "VISA": "목록에서 USB/GPIB 리소스를 선택하세요. VISA 드라이버에 표시되는 장치만 조회합니다.",
+                "AUTO": "연결을 누르면 USB, LAN, RS232, GPIB에서 DUT를 찾습니다.",
+                "VISA": "목록에서 USB 계측기의 VISA 리소스를 선택하세요.",
+                "GPIB": "목록에서 DUT를 선택하거나 본체 GPIB 주소를 입력하세요. 예: 4 또는 GPIB0::4::INSTR.",
                 "WT_LAN": "WT의 IP 주소를 입력하세요. VXI-11과 VISA 드라이버가 필요합니다. WT3000 계열은 GPIB 또는 장착된 RS232를 선택하세요.",
                 "WT5000_TCP": "소켓 통신을 지원하는 WT5000의 IP를 입력하세요. TCP 10002와 LF를 사용합니다. 본체 Command Type은 WT5000으로 설정하세요.",
                 "PPA_LAN": "PPA의 IP 주소를 입력하세요 (기본 TCP 포트 10001). 본체 REMOTE 인터페이스도 LAN으로 선택하세요.",
-                "SERIAL": "‘목록’에서 COM 포트를 선택하고 본체와 통신 설정을 맞추세요. PPA55xx RS232 기본값은 19200 / 8-N-1 / RTS/CTS / CR입니다.",
+                "HIOKI_LAN": "본체 SYSTEM → Interface에 표시된 IP를 입력하세요. TCP 포트는 PW3390은 3390, PW6001은 23입니다.",
+                "SERIAL": "‘목록’에서 COM 포트를 고르고 본체 설정과 맞추세요. PPA55xx 기본값은 19200 / 8N1 / RTS/CTS / CR입니다.",
                 "DEMO": "화면 확인용 고정 예제입니다. 실제 장비 연결이나 측정은 하지 않습니다.",
             }
             self.var_dut_hint.set(hints[mode])
             self._dut_candidates.clear()
             self.combo_dut_address.configure(values=())
             if _event is not None:
-                self.var_dut_address.set("")
-                self.var_dut_eol.set("LF" if mode in ("WT_LAN", "WT5000_TCP") else "CRLF")
-            if mode in ("PPA_LAN", "SERIAL") and not self._dut_details_open:
+                self.var_dut_address.set(self.var_dut_lan_ip.get()
+                                         if mode == self._dut_saved_lan.get("mode") else "")
+                self.var_dut_eol.set("LF" if mode in ("GPIB", "WT_LAN", "WT5000_TCP", "SERIAL") else "CRLF")
+                if mode == "SERIAL":
+                    self.var_dut_flow.set("XON/XOFF")
+            if _event is not None and mode in ("PPA_LAN", "HIOKI_LAN"):
+                self.var_dut_port.set("3390" if mode == "HIOKI_LAN" else "10001")
+                if mode == self._dut_saved_lan.get("mode"):
+                    self.var_dut_port.set(str(self._dut_saved_lan.get("port", self.var_dut_port.get())))
+            if mode in ("PPA_LAN", "HIOKI_LAN", "SERIAL") and not self._dut_details_open:
                 self._dut_toggle_details()
+            if mode == "AUTO":
+                self.dut_lan_row.pack(fill="x", pady=4, before=self.dut_common_row)
+            else:
+                self.dut_lan_row.pack_forget()
+            if mode == "SERIAL":
+                self.dut_serial_row.pack(fill="x", pady=4)
+            else:
+                self.dut_serial_row.pack_forget()
+            self.btn_dut_details.configure(text="LAN 설정" if mode == "AUTO" else "설정")
             self._dut_sync_controls()
 
         def _dut_toggle_details(self):
@@ -3881,7 +4536,11 @@ if HAS_TKINTER:
                 self.dut_details.pack_forget()
 
         def _dut_settings(self):
-            settings = DUTSettings(mode=self._dut_modes[self.var_dut_mode.get()], address=self.var_dut_address.get().strip(),
+            mode = self._dut_modes[self.var_dut_mode.get()]
+            address = self.var_dut_address.get().strip()
+            if mode == "GPIB" and re.fullmatch(r"\d{1,2}", address):
+                address = f"GPIB0::{int(address)}::INSTR"
+            settings = DUTSettings(mode=mode, address=address,
                 port=int(self.var_dut_port.get() or 0), timeout=float(self.var_dut_timeout.get()), eol=self.var_dut_eol.get(),
                 baudrate=int(self.var_dut_baud.get()), data_bits=int(self.var_dut_bits.get()), parity=self.var_dut_parity.get(),
                 stop_bits=int(self.var_dut_stop.get()), flow=self.var_dut_flow.get())
@@ -3895,11 +4554,14 @@ if HAS_TKINTER:
                 if self.seq_running or self._io_busy:
                     self.var_dut_status.set("기준기 작업이 끝난 뒤 DUT 자동 검색을 시작하세요.")
                     return
-                self._dut_first_visit = False
+                lan_ip = self.var_dut_lan_ip.get().strip()
+                if lan_ip and _dut_discovery_ipv4(lan_ip) is None:
+                    self.var_dut_status.set("LAN 설정에 장비 통신 메뉴의 IPv4 주소를 입력하세요. 예 192.168.10.3")
+                    return
                 self._dut_candidates.clear()
                 self.combo_dut_address.configure(values=())
                 self.var_dut_address.set("")
-                self.var_dut_identity.set("USB, LAN 또는 USB COM으로 연결한 DUT를 찾습니다.")
+                self.var_dut_identity.set("USB, LAN, GPIB 또는 USB COM으로 연결한 DUT를 찾습니다.")
                 self._dut_start("discover")
             else:
                 self._dut_start("scan")
@@ -3908,13 +4570,16 @@ if HAS_TKINTER:
             if self._dut_busy or self._dut_closing or self.dut_session.connected:
                 return
             try:
+                if self.seq_running or self._io_busy:
+                    raise ValueError("기준기 작업이 끝난 뒤 DUT를 연결하세요.")
                 mode = self._dut_modes[self.var_dut_mode.get()]
                 if mode == "AUTO":
+                    if not self._dut_candidates:
+                        self._dut_scan()
+                        return
                     candidate = self._dut_candidates.get(self.var_dut_address.get())
                     if candidate is None:
-                        raise ValueError("자동 검색 결과에서 연결할 DUT를 선택하세요.")
-                    if self.seq_running or self._io_busy:
-                        raise ValueError("기준기 작업이 끝난 뒤 DUT를 연결하세요.")
+                        raise ValueError("목록에서 연결할 DUT를 선택하세요.")
                     settings = replace(candidate.settings, timeout=float(self.var_dut_timeout.get()))
                     settings.validate()
                 else:
@@ -3924,8 +4589,9 @@ if HAS_TKINTER:
                 target_ip = _dut_discovery_resource_ip(target) if settings.mode == "VISA" else _dut_discovery_ipv4(target)
                 used_ip = _dut_discovery_ipv4(info.discovered_ip) or _dut_discovery_resource_ip(used)
                 target_usb = _dut_discovery_usb_key(target) if settings.mode == "VISA" else None
+                target_gpib = _dut_gpib_key(target)
                 if settings.mode != "DEMO" and info.connected and (
-                        target == used or
+                        target == used or (target_gpib is not None and target_gpib == _dut_gpib_key(used)) or
                         (settings.mode == "SERIAL" and target == used.split(" / ")[0]) or
                         (target_ip is not None and target_ip == used_ip) or
                         (target_usb is not None and target_usb == _dut_discovery_usb_key(used))):
@@ -3947,13 +4613,16 @@ if HAS_TKINTER:
                     transport = "USB"
                     fields = candidate.identity.split(",")
                     address = (fields[2].strip() if len(fields) > 2 else "") or settings.address
+                elif settings.mode == "GPIB":
+                    transport = "GPIB"
+                    address = settings.address
                 elif settings.mode == "SERIAL":
                     transport = "COM"
                     address = settings.address
                 else:
                     transport = "LAN"
                     address = settings.address
-                    if settings.mode in ("PPA_LAN", "WT5000_TCP"):
+                    if settings.mode in ("PPA_LAN", "WT5000_TCP", "HIOKI_LAN"):
                         address += f":{settings.port}"
                 label = f"{candidate.profile.model} · {transport} · {address}"
                 if label in self._dut_candidates:
@@ -3964,9 +4633,11 @@ if HAS_TKINTER:
                 self.var_dut_address.set(next(iter(self._dut_candidates)))
                 self._dut_connect()
             elif self._dut_candidates:
-                self.var_dut_status.set(f"DUT {len(self._dut_candidates)}개 발견 · 장비를 선택하고 ‘선택 연결’을 누르세요.")
+                self.var_dut_status.set(f"DUT {len(self._dut_candidates)}개 발견 · 장비를 선택하고 ‘연결’을 누르세요.")
             else:
-                self.var_dut_status.set(diagnostics[-1] if diagnostics else "연결할 DUT를 찾지 못했습니다.")
+                self.var_dut_status.set(diagnostics[-1] if diagnostics else "DUT를 찾지 못했습니다. LAN 연결이면 LAN 설정에 본체 IP를 입력하세요.")
+                if not self._dut_details_open:
+                    self._dut_toggle_details()
 
         def _dut_interval_seconds(self):
             interval = float(self.var_dut_interval.get())
@@ -4002,8 +4673,10 @@ if HAS_TKINTER:
                 self.var_dut_status.set(f"설정 확인: {exc}")
                 return
             info = self.conn_mgr.info
-            excluded_ip = info.discovered_ip or (self.var_lan_ip.get() if operation == "discover" else "")
+            excluded_ip = info.discovered_ip
             selected = self._dut_candidates.get(self.var_dut_address.get()) if mode == "AUTO" else None
+            lan_ip = self.var_dut_lan_ip.get().strip()
+            saved_lan = self._dut_saved_lan
             self._dut_busy = True
             self._seq_dut_reading = operation == "sequence_read"
             self.dut_session.cancel.clear()
@@ -4011,7 +4684,7 @@ if HAS_TKINTER:
             self.var_dut_status.set({"connect": "DUT 연결 중…", "disconnect": "DUT 연결 해제 중…",
                                      "sequence_read": "새 DUT 측정값 대기 중…",
                                      "read": "조회 중… · 표시된 값은 이전 수신값입니다.", "scan": "연결 목록 조회 중…",
-                                     "discover": "USB / LAN / COM DUT 검색 중…"}[operation])
+                                     "discover": "USB / LAN / GPIB / COM DUT 검색 중…"}[operation])
             self._dut_sync_controls()
             def run():
                 result, error = None, None
@@ -4029,7 +4702,8 @@ if HAS_TKINTER:
                         result = identity, defaults
                     elif operation == "discover":
                         result = discover_duts(self.dut_session.cancel, excluded_resource=info.resource_name,
-                                               excluded_ip=excluded_ip, include_serial=True)
+                                               excluded_ip=excluded_ip, include_serial=True, include_gpib=True,
+                                               lan_ip=lan_ip, saved_lan=saved_lan)
                     elif operation == "disconnect":
                         self.dut_session.disconnect()
                     elif operation == "read":
@@ -4045,7 +4719,12 @@ if HAS_TKINTER:
                             raise RuntimeError(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
                         manager = SharedVisaManager()
                         try:
-                            result = [r for r in manager.list_resources() if r.upper().startswith(("USB", "GPIB", "TCPIP"))]
+                            used_gpib = _dut_gpib_key(info.resource_name)
+                            if mode == "GPIB":
+                                result = [r for r in manager.list_resources()
+                                          if _dut_gpib_key(r) is not None and _dut_gpib_key(r) != used_gpib]
+                            else:
+                                result = [r for r in manager.list_resources() if r.upper().startswith("USB")]
                         finally:
                             manager.close()
                 except Exception as exc:
@@ -4109,13 +4788,20 @@ if HAS_TKINTER:
                 widget.configure(state="disabled" if locked else "readonly" if isinstance(widget, ttk.Combobox) else "normal")
             mode = self._dut_modes[self.var_dut_mode.get()]
             auto = mode == "AUTO"
+            self.entry_dut_lan_ip.configure(state="disabled" if locked else "normal")
+            if auto and not self._dut_candidates:
+                self.combo_dut_address.pack_forget()
+            elif not self.combo_dut_address.winfo_manager():
+                self.combo_dut_address.pack(side="left", fill="x", expand=True, padx=(0, 8), before=self.btn_dut_connect)
             self.combo_dut_address.configure(state="disabled" if locked or (auto and not self._dut_candidates)
                                             else "readonly" if auto else "normal")
-            self.btn_dut_connect.configure(text="선택 연결" if auto else "연결",
-                                           state="disabled" if locked or (auto and not self._dut_candidates) else "normal")
-            self.btn_dut_scan.configure(text="자동 검색" if auto else "목록",
-                                        style="Primary.TButton" if auto and not self._dut_candidates else "TButton",
-                                        state="normal" if not locked and mode in ("AUTO", "VISA", "SERIAL") else "disabled")
+            self.btn_dut_connect.configure(state="disabled" if locked else "normal")
+            if mode in ("VISA", "GPIB", "SERIAL"):
+                if not self.btn_dut_scan.winfo_manager():
+                    self.btn_dut_scan.pack(side="left", padx=(0, 6), before=self.btn_dut_connect)
+                self.btn_dut_scan.configure(state="disabled" if locked else "normal")
+            else:
+                self.btn_dut_scan.pack_forget()
             self.btn_dut_disconnect.configure(state="normal" if self._dut_busy or self.dut_session.connected else "disabled")
             reserved = self._sequence_dut_reserved()
             ready = not reserved and self.dut_session.connected and not self._dut_busy and not self._dut_closing
@@ -4142,13 +4828,26 @@ if HAS_TKINTER:
                     else:
                         self.var_dut_status.set("DUT 연결 해제됨")
                 elif error:
+                    if operation == "connect":
+                        self._dut_candidates.clear()
                     self.var_dut_auto.set(False)
                     self._dut_clear_values("조회 실패")
                     self.var_dut_status.set(f"DUT 오류: {error}")
                     self._log(f"[DUT {operation}] {error}")
                 elif operation == "connect":
                     identity, defaults = result
+                    settings = self.dut_session.settings
                     self.var_dut_identity.set(identity)
+                    if settings and settings.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN"):
+                        host = AutoNetworkAligner.normalize_ipv4(settings.address)
+                        endpoint = host if settings.mode == "WT_LAN" else f"{host}:{settings.port}"
+                        self.var_dut_identity.set(f"LAN · {endpoint} · {identity}")
+                        self.var_dut_lan_ip.set(host)
+                        self._dut_saved_lan = {"ip": host, "mode": settings.mode, "port": settings.port, "eol": settings.eol}
+                        self.conn_mgr._remember_connection("LAN", history_key="DUT-LAN", **self._dut_saved_lan)
+                    elif settings and settings.mode in ("VISA", "SERIAL", "GPIB"):
+                        interface = {"VISA": "USB", "SERIAL": "RS232", "GPIB": "GPIB"}[settings.mode]
+                        self.var_dut_identity.set(f"{interface} · {settings.address} · {identity}")
                     if self.dut_session.simulated:
                         status = "가상 DUT 연결됨 · 화면에서 예제 값을 조회할 수 있습니다."
                     elif self.dut_session.supports_fresh_capture:
@@ -4156,7 +4855,7 @@ if HAS_TKINTER:
                     else:
                         status = "DUT 연결됨 · 이 탭에서 공통 측정값을 조회할 수 있습니다."
                     self.var_dut_status.set(status)
-                    channels = self.dut_session.input_channels or tuple(range(1, self.dut_session.profile.channels + 1))
+                    channels = self.dut_session.available_channels
                     self.combo_dut_channel.configure(values=channels)
                     self.var_dut_channel.set(str(channels[0]))
                     self._log(f"[DUT 연결] {identity}")
@@ -4174,6 +4873,7 @@ if HAS_TKINTER:
                     self.var_dut_status.set(f"연결 목록 {len(result)}개 · 주소 칸에서 선택하세요." if result else
                         "장치가 목록에 없습니다. USB 드라이버·케이블을 확인하거나 LAN/COM 주소를 직접 입력하세요.")
                 else:
+                    self._dut_candidates.clear()
                     self._dut_clear_values("연결 해제됨")
                     self.var_dut_status.set("DUT 연결 해제됨")
                 if self.var_dut_auto.get():
@@ -4215,7 +4915,7 @@ if HAS_TKINTER:
             header.pack(fill="x")
             tk.Label(header, text="Fluke Controller", bg="#F5F7FA", fg="#0F172A",
                      font=("Segoe UI", 18, "bold")).pack(side="left")
-            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.10.10", bg="#F5F7FA",
+            tk.Label(header, text="5560A · 5522A · 5520A · 5080A   /   v6.10.26", bg="#F5F7FA",
                      fg="#64748B", font=("Segoe UI", 9)).pack(side="left", padx=16)
             self.lbl_conn_badge = tk.Label(header, text="연결 안 됨", bg="#E2E8F0", fg="#64748B", padx=12, pady=5)
             self.lbl_conn_badge.pack(side="right")
@@ -4247,7 +4947,7 @@ if HAS_TKINTER:
             self._last_report = ""
             self._connection_buttons = []
             self._configured_model = "5560A"
-            for name, value in (("model", "5560A"), ("conn_mode", "LAN"), ("lan_ip", "169.254.1.1"),
+            for name, value in (("model", "5560A"), ("conn_mode", "AUTO"), ("lan_ip", ""),
                                 ("lan_port", "3490"), ("gpib_addr", "1"), ("timeout", "3"),
                                 ("operation_timeout", "60"), ("eol", "CRLF"), ("visa_resource", ""),
                                 ("adapter_choice", ""), ("serial_port", ""), ("baudrate", "9600"),
@@ -4256,10 +4956,11 @@ if HAS_TKINTER:
                 setattr(self, "var_" + name, tk.StringVar(value=value))
             row = tk.Frame(card, bg="white")
             row.pack(fill="x")
-            self._ui_label(row, "모델")
-            self.combo_model = self._ui_combo(row, self.var_model, list(MODEL_PROFILES), 8)
+            self.model_choice_row = tk.Frame(row, bg="white")
+            self._ui_label(self.model_choice_row, "모델")
+            self.combo_model = self._ui_combo(self.model_choice_row, self.var_model, list(MODEL_PROFILES), 8)
             self.combo_model.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
-            self._ui_label(row, "연결")
+            self.mode_label = self._ui_label(row, "기준기")
             self.combo_conn_mode = self._ui_combo(row, self.var_conn_mode, (), 9)
             actions = tk.Frame(row, bg="white")
             actions.pack(side="right")
@@ -4284,7 +4985,7 @@ if HAS_TKINTER:
             self._ui_label(endpoint, "장비 주소")
             self._ui_entry(endpoint, self.var_gpib_addr, 4)
             self._ui_label(self.connection_endpoints["USB"], "후면 USB Device · USBTMC")
-            self._ui_label(self.connection_endpoints["AUTO"], "상세 설정의 주소·포트로 검색")
+            self._ui_label(self.connection_endpoints["AUTO"], "장비 모델과 연결 방식 자동 확인")
             self._ui_label(self.connection_endpoints["SIMULATION"], "가상 장비 · 실제 출력 없음")
 
             self.connection_details = tk.Frame(card, bg="white", pady=8)
@@ -4301,7 +5002,7 @@ if HAS_TKINTER:
             self._connection_buttons.append(self._ui_button(common, "시뮬레이션", self._on_sim_connect_clicked))
             self._connection_buttons.append(self._ui_button(common, "진단 저장", self._on_save_report))
             self.connection_detail_rows = {}
-            for key in ("LAN", "RS232", "VISA", "AUTO"):
+            for key in ("AUTO", "LAN", "RS232", "VISA"):
                 self.connection_detail_rows[key] = tk.Frame(self.connection_details, bg="white")
             lan = self.connection_detail_rows["LAN"]
             self._ui_label(lan, "랜카드")
@@ -4320,12 +5021,12 @@ if HAS_TKINTER:
             self._ui_entry(visa, self.var_visa_resource, 40)
             self._ui_label(visa, "USB–GPIB는 GPIB, USB–RS232는 RS232 선택")
             auto = self.connection_detail_rows["AUTO"]
-            for title, name, width in (("IP", "lan_ip", 16), ("포트", "lan_port", 5),
+            for title, name, width in (("LAN IP", "lan_ip", 16), ("포트", "lan_port", 5),
                                        ("COM", "serial_port", 12), ("GPIB 주소", "gpib_addr", 4)):
                 self._ui_label(auto, title)
                 self._ui_entry(auto, getattr(self, "var_" + name), width)
             ttk.Label(self.connection_details, textvariable=self.var_model_note, foreground="#64748B").pack(side="bottom", anchor="w", pady=(8, 0))
-            self.var_idn_display = tk.StringVar(value="모델과 연결 방식을 선택하세요.")
+            self.var_idn_display = tk.StringVar(value="연결을 누르면 기준기를 찾습니다.")
             self.connection_status = tk.Label(card, textvariable=self.var_idn_display, bg="white", fg="#64748B",
                                               anchor="w", justify="left", wraplength=1100)
             self.connection_status.pack(fill="x", pady=(7, 0))
@@ -4341,7 +5042,7 @@ if HAS_TKINTER:
             choices = [f"{a['idx']}: {a['name']} [{a['state']}]" for a in adapters]
             choices.append("자동: Windows 경로 사용")
             self.combo_adapter.configure(values=choices)
-            self.var_adapter_choice.set(next((v for v in choices if v.split(":", 1)[0] == current), choices[0]))
+            self.var_adapter_choice.set(next((v for v in choices if v.split(":", 1)[0] == current), choices[-1]))
 
         def _get_selected_adapter_id(self):
             value = self.var_adapter_choice.get().split(":", 1)[0]
@@ -4353,8 +5054,8 @@ if HAS_TKINTER:
                 raise ValueError("제한 시간은 0.2~60초 사이여야 합니다.")
             operation_timeout = self._get_operation_timeout()
             mode = self.var_conn_mode.get()
-            return dict(preferred_mode=mode, lan_ip=self.var_lan_ip.get(), model=self._selected_model(),
-                        lan_port=int(self.var_lan_port.get()) if mode in ("AUTO", "LAN") else 3490,
+            return dict(preferred_mode=mode, lan_ip=self.var_lan_ip.get(), model="AUTO" if mode == "AUTO" else self._selected_model(),
+                        lan_port=(self.var_lan_port.get().strip() or "3490") if mode in ("AUTO", "LAN") else 3490,
                         gpib_addr=int(self.var_gpib_addr.get()) if mode in ("AUTO", "GPIB") else 1,
                         timeout_sec=timeout, eol=self.var_eol.get(), adapter_idx=self._get_selected_adapter_id(),
                         visa_resource=self.var_visa_resource.get(), operation_timeout_sec=operation_timeout,
@@ -4405,6 +5106,8 @@ if HAS_TKINTER:
                 self._log(event)
                 if event.startswith("[출력 안정화 대기]"):
                     self.var_idn_display.set(event)
+                elif event.startswith("[영점 조정 필요]"):
+                    self._refresh_oper_badge()
             try:
                 complete, value, error, on_error = self._io_results.get_nowait()
             except queue.Empty:
@@ -4450,11 +5153,12 @@ if HAS_TKINTER:
         def _on_lan_diagnose(self):
             try:
                 args = self._connection_arguments()
-                if "LAN" not in MODEL_PROFILES[self._selected_model()].interfaces:
+                if args['model'] != "AUTO" and "LAN" not in MODEL_PROFILES[self._selected_model()].interfaces:
                     raise ValueError("선택한 모델에는 LAN 포트가 없습니다. RS232 또는 GPIB를 사용하세요.")
+                profile = MODEL_PROFILES[self._selected_model()]
                 def diagnose():
                     self.conn_mgr.expected_model = args['model']
-                    self.conn_mgr.profile = MODEL_PROFILES[args['model']]
+                    self.conn_mgr.profile = profile
                     return self.conn_mgr.diagnose_lan(args['lan_ip'], args['lan_port'], args['timeout_sec'],
                                                       eol=args['eol'], adapter_idx=args['adapter_idx'])
                 def done(report):
@@ -4515,6 +5219,8 @@ if HAS_TKINTER:
             self.lbl_output_state = tk.Label(bar, text="출력 상태 미확인", bg="#E2E8F0", fg="#475569",
                                              padx=10, pady=6, font=("Malgun Gothic", 9, "bold"))
             self.lbl_output_state.pack(side="left", padx=(0, 10))
+            self.lbl_zero_adjustment = tk.Label(bar, text="5560A 영점 조정 필요", bg="#FEF3C7", fg="#92400E",
+                                               padx=10, pady=6, font=("Malgun Gothic", 9, "bold"))
             self._ui_button(bar, "출력 켜기 · OPER", self._on_oper_clicked)
             self.btn_standby = self._ui_button(bar, "출력 끄기 · STBY", self._on_stby_clicked, "Stop.TButton")
             self._ui_button(bar, "장비 초기화", self._on_reset_clicked, side="right")
@@ -4534,6 +5240,7 @@ if HAS_TKINTER:
             menu.add_command(label="빈 행 추가", command=self._on_add_blank_row)
             menu.add_command(label="시트 비우기", command=self._on_clear_sheet)
             edit.configure(menu=menu)
+            self.btn_channel_assignment = self._ui_button(toolbar, "채널 배정", self._open_channel_assignment)
             self.var_seq_use_coil = tk.BooleanVar(value=False)
             ttk.Checkbutton(toolbar, text="턴코일", variable=self.var_seq_use_coil,
                             command=self._recalculate_all_grid_steps).pack(side="left", padx=(0, 6))
@@ -4580,7 +5287,8 @@ if HAS_TKINTER:
             controls.pack(side="bottom", fill="x")
             self._ui_button(controls, "시작", self._on_seq_start_from_selected_or_range, "Primary.TButton")
             self._ui_button(controls, "처음부터", lambda: self._on_seq_start_from_selected_or_range(all_rows=True))
-            self._ui_button(controls, "일시정지", lambda: self._on_seq_stop_auto(silent=False))
+            self.btn_seq_hold = self._ui_button(controls, "출력 유지", self._on_seq_hold_clicked)
+            self.btn_seq_stop = self._ui_button(controls, "정지", self._on_seq_stop_clicked, "Stop.TButton")
             self._ui_button(controls, "재개", self._on_seq_resume_from_paused)
             self._ui_label(controls, "  유지")
             self._ui_entry(controls, self.var_seq_dwell_sec, 5)
@@ -4666,7 +5374,7 @@ if HAS_TKINTER:
             tabular = any("\t" in line for line in lines)
             if parsed_rows and (append or tabular or len(parsed_rows) == len(lines)):
                 new_steps = []
-                for offset, (vi_c, fq_c, pf_c, nom_c) in enumerate(parsed_rows):
+                for offset, (vi_c, fq_c, pf_c, nom_c) in enumerate(SmartClipboardSequenceParser.resolve_unsigned_pf_triplets(parsed_rows)):
                     target_idx = start_row_idx + offset
                     step_num = target_idx + 1
                     try:
@@ -4689,6 +5397,8 @@ if HAS_TKINTER:
                     self._original_row_positions = None
                     self.seq_current_idx = self.seq_paused_idx = -1
                     self.progress_var.set(0)
+                for new_step, old_step in zip(new_steps, self.seq_steps[start_row_idx:start_row_idx + len(new_steps)]):
+                    new_step.dut_channel = old_step.dut_channel
                 self.seq_steps[start_row_idx:start_row_idx + len(new_steps)] = new_steps
                 if append or replace_all:
                     self.var_seq_start_row.set("1")
@@ -4718,6 +5428,16 @@ if HAS_TKINTER:
 
             if tabular or replace_all or append:
                 return
+            pf_inputs = []
+            if start_col_idx in (4, 5):
+                for index, line in enumerate(lines, start_row_idx):
+                    if index < len(self.seq_steps) and self.seq_steps[index].func_type == "PF":
+                        row = self.seq_steps[index]
+                        value = line.strip()
+                        pf_inputs.append((row.vi_cond_raw, row.freq_cond_raw, value, value))
+                    else:
+                        pf_inputs.append(("", "", "", ""))
+                pf_inputs = SmartClipboardSequenceParser.resolve_unsigned_pf_triplets(pf_inputs)
             for offset, ln in enumerate(lines):
                 ln = ln.strip()
                 target_idx = start_row_idx + offset
@@ -4738,6 +5458,8 @@ if HAS_TKINTER:
                 fq_c = ln if start_col_idx == 3 else st.freq_cond_raw
                 pf_c = ln if start_col_idx == 4 else st.pf_cond_raw
                 nom_c = ln if start_col_idx == 5 else st.nominal_raw
+                if pf_inputs and pf_inputs[offset][3]:
+                    pf_c = nom_c = pf_inputs[offset][3]
                 try:
                     self.seq_steps[target_idx] = SmartClipboardSequenceParser.build_sheet_step(
                         model=self._selected_model(), step_no=target_idx + 1,
@@ -4749,6 +5471,7 @@ if HAS_TKINTER:
                         coil_turns=turns,
                         breakpoint=st.breakpoint,
                     )
+                    self.seq_steps[target_idx].dut_channel = st.dut_channel
                     self.seq_steps[target_idx].measured_raw = SIUnits.with_nominal_unit(st.measured_raw, st.nominal_raw)
                 except Exception:
                     pass
@@ -4773,6 +5496,7 @@ if HAS_TKINTER:
                 except ValueError as exc:
                     invalid = SequenceStep(st.step_no, vi_c, fq_c, pf_c, nom_c, "ERROR", "", str(exc),
                                            "⚠ 설정 확인", st.breakpoint, st.measured_raw)
+                    invalid.dut_channel = st.dut_channel
                     self.seq_steps[r_idx] = invalid
                     self.excel_grid._update_single_row_visual(r_idx, invalid)
                     self._refresh_current_group_preview()
@@ -4801,11 +5525,13 @@ if HAS_TKINTER:
                 updated.measured_raw = SIUnits.with_nominal_unit(st.measured_raw, st.nominal_raw)
                 if updated.scpi_cmd and st.scpi_cmd:
                     updated.status = st.status
+                updated.dut_channel = st.dut_channel
                 self.seq_steps[r_idx] = updated
                 self.excel_grid._update_single_row_visual(r_idx, updated, is_active=(r_idx == self.seq_current_idx))
                 self._refresh_current_group_preview()
             except Exception as e:
                 invalid = SequenceStep(st.step_no, vi_c, fq_c, pf_c, nom_c, "ERROR", "", str(e), "⚠ 설정 확인", st.breakpoint, st.measured_raw)
+                invalid.dut_channel = st.dut_channel
                 self.seq_steps[r_idx] = invalid
                 self.excel_grid._update_single_row_visual(r_idx, invalid)
                 self._refresh_current_group_preview()
@@ -4888,12 +5614,16 @@ if HAS_TKINTER:
                                            st.nominal_raw, "ERROR", "", str(exc), "⚠ 설정 확인", st.breakpoint)
                     self._log(f"[#{st.step_no}행 설정 확인] {exc}")
                 rebuilt.measured_raw = st.measured_raw
+                rebuilt.measured_raw = st.measured_raw
+                rebuilt.dut_channel = st.dut_channel
                 rebuilt_steps.append(rebuilt)
             self.seq_steps = rebuilt_steps
             self.excel_grid.render_steps(self.seq_steps, active_idx=-1)
             self._refresh_current_group_preview()
             self._refresh_current_group_preview()
 
+        _SEQUENCE_HOLD_STATUS = "출력 유지"
+        _SEQUENCE_STOPPED_STATUS = "정지됨"
         _DUT_SEQUENCE_QUANTITIES = {
             "ACV": ("voltage", "V"), "DCV": ("dc_voltage", "V"),
             "ACI": ("current", "A"), "DCI": ("dc_current", "A"),
@@ -4960,9 +5690,7 @@ if HAS_TKINTER:
                         raise ValueError("이 DUT는 자동 기록을 지원하지 않습니다. 직접 측정하려면 DUT 자동 기록을 끄세요.")
                     if self._dut_busy:
                         raise RuntimeError("진행 중인 DUT 조회가 끝난 뒤 다시 시작하세요.")
-                    channel = int(self.var_dut_channel.get())
-                    if not 1 <= channel <= self.dut_session.profile.channels:
-                        raise ValueError("DUT 입력 채널을 확인하세요.")
+                    channel = self._dut_channel_for_step(step)
                     if dwell_ms is None:
                         dwell = float(self.var_seq_dwell_sec.get())
                         if not .2 <= dwell <= 86_400:
@@ -4980,7 +5708,9 @@ if HAS_TKINTER:
             step.status = "… 출력 안정화 대기"
             self.excel_grid._update_single_row_visual(index, step, is_active=True)
             self.excel_grid.scroll_to_row(index)
-            self.var_active_row_banner.set(f"#{step.step_no}행 완료 응답 대기: {command}")
+            active_channel = channel if linked else step.dut_channel
+            row_label = f"#{step.step_no}행" + (f" · CH{active_channel}" if active_channel is not None else "")
+            self.var_active_row_banner.set(f"{row_label} 완료 응답 대기: {command}")
             self.lbl_active_row_banner.configure(bg="#FEF3C7", fg="#92400E")
             self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={command}")
 
@@ -4995,6 +5725,9 @@ if HAS_TKINTER:
                 self.progress_var.set((plan.index(index) + 1) / len(plan) * 100 if index in plan else 100)
 
             def failed(exc):
+                if (same_step() and step.status == self._SEQUENCE_STOPPED_STATUS
+                        and (isinstance(exc, OperationCancelled) or isinstance(getattr(exc, "__cause__", None), OperationCancelled))):
+                    return
                 if linked:
                     if current_capture():
                         self._sequence_dut_failure(index, step, exc)
@@ -5080,6 +5813,8 @@ if HAS_TKINTER:
                     failed("DUT 조회를 시작할 수 없습니다.")
 
             def done(state):
+                if same_step() and step.status in (self._SEQUENCE_HOLD_STATUS, self._SEQUENCE_STOPPED_STATUS):
+                    return
                 if linked and not current_capture():
                     return
                 if not same_step():
@@ -5094,7 +5829,7 @@ if HAS_TKINTER:
                     return
                 step.status = "… 유지시간 대기" if linked else "▶ 측정 진행 중"
                 output, _ = self._sequence_output_preview(step)
-                self.var_active_row_banner.set(f"[#{step.step_no}/{len(self.seq_steps)}행 출력 확인] {step.nominal_raw} → {output}")
+                self.var_active_row_banner.set(f"[{row_label} 출력 확인] {step.nominal_raw} → {output}")
                 self.lbl_active_row_banner.configure(bg="#DBEAFE", fg="#0F172A")
                 self.excel_grid._update_single_row_visual(index, step, is_active=True)
                 self._log(f"[#{step.step_no}행 완료 응답 확인] 유지시간 시작")
@@ -5149,32 +5884,26 @@ if HAS_TKINTER:
             if not self.seq_steps:
                 return
             if self.seq_paused_idx < 0:
-                self._on_seq_start_from_selected_or_range()
+                self._log("재개할 행이 없습니다. 새 측정은 시작을 누르세요.")
                 return
-            _, stop_idx = self._get_start_and_stop_indices()
+            start_idx, stop_idx = self._get_start_and_stop_indices()
+            if self.seq_paused_idx in self._seq_active_indices:
+                position = self._seq_active_indices.index(self.seq_paused_idx)
+                self._start_filtered_sequence(start_idx, stop_idx, remaining=self._seq_active_indices[position:])
+                return
             if self.seq_paused_idx > stop_idx:
                 stop_idx = len(self.seq_steps) - 1
                 self.var_seq_stop_row.set(str(stop_idx + 1))
             self._start_filtered_sequence(self.seq_paused_idx, stop_idx)
 
-        def _run_next_auto_step(self, idx, stop_idx, dwell_ms):
+        def _run_next_auto_step(self, position, dwell_ms):
             self.seq_after_id = None
             if not self.seq_running or self._io_busy:
                 return
-            try:
-                while idx <= stop_idx and idx < len(self.seq_steps) and not self._step_in_current_group(self.seq_steps[idx]):
-                    step = self.seq_steps[idx]
-                    reason = step.actual_out_desc if step.func_type == "OUT_OF_RANGE" else "다른 그룹"
-                    self._log(f"[#{idx + 1}행 건너뜀] {reason}")
-                    idx += 1
-            except ValueError as exc:
-                self.seq_running = False
-                if self._seq_dut_run:
-                    self._on_stby_clicked()
-                self._show_report("전류 그룹 확인", str(exc))
-                return
-            if idx > stop_idx or idx >= len(self.seq_steps):
-                self.seq_running = False
+            plan = self._seq_active_indices
+            if position >= len(plan):
+                self._on_seq_stop_auto(silent=True)
+                self.seq_paused_idx = -1
                 def finished(_state):
                     for r_i, step in enumerate(self.seq_steps):
                         if step.status == "▶ 측정 진행 중":
@@ -5183,32 +5912,37 @@ if HAS_TKINTER:
                     self.progress_var.set(100)
                     self.var_active_row_banner.set(f"{self._current_group_label()} 완료 — STBY 확인 완료. 케이블 변경 후 다른 그룹을 선택하세요.")
                     self.lbl_active_row_banner.configure(bg="#DCFCE7", fg="#166534")
-                self._on_seq_stop_auto(silent=True)
                 self._send_and_log("STBY", on_done=finished)
                 return
+
+            idx = plan[position]
             linked = self._seq_dut_run and self.seq_steps[idx].func_type in self._DUT_SEQUENCE_QUANTITIES
+            next_position = position + 1
+
             def completed():
-                if not self.seq_running:
+                if not self.seq_running or self._seq_active_indices is not plan:
                     return
-                if self.seq_steps[idx].breakpoint:
+                if self.seq_steps[idx].breakpoint and next_position < len(plan):
                     self.seq_steps[idx].status = "🛑 중단점 도달"
-                    self.seq_running = False
-                    self.seq_paused_idx = min(len(self.seq_steps) - 1, idx + 1)
-                    self.var_active_row_banner.set(f"#{idx + 1}행 중단점 도달 — 다음 행부터 재개 가능")
+                    self.seq_paused_idx = plan[next_position]
+                    self.var_active_row_banner.set(f"#{idx + 1}행 중단점 도달 · 재개하면 #{self.seq_paused_idx + 1}행부터 시작")
                     self.excel_grid._update_single_row_visual(idx, self.seq_steps[idx], is_active=False)
                     if self._seq_dut_run:
                         self._seq_dut_resume_required = True
                         self._on_stby_clicked()
+                    else:
+                        self._on_seq_stop_auto(silent=True)
                     return
                 self.seq_after_id = self.after(0 if linked else dwell_ms,
-                    lambda: self._run_next_auto_step(idx + 1, stop_idx, dwell_ms))
+                    lambda: self._run_next_auto_step(next_position, dwell_ms))
+
             if not self._execute_sequence_step(idx, on_complete=completed, dwell_ms=dwell_ms):
                 if self._seq_dut_run and self.conn_mgr.info.connected:
                     self._on_stby_clicked()
                 else:
                     self._on_seq_stop_auto(silent=True)
 
-        def _on_seq_stop_auto(self, silent: bool = False) -> None:
+        def _on_seq_stop_auto(self, silent: bool = False, *, keep_output: bool = False) -> None:
             had_linked_capture = self._sequence_dut_reserved()
             if self._seq_dut_pending is not None or (had_linked_capture and not silent):
                 self._seq_dut_resume_required = True
@@ -5226,19 +5960,18 @@ if HAS_TKINTER:
             self.seq_running = False
             if 0 <= self.seq_current_idx < len(self.seq_steps) and not silent:
                 st = self.seq_steps[self.seq_current_idx]
-                st.status = "⏸ 일시중단됨"
+                st.status = self._SEQUENCE_HOLD_STATUS if keep_output else self._SEQUENCE_STOPPED_STATUS
                 self.seq_paused_idx = self.seq_current_idx
                 self.var_active_row_banner.set(
-                    f"⏸ [일시중단됨: #{st.step_no}번 행] ({st.vi_cond_raw} | {st.freq_cond_raw} | {st.nominal_raw}) — [⏯ 중단된 행부터 이어서 시작] 가능"
+                    f"#{st.step_no}행 {st.status} · 재개하면 이 행부터 시작합니다. 출력 상태는 상단에서 확인하세요."
                 )
                 self.lbl_active_row_banner.configure(bg="#FED7AA", fg="#9A3412")
                 self.excel_grid._update_single_row_visual(self.seq_current_idx, st, is_active=False)
             if was_running and not silent:
-                self._log(f"[일시중단] #{self.seq_current_idx + 1}번 행에서 순차 실행을 중단했습니다.")
+                action = "출력 유지" if keep_output else "정지"
+                self._log(f"[{action}] #{self.seq_current_idx + 1}행에서 순차 실행을 중단했습니다.")
             if had_linked_capture:
                 self._dut_sync_controls()
-                if not silent and self.conn_mgr.info.connected:
-                    self._on_stby_clicked()
 
         def _on_seq_step_next(self):
             if self._sequence_dut_reserved() or self._seq_dut_reading:
@@ -5255,7 +5988,7 @@ if HAS_TKINTER:
                     if self.conn_mgr.info.connected:
                         self._on_stby_clicked()
                     return
-                self._seq_active_indices = [index]
+                self._seq_active_indices = []
                 self._execute_sequence_step(index)
             except ValueError as exc:
                 self._show_report("전류 그룹 확인", str(exc))
@@ -5271,7 +6004,7 @@ if HAS_TKINTER:
                 index = next((i for i in range(self.seq_current_idx - 1, -1, -1)
                               if self._step_in_current_group(self.seq_steps[i])), None)
                 if index is not None:
-                    self._seq_active_indices = [index]
+                    self._seq_active_indices = []
                     self._execute_sequence_step(index)
             except ValueError as exc:
                 self._show_report("전류 그룹 확인", str(exc))
@@ -5285,6 +6018,7 @@ if HAS_TKINTER:
             if not (0 <= idx < len(self.seq_steps)):
                 return
             self.var_seq_start_row.set(str(idx + 1))
+            self._seq_active_indices = []
             self._execute_sequence_step(idx)
 
         # -----------------------------------------------------------------
@@ -5296,7 +6030,7 @@ if HAS_TKINTER:
             row = tk.Frame(frame, bg="#F5F7FA")
             row.pack(fill="x")
             self.btn_console = self._ui_button(row, "통신 기록·수동 명령 ▾", self._toggle_console)
-            tk.Label(row, text="기록 자동 저장", bg="#F5F7FA", fg="#64748B").pack(side="right")
+            self.btn_log_folder = self._ui_button(row, "로그 저장 폴더", self._on_choose_log_folder, side="right")
             self.console_details = tk.Frame(frame, bg="white", padx=10, pady=8)
             self._console_open = False
             command_row = tk.Frame(self.console_details, bg="white")
@@ -5310,12 +6044,25 @@ if HAS_TKINTER:
             self.txt_log = tk.Text(self.console_details, height=5, bg="#F8FAFC", fg="#334155", font=("Consolas", 9),
                                     wrap="word", relief="flat", padx=8, pady=6)
             self.txt_log.pack(fill="both", expand=True)
+            self.var_log_folder = tk.StringVar(value=self._log_folder_text())
+            ttk.Label(self.console_details, textvariable=self.var_log_folder, foreground="#64748B",
+                      wraplength=1050).pack(fill="x", pady=(5, 0))
             # The detailed command remains available without occupying the safety bar.
             self.after_idle(self._attach_command_summary)
 
         def _on_connect_clicked(self):
             try:
+                if self._dut_busy:
+                    self.var_idn_display.set("DUT 연결 확인이 끝난 뒤 기준기를 연결하세요.")
+                    return
                 args = self._connection_arguments()
+                dut = self.dut_session.settings
+                if dut is not None:
+                    target = dut.address.upper()
+                    args.update(excluded_com=target if dut.mode == "SERIAL" else "",
+                                excluded_gpib=_dut_gpib_key(target),
+                                excluded_ip=_dut_discovery_ipv4(target) or _dut_discovery_resource_ip(target) or "",
+                                excluded_usb=_dut_discovery_usb_key(target))
                 def connect():
                     info = self.conn_mgr.scan_and_auto_connect(**args)
                     state = self.conn_mgr.query("OPER?").strip()
@@ -5325,10 +6072,29 @@ if HAS_TKINTER:
                     return info, state == "1"
                 def done(result):
                     info, self.is_operating = result
+                    model = self.conn_mgr.profile.model
+                    if model != self._configured_model:
+                        self.var_model.set(model)
+                        self._apply_calibrator_model(model)
+                    if info.discovered_ip:
+                        self.var_lan_ip.set(info.discovered_ip)
+                        self.var_lan_port.set(str(info.discovered_port))
                     self._update_connection_ui(info)
                     self._refresh_oper_badge()
-                    self._log(f"[연결 성공] {info.interface_type} | {info.idn_string} | PC 원본 IP: {self.conn_mgr.source_ip}")
-                self._start_io("장비 연결 및 식별 확인 중…", connect, done)
+                    if info.interface_type.startswith("RS232"):
+                        self.var_serial_port.set(info.resource_name.split(" / ", 1)[0])
+                    route = f" | PC 원본 IP: {self.conn_mgr.source_ip}" if info.discovered_ip else ""
+                    self._log(f"[연결 성공] {info.interface_type} | {info.resource_name} | {info.idn_string}{route}")
+                def failed(exc):
+                    if args["preferred_mode"] != "AUTO" or self.conn_mgr.info.connected:
+                        self._show_report("통신 안내", self._last_report)
+                        return
+                    if isinstance(exc, OperationCancelled):
+                        return
+                    self.var_idn_display.set("기준기를 찾지 못했습니다. LAN 연결이면 상세 설정 → LAN IP에 본체 주소를 입력하고 다시 연결하세요.")
+                    if not self._connection_details_open:
+                        self._toggle_connection_details()
+                self._start_io("장비 연결 및 식별 확인 중…", connect, done, on_error=failed)
             except Exception as exc:
                 messagebox.showerror("입력 확인", str(exc))
 
@@ -5360,7 +6126,7 @@ if HAS_TKINTER:
                 self.var_idn_display.set(f"{info.interface_type}  ·  {info.resource_name}  ·  {info.idn_string}")
             else:
                 self.lbl_conn_badge.configure(text="연결 안 됨", bg="#E2E8F0", fg="#64748B")
-                self.var_idn_display.set("모델과 연결 방식을 선택하세요.")
+                self.var_idn_display.set("연결을 누르면 기준기를 찾습니다.")
             self._refresh_connection_controls()
 
         def _ensure_connected_or_sim(self) -> bool:
@@ -5391,24 +6157,42 @@ if HAS_TKINTER:
                 self.conn_mgr.operation_timeout = self._get_operation_timeout()
             full_cmd = f"{cmd}; OPER" if auto_oper else cmd
             self.conn_mgr.profile.validate_command(full_cmd)
+            model = self.conn_mgr.profile.model
+            parts = [part.strip().upper() for part in cmd.split(";")]
+            requests_output = auto_oper or "OPER" in parts
+            requested_post = None
+            if model != "5560A" and "OPER" not in parts and not self.conn_mgr.info.interface_type.startswith("SIMULATION"):
+                requested_post = next((part.split(maxsplit=1)[1] for part in reversed(parts)
+                                       if part.startswith("CUR_POST ")), None)
             self.var_active_cmd_summary.set(f"전송 요청: {full_cmd}")
             self.is_operating = None
             self._refresh_oper_badge()
             def operation():
-                if dual_current and self.conn_mgr.query("OPER?").strip() != "0":
+                changing_active_post = (requested_post is not None
+                                        and self.conn_mgr.query("OPER?") == "1"
+                                        and self.conn_mgr.query("CUR_POST?").upper() != requested_post)
+                if changing_active_post or (dual_current and self.conn_mgr.query("OPER?") != "0"):
                     self.conn_mgr.send_command("STBY")
                     if self.conn_mgr.query("OPER?").strip() != "0":
-                        raise InstrumentProtocolError("5560A STBY를 확인하지 못했습니다. 본체 출력 상태를 확인하세요.")
-                if verify_setpoint or dual_current:
+                        raise InstrumentProtocolError(f"{model} STBY를 확인하지 못했습니다. 본체 출력 상태를 확인하세요.")
+                if verify_setpoint or dual_current or requested_post is not None:
                     self.conn_mgr.send_command(cmd, check_before=True)
                     if dual_current and not self.conn_mgr.info.interface_type.startswith("SIMULATION"):
                         self.conn_mgr.profile.verify_dual_current_readback(cmd, self.conn_mgr.query("OUT?"))
+                    if requested_post is not None:
+                        actual_post = self.conn_mgr.query("CUR_POST?").upper()
+                        if actual_post != requested_post:
+                            if self.conn_mgr.query("OPER?") != "0":
+                                self.conn_mgr.send_command("STBY")
+                                if self.conn_mgr.query("OPER?") != "0":
+                                    raise InstrumentProtocolError(f"{model} 전류 단자 불일치 후 STBY를 확인하지 못했습니다.")
+                            raise InstrumentCommandError(
+                                f"{model} 전류 단자 불일치 · 설정 {requested_post}, 본체 {actual_post}. "
+                                "STBY 확인 완료, 연결 유지.")
                     if auto_oper:
-                        self.conn_mgr.send_command("OPER")
+                        self.conn_mgr.send_command("OPER", check_before=model != "5560A")
                 else:
-                    command = cmd.strip().upper()
-                    check_before = self.conn_mgr.profile.model == "5560A" and (
-                        auto_oper or command.startswith("OUT ") or command == "OPER")
+                    check_before = requests_output or any(part.startswith("OUT ") for part in parts)
                     self.conn_mgr.send_command(full_cmd, check_before=check_before)
                 state = self.conn_mgr.query("OPER?").strip()
                 if state not in ("0", "1"):
@@ -5418,9 +6202,9 @@ if HAS_TKINTER:
                     raise error
                 if standby and state != "0":
                     raise InstrumentProtocolError("STBY 요청 후에도 OPER 상태입니다. 본체에서 출력을 끄세요.")
-                if self.conn_mgr.profile.model == "5560A" and (auto_oper or cmd.strip().upper() == "OPER") and state == "0":
+                if requests_output and state == "0":
                     error = self.conn_mgr.query("ERR?")
-                    raise InstrumentCommandError(f"5560A 출력 중단 · {error}. STBY 확인 완료, 연결 유지.")
+                    raise InstrumentCommandError(f"{model} 출력 중단 · {error}. STBY 확인 완료, 연결 유지.")
                 return state == "1"
             def done(state):
                 self.is_operating = state
@@ -5475,6 +6259,10 @@ if HAS_TKINTER:
             else:
                 text, bg, fg = "STBY · 출력 대기", "#DCFCE7", "#166534"
             self.lbl_output_state.configure(text=text, bg=bg, fg=fg)
+            if self.conn_mgr.info.connected and self.conn_mgr.zero_adjustment_due:
+                self.lbl_zero_adjustment.pack(side="left", after=self.lbl_output_state, padx=(0, 10))
+            else:
+                self.lbl_zero_adjustment.pack_forget()
 
         def _on_manual_send(self, is_query):
             if not self._ensure_connected_or_sim():
@@ -5497,6 +6285,15 @@ if HAS_TKINTER:
         def _on_check_err(self) -> None:
             self.var_manual_cmd.set("ERR?")
             self._on_manual_send(is_query=True)
+
+        def _on_seq_hold_clicked(self):
+            if self.seq_running or self._sequence_dut_reserved():
+                self._on_seq_stop_auto(silent=False, keep_output=True)
+
+        def _on_seq_stop_clicked(self):
+            self._on_seq_stop_auto(silent=False)
+            if self.conn_mgr.info.connected:
+                self._on_stby_clicked()
 
         def _build_current_group_panel(self, container, toolbar):
             self._group_high_only = False
@@ -5757,7 +6554,7 @@ if HAS_TKINTER:
             else:
                 apply()
 
-        def _start_filtered_sequence(self, start_idx, stop_idx):
+        def _start_filtered_sequence(self, start_idx, stop_idx, *, remaining=None):
             if self._sequence_dut_reserved() or self._seq_dut_reading:
                 self._log('DUT 기록을 중단하거나 현재 조회가 끝난 뒤 실행하세요.')
                 return
@@ -5767,13 +6564,18 @@ if HAS_TKINTER:
                 dwell = float(self.var_seq_dwell_sec.get())
                 if not .2 <= dwell <= 86_400:
                     raise ValueError("유지시간은 0.2~86400초 사이여야 합니다.")
-                plan = [i for i in range(start_idx, stop_idx + 1) if self._step_in_current_group(self.seq_steps[i])]
+                rows = range(start_idx, stop_idx + 1) if remaining is None else remaining
+                plan = [i for i in rows if 0 <= i < len(self.seq_steps) and self._step_in_current_group(self.seq_steps[i])]
                 for i in plan:
                     step = self.seq_steps[i]
                     if not step.scpi_cmd or step.func_type == "ERROR":
                         raise ValueError(f"#{step.step_no}행 설정을 확인하세요: {step.actual_out_desc}")
+                    if self._sequence_dut_enabled() and step.func_type in self._DUT_SEQUENCE_QUANTITIES:
+                        self._dut_channel_for_step(step)
                     command, _ = self._sequence_output_command(step)
                     MODEL_PROFILES[self._selected_model()].validate_command(command)
+                if any(self.seq_steps[i].dut_channel is not None for i in plan):
+                    plan.sort(key=lambda i: (self._sequence_channel_order(i), i))
             except (ValueError, IndexError) as exc:
                 self._show_report("순차 실행 설정 확인", str(exc))
                 return
@@ -5788,9 +6590,8 @@ if HAS_TKINTER:
                 return
             if not self._ensure_connected_or_sim():
                 return
-            for i in range(start_idx, stop_idx + 1):
-                if i in plan:
-                    self.seq_steps[i].status = "대기"
+            for i in plan:
+                self.seq_steps[i].status = "대기"
             self._refresh_current_group_preview()
             self.progress_var.set(0)
             self._seq_dut_run = self._sequence_dut_enabled() and any(
@@ -5799,7 +6600,15 @@ if HAS_TKINTER:
             self.seq_running = True
             self._dut_sync_controls()
             self._log(f"[그룹 순차 시작] {self._current_group_label()} | 표의 실행 행: {', '.join(str(i + 1) for i in plan)} | 유지 {dwell:g}초")
-            self._run_next_auto_step(start_idx, stop_idx, int(dwell * 1000))
+            self._run_next_auto_step(0, int(dwell * 1000))
+
+        def _sequence_channel_order(self, index):
+            step = self.seq_steps[index]
+            if step.dut_channel is not None:
+                return step.dut_channel
+            if self._sequence_dut_enabled() and step.func_type in self._DUT_SEQUENCE_QUANTITIES:
+                return self._dut_channel_for_step(step)
+            return math.inf
 
         def _selected_model(self):
             if self.conn_mgr.info.connected:
@@ -5846,6 +6655,9 @@ if HAS_TKINTER:
             if requested not in MODEL_PROFILES:
                 self.var_model.set(self._configured_model)
                 return
+            self._apply_calibrator_model(requested)
+
+        def _apply_calibrator_model(self, requested):
             self._configured_model = requested
             self._sync_model_controls()
             self.seq_current_idx = self.seq_paused_idx = -1
@@ -5860,9 +6672,9 @@ if HAS_TKINTER:
                 choices = [f"{device} | {description}" for device, description in ports]
                 current = self.var_serial_port.get().split(" | ", 1)[0]
                 self.combo_serial_port.configure(values=choices)
-                if not current and choices:
-                    self.var_serial_port.set(choices[0])
-                note = ("COM 포트를 선택하세요. 다른 장치에는 연결하지 않습니다." if choices else
+                if current and current not in {device for device, _ in ports}:
+                    self.var_serial_port.set("")
+                note = ("COM을 선택하거나 비워 두고 연결하면 자동으로 찾습니다." if choices else
                         "COM 포트가 없습니다. 컨버터 드라이버/케이블을 확인하세요." if HAS_PYSERIAL else
                         "pyserial이 없습니다. 통신라이브러리_설치.cmd를 실행하세요.")
                 self.var_idn_display.set(note)
@@ -5900,10 +6712,17 @@ if HAS_TKINTER:
                 frame.pack_forget()
                 visible = key == mode or (key == "VISA" and mode in ("USB", "GPIB"))
                 if mode == "AUTO":
-                    supported = MODEL_PROFILES[self._configured_model].interfaces
-                    visible = key in ("AUTO", "RS232") or (key == "LAN" and "LAN" in supported) or (key == "VISA" and "GPIB" in supported)
+                    visible = True
                 if visible:
                     frame.pack(fill="x", pady=4)
+            self._sync_connection_model_choice()
+
+        def _sync_connection_model_choice(self):
+            show = self.var_conn_mode.get() != "AUTO" or self.conn_mgr.info.connected
+            if show and not self.model_choice_row.winfo_manager():
+                self.model_choice_row.pack(side="left", before=self.mode_label)
+            elif not show:
+                self.model_choice_row.pack_forget()
 
         def _toggle_connection_details(self):
             self._connection_details_open = not self._connection_details_open
@@ -5920,6 +6739,7 @@ if HAS_TKINTER:
             self.combo_conn_mode.configure(state="disabled" if locked else "readonly")
             self.btn_connect.configure(state="disabled" if locked else "normal")
             self.btn_disconnect.configure(state="normal" if connected and not self._io_busy else "disabled")
+            self._sync_connection_model_choice()
 
         def _paste_into_empty_sheet(self, event):
             if self.seq_steps or self.notebook.select() != str(self.tab_sequence):
@@ -5937,6 +6757,25 @@ if HAS_TKINTER:
                 self.sequence_details.pack_forget()
             self.btn_sequence_details.configure(text="범위·그룹 설정 ▴" if self._sequence_details_open else "범위·그룹 설정 ▾")
 
+        def _log_folder_text(self):
+            folder = os.path.dirname(self.conn_mgr.log_path)
+            warning = self.conn_mgr.log_folder_warning
+            return f"로그 저장 위치  {folder}" + (f"\n{warning}" if warning else "")
+
+        def _on_choose_log_folder(self):
+            current = os.path.dirname(self.conn_mgr.log_path)
+            options = {"initialdir": current} if os.path.isdir(current) else {}
+            folder = filedialog.askdirectory(parent=self, title="로그 저장 폴더 선택", mustexist=True, **options)
+            if not folder:
+                return
+            try:
+                self.conn_mgr.set_log_folder(folder)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("로그 폴더 변경 실패", str(exc), parent=self)
+                return
+            self.var_log_folder.set(self._log_folder_text())
+            self._log(f"통신 기록 저장 위치 변경: {self.conn_mgr.log_path}")
+
         def _attach_command_summary(self):
             ttk.Label(self.console_details, textvariable=self.var_active_cmd_summary, foreground="#64748B",
                       wraplength=1050).pack(fill="x", pady=(5, 0))
@@ -5949,6 +6788,140 @@ if HAS_TKINTER:
                 self.console_details.pack_forget()
             self.btn_console.configure(text="통신 기록·수동 명령 ▴" if self._console_open else "통신 기록·수동 명령 ▾")
 
+        def _open_channel_assignment(self):
+            if self._io_busy or self.seq_running or self._sequence_dut_reserved() or self._seq_dut_reading:
+                self.var_active_row_banner.set("측정을 멈춘 뒤 채널을 배정하세요.")
+                return
+            if not self.seq_steps:
+                self.var_active_row_banner.set("측정 조건을 붙여넣은 뒤 채널을 배정하세요.")
+                return
+
+            dialog = tk.Toplevel(self)
+            dialog.title("DUT 채널 배정")
+            dialog.transient(self)
+            dialog.resizable(False, False)
+            body = ttk.Frame(dialog, padding=14)
+            body.pack(fill="both", expand=True)
+            channels = self.dut_session.available_channels or tuple(range(1, 8))
+            start = tk.StringVar(dialog, value="1")
+            end = tk.StringVar(dialog, value=str(len(self.seq_steps)))
+            first_channel = tk.StringVar(dialog, value=str(channels[0]))
+            mode = tk.StringVar(dialog, value="7항목 자동 감지")
+            preview = tk.StringVar(dialog, value="배정할 행 범위와 첫 채널을 정한 뒤 미리보기를 누르세요.")
+            plan = {}
+
+            settings = ttk.Frame(body)
+            settings.pack(fill="x")
+            self._ui_combo(settings, mode, ("7항목 자동 감지", "한 채널 지정", "배정 해제"), 16)
+            self._ui_entry(settings, start, 5)
+            self._ui_label(settings, "–")
+            self._ui_entry(settings, end, 5)
+            self._ui_label(settings, "행")
+            self._ui_label(settings, "첫 채널")
+            channel_input = self._ui_combo(settings, first_channel, channels, 4)
+            review_frame = ttk.Frame(body)
+            review_frame.pack(fill="x", pady=12)
+            display = tk.Text(review_frame, height=11, width=62, wrap="word", relief="flat", padx=5, pady=5)
+            scroll = ttk.Scrollbar(review_frame, orient="vertical", command=display.yview)
+            scroll.pack(side="right", fill="y")
+            display.configure(yscrollcommand=scroll.set)
+            display.pack(fill="both", expand=True)
+
+            def show_preview(*_):
+                display.configure(state="normal")
+                display.delete("1.0", "end")
+                display.insert("1.0", preview.get())
+                display.configure(state="disabled")
+
+            preview.trace_add("write", show_preview)
+            actions = ttk.Frame(body)
+            actions.pack(fill="x")
+
+            def invalidate(*_):
+                plan.clear()
+                preview.set("미리보기를 눌러 배정을 확인하세요.")
+                apply_button.state(["disabled"])
+                channel_input.configure(state="disabled" if mode.get() == "배정 해제" else "readonly")
+
+            def review():
+                invalidate()
+                automatic = mode.get() == "7항목 자동 감지"
+                clear = mode.get() == "배정 해제"
+                try:
+                    left, right = int(start.get()) - 1, int(end.get())
+                    if not 0 <= left < right <= len(self.seq_steps):
+                        raise ValueError("측정표에 있는 행 범위를 입력하세요.")
+                    selection = self.seq_steps[left:right]
+                    if automatic:
+                        sections = detect_channel_sections(selection)
+                        if not sections:
+                            raise ValueError("일곱 항목에서 채널을 구분할 반복 조건을 찾지 못했습니다. ‘한 채널 지정’을 사용할 수 있습니다.")
+                    else:
+                        rows = [i for i, step in enumerate(selection) if clear or step.func_type != "BLANK"]
+                        if not rows:
+                            raise ValueError("배정할 측정 행이 없습니다.")
+                        sections = [("배정 해제" if clear else "선택 범위", [rows])]
+                    available = (None,) if clear else channels[channels.index(int(first_channel.get())):]
+                except ValueError as exc:
+                    preview.set(str(exc))
+                    return
+                descriptions = []
+                for name, blocks in sections:
+                    if len(blocks) > len(available):
+                        descriptions.append(f"{name} · 반복 {len(blocks)}개, 사용 가능한 채널 {len(available)}개 · 배정 보류")
+                        continue
+                    ranges = []
+                    for block, channel in zip(blocks, available):
+                        indices = [index + left for index in block]
+                        plan.update((index, channel) for index in indices)
+                        prefix = f"CH{channel} " if channel is not None else ""
+                        ranges.append(f"{prefix}{channel_row_ranges(indices)}행")
+                    descriptions.append(f"{name} · {' / '.join(ranges)}")
+                if automatic:
+                    rows = sum(_channel_measurement_kind(step) is not None for step in selection)
+                    if rows > len(plan):
+                        descriptions.append(f"자동 배정 보류 {rows - len(plan)}행")
+                recorded = sum(bool(self.seq_steps[index].measured_raw)
+                               for index, channel in plan.items() if self.seq_steps[index].dut_channel != channel)
+                if recorded:
+                    descriptions.append(f"측정값이 있는 {recorded}행의 채널 배정이 바뀝니다. 기존 측정값은 유지됩니다.")
+                preview.set("\n".join(descriptions))
+                if plan:
+                    apply_button.state(["!disabled"])
+
+            def apply():
+                if self._io_busy or self.seq_running or self._sequence_dut_reserved() or self._seq_dut_reading:
+                    preview.set("측정을 멈춘 뒤 다시 시도하세요.")
+                    return
+                self._apply_channel_assignment(plan)
+                dialog.destroy()
+
+            self._ui_button(actions, "미리보기", review)
+            apply_button = self._ui_button(actions, "적용", apply, "Primary.TButton")
+            apply_button.state(["disabled"])
+            self._ui_button(actions, "닫기", dialog.destroy, side="right")
+            for field in (start, end, first_channel, mode):
+                field.trace_add("write", invalidate)
+            review()
+            dialog.wait_visibility()
+            dialog.grab_set()
+
+        def _apply_channel_assignment(self, plan):
+            for index, channel in plan.items():
+                self.seq_steps[index].dut_channel = channel
+            self.excel_grid.render_steps(self.seq_steps, active_idx=self.seq_current_idx)
+            self._refresh_current_group_preview()
+            channels = sorted({channel for channel in plan.values() if channel is not None})
+            summary = " · ".join(f"CH{channel}" for channel in channels) or "채널 배정 해제"
+            self.var_active_row_banner.set(f"{summary} · {len(plan)}행 적용")
+            self._log(f"[DUT 채널 배정] {summary} · {len(plan)}행")
+
+        def _dut_channel_for_step(self, step):
+            channel = step.dut_channel if step.dut_channel is not None else int(self.var_dut_channel.get())
+            if channel not in self.dut_session.available_channels:
+                raise ValueError(f"#{step.step_no}행 CH{channel}은 연결된 DUT에서 사용할 수 없습니다.")
+            return channel
+
         def _log(self, msg: str) -> None:
             self.conn_mgr.record_event(msg)
             ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -5959,7 +6932,7 @@ if HAS_TKINTER:
 def run_cli_interactive(model="5560A") -> None:
     mgr = Fluke5560AConnectionManager()
     print("=" * 88)
-    print(" Fluke 5560A Multi-Product Calibrator Controller v6.10.10 (CLI Mode)")
+    print(" Fluke 5560A Multi-Product Calibrator Controller v6.10.26 (CLI Mode)")
     print("=" * 88)
     print(f"현재 PC 로컬 IPv4: {mgr.get_local_pc_ipv4_list()}")
     print(f"감지된 이더넷 어댑터: {AutoNetworkAligner.list_ethernet_interfaces()}")

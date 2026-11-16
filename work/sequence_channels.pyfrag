@@ -1,0 +1,93 @@
+CHANNEL_MEASUREMENT_NAMES = {
+    "DCV": "DC 전압", "ACV": "AC 전압", "DCI": "DC 전류", "ACI": "AC 전류",
+    "DCP": "DC 전력", "ACP": "AC 전력", "PF": "역률",
+}
+
+
+def _channel_frequency(step):
+    parsed = SmartClipboardSequenceParser.parse_value_and_unit(step.freq_cond_raw)
+    if parsed:
+        base, scale = SIUnits.split(parsed[1])
+        if base == "HZ":
+            return parsed[0] * scale
+    if step.freq_cond_raw.strip().upper() in ("", "-", "DC", "0"):
+        return 0.0
+    return step.freq_cond_raw.strip()
+
+
+def _channel_measurement_kind(step):
+    if step.func_type in CHANNEL_MEASUREMENT_NAMES:
+        return step.func_type
+    if step.func_type != "OUT_OF_RANGE":
+        return None
+    target = SmartClipboardSequenceParser.parse_value_and_unit(step.nominal_raw)
+    if target is None:
+        return "PF" if SmartClipboardSequenceParser.VI_SLASH_PATTERN.fullmatch(step.vi_cond_raw.strip()) else None
+    base, _ = SIUnits.split(target[1])
+    quantity = {"V": "V", "A": "I", "W": "P"}.get(base)
+    frequency = _channel_frequency(step)
+    if quantity and isinstance(frequency, (float, int)):
+        return ("AC" if frequency > 0 else "DC") + quantity
+    return None
+
+
+def repeated_channel_blocks(steps):
+    """Return row indices for exact repeated blocks of measurement conditions."""
+    rows = [index for index, step in enumerate(steps) if step.func_type != "BLANK"]
+    keys = [
+        (_channel_measurement_kind(step), _channel_frequency(step),
+         *(re.sub(r"\s+", "", value) for value in (step.vi_cond_raw, step.pf_cond_raw, step.nominal_raw)))
+        for step in (steps[index] for index in rows)
+    ]
+    for size in range(2, len(keys) // 2 + 1):
+        if len(keys) % size:
+            continue
+        pattern = keys[:size]
+        if len(set(pattern)) > 1 and keys == pattern * (len(keys) // size):
+            return [rows[start:start + size] for start in range(0, len(rows), size)]
+    return []
+
+
+def detect_channel_sections(steps):
+    """Find a repeated sequence for each measurement type, then per frequency."""
+    by_kind = {kind: [] for kind in CHANNEL_MEASUREMENT_NAMES}
+    for index, step in enumerate(steps):
+        kind = _channel_measurement_kind(step)
+        if kind:
+            by_kind[kind].append(index)
+
+    def find_blocks(indices):
+        positions = repeated_channel_blocks([steps[i] for i in indices])
+        return [[indices[i] for i in block] for block in positions]
+
+    sections = []
+    for kind, indices in by_kind.items():
+        name = CHANNEL_MEASUREMENT_NAMES[kind]
+        blocks = find_blocks(indices)
+        if blocks:
+            sections.append((name, blocks))
+            continue
+        frequencies = {}
+        for index in indices:
+            frequencies.setdefault(_channel_frequency(steps[index]), []).append(index)
+        if len(frequencies) < 2:
+            continue
+        for frequency, subset in frequencies.items():
+            blocks = find_blocks(subset)
+            if blocks:
+                label = f"{frequency:g} Hz" if isinstance(frequency, (float, int)) and frequency else frequency or "DC"
+                sections.append((f"{name} · {label}", blocks))
+    return sections
+
+
+def channel_row_ranges(indices):
+    ranges = []
+    for index in indices:
+        row = index + 1
+        if ranges and ranges[-1][1] + 1 == row:
+            ranges[-1][1] = row
+        else:
+            ranges.append([row, row])
+    return ", ".join(str(start) if start == end else f"{start}~{end}" for start, end in ranges)
+
+

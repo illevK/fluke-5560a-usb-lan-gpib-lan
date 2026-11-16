@@ -86,7 +86,7 @@
             self._last_report = ""
             self._connection_buttons = []
             self._configured_model = "5560A"
-            for name, value in (("model", "5560A"), ("conn_mode", "LAN"), ("lan_ip", "169.254.1.1"),
+            for name, value in (("model", "5560A"), ("conn_mode", "AUTO"), ("lan_ip", ""),
                                 ("lan_port", "3490"), ("gpib_addr", "1"), ("timeout", "3"),
                                 ("operation_timeout", "60"), ("eol", "CRLF"), ("visa_resource", ""),
                                 ("adapter_choice", ""), ("serial_port", ""), ("baudrate", "9600"),
@@ -95,10 +95,11 @@
                 setattr(self, "var_" + name, tk.StringVar(value=value))
             row = tk.Frame(card, bg="white")
             row.pack(fill="x")
-            self._ui_label(row, "모델")
-            self.combo_model = self._ui_combo(row, self.var_model, list(MODEL_PROFILES), 8)
+            self.model_choice_row = tk.Frame(row, bg="white")
+            self._ui_label(self.model_choice_row, "모델")
+            self.combo_model = self._ui_combo(self.model_choice_row, self.var_model, list(MODEL_PROFILES), 8)
             self.combo_model.bind("<<ComboboxSelected>>", lambda _e: self._on_model_changed())
-            self._ui_label(row, "연결")
+            self.mode_label = self._ui_label(row, "기준기")
             self.combo_conn_mode = self._ui_combo(row, self.var_conn_mode, (), 9)
             actions = tk.Frame(row, bg="white")
             actions.pack(side="right")
@@ -123,7 +124,7 @@
             self._ui_label(endpoint, "장비 주소")
             self._ui_entry(endpoint, self.var_gpib_addr, 4)
             self._ui_label(self.connection_endpoints["USB"], "후면 USB Device · USBTMC")
-            self._ui_label(self.connection_endpoints["AUTO"], "상세 설정의 주소·포트로 검색")
+            self._ui_label(self.connection_endpoints["AUTO"], "장비 모델과 연결 방식 자동 확인")
             self._ui_label(self.connection_endpoints["SIMULATION"], "가상 장비 · 실제 출력 없음")
 
             self.connection_details = tk.Frame(card, bg="white", pady=8)
@@ -140,7 +141,7 @@
             self._connection_buttons.append(self._ui_button(common, "시뮬레이션", self._on_sim_connect_clicked))
             self._connection_buttons.append(self._ui_button(common, "진단 저장", self._on_save_report))
             self.connection_detail_rows = {}
-            for key in ("LAN", "RS232", "VISA", "AUTO"):
+            for key in ("AUTO", "LAN", "RS232", "VISA"):
                 self.connection_detail_rows[key] = tk.Frame(self.connection_details, bg="white")
             lan = self.connection_detail_rows["LAN"]
             self._ui_label(lan, "랜카드")
@@ -159,12 +160,12 @@
             self._ui_entry(visa, self.var_visa_resource, 40)
             self._ui_label(visa, "USB–GPIB는 GPIB, USB–RS232는 RS232 선택")
             auto = self.connection_detail_rows["AUTO"]
-            for title, name, width in (("IP", "lan_ip", 16), ("포트", "lan_port", 5),
+            for title, name, width in (("LAN IP", "lan_ip", 16), ("포트", "lan_port", 5),
                                        ("COM", "serial_port", 12), ("GPIB 주소", "gpib_addr", 4)):
                 self._ui_label(auto, title)
                 self._ui_entry(auto, getattr(self, "var_" + name), width)
             ttk.Label(self.connection_details, textvariable=self.var_model_note, foreground="#64748B").pack(side="bottom", anchor="w", pady=(8, 0))
-            self.var_idn_display = tk.StringVar(value="모델과 연결 방식을 선택하세요.")
+            self.var_idn_display = tk.StringVar(value="연결을 누르면 기준기를 찾습니다.")
             self.connection_status = tk.Label(card, textvariable=self.var_idn_display, bg="white", fg="#64748B",
                                               anchor="w", justify="left", wraplength=1100)
             self.connection_status.pack(fill="x", pady=(7, 0))
@@ -187,10 +188,17 @@
                 frame.pack_forget()
                 visible = key == mode or (key == "VISA" and mode in ("USB", "GPIB"))
                 if mode == "AUTO":
-                    supported = MODEL_PROFILES[self._configured_model].interfaces
-                    visible = key in ("AUTO", "RS232") or (key == "LAN" and "LAN" in supported) or (key == "VISA" and "GPIB" in supported)
+                    visible = True
                 if visible:
                     frame.pack(fill="x", pady=4)
+            self._sync_connection_model_choice()
+
+        def _sync_connection_model_choice(self):
+            show = self.var_conn_mode.get() != "AUTO" or self.conn_mgr.info.connected
+            if show and not self.model_choice_row.winfo_manager():
+                self.model_choice_row.pack(side="left", before=self.mode_label)
+            elif not show:
+                self.model_choice_row.pack_forget()
 
         def _toggle_connection_details(self):
             self._connection_details_open = not self._connection_details_open
@@ -207,6 +215,7 @@
             self.combo_conn_mode.configure(state="disabled" if locked else "readonly")
             self.btn_connect.configure(state="disabled" if locked else "normal")
             self.btn_disconnect.configure(state="normal" if connected and not self._io_busy else "disabled")
+            self._sync_connection_model_choice()
 
         def _build_safety_bar(self):
             bar = tk.Frame(self, bg="#F5F7FA", padx=2, pady=8)
@@ -214,6 +223,8 @@
             self.lbl_output_state = tk.Label(bar, text="출력 상태 미확인", bg="#E2E8F0", fg="#475569",
                                              padx=10, pady=6, font=("Malgun Gothic", 9, "bold"))
             self.lbl_output_state.pack(side="left", padx=(0, 10))
+            self.lbl_zero_adjustment = tk.Label(bar, text="5560A 영점 조정 필요", bg="#FEF3C7", fg="#92400E",
+                                               padx=10, pady=6, font=("Malgun Gothic", 9, "bold"))
             self._ui_button(bar, "출력 켜기 · OPER", self._on_oper_clicked)
             self.btn_standby = self._ui_button(bar, "출력 끄기 · STBY", self._on_stby_clicked, "Stop.TButton")
             self._ui_button(bar, "장비 초기화", self._on_reset_clicked, side="right")
@@ -233,6 +244,7 @@
             menu.add_command(label="빈 행 추가", command=self._on_add_blank_row)
             menu.add_command(label="시트 비우기", command=self._on_clear_sheet)
             edit.configure(menu=menu)
+            self.btn_channel_assignment = self._ui_button(toolbar, "채널 배정", self._open_channel_assignment)
             self.var_seq_use_coil = tk.BooleanVar(value=False)
             ttk.Checkbutton(toolbar, text="턴코일", variable=self.var_seq_use_coil,
                             command=self._recalculate_all_grid_steps).pack(side="left", padx=(0, 6))
@@ -278,7 +290,8 @@
             controls.pack(side="bottom", fill="x")
             self._ui_button(controls, "시작", self._on_seq_start_from_selected_or_range, "Primary.TButton")
             self._ui_button(controls, "처음부터", lambda: self._on_seq_start_from_selected_or_range(all_rows=True))
-            self._ui_button(controls, "일시정지", lambda: self._on_seq_stop_auto(silent=False))
+            self.btn_seq_hold = self._ui_button(controls, "출력 유지", self._on_seq_hold_clicked)
+            self.btn_seq_stop = self._ui_button(controls, "정지", self._on_seq_stop_clicked, "Stop.TButton")
             self._ui_button(controls, "재개", self._on_seq_resume_from_paused)
             self._ui_label(controls, "  유지")
             self._ui_entry(controls, self.var_seq_dwell_sec, 5)
@@ -393,7 +406,7 @@
             row = tk.Frame(frame, bg="#F5F7FA")
             row.pack(fill="x")
             self.btn_console = self._ui_button(row, "통신 기록·수동 명령 ▾", self._toggle_console)
-            tk.Label(row, text="기록 자동 저장", bg="#F5F7FA", fg="#64748B").pack(side="right")
+            self.btn_log_folder = self._ui_button(row, "로그 저장 폴더", self._on_choose_log_folder, side="right")
             self.console_details = tk.Frame(frame, bg="white", padx=10, pady=8)
             self._console_open = False
             command_row = tk.Frame(self.console_details, bg="white")
@@ -407,8 +420,30 @@
             self.txt_log = tk.Text(self.console_details, height=5, bg="#F8FAFC", fg="#334155", font=("Consolas", 9),
                                     wrap="word", relief="flat", padx=8, pady=6)
             self.txt_log.pack(fill="both", expand=True)
+            self.var_log_folder = tk.StringVar(value=self._log_folder_text())
+            ttk.Label(self.console_details, textvariable=self.var_log_folder, foreground="#64748B",
+                      wraplength=1050).pack(fill="x", pady=(5, 0))
             # The detailed command remains available without occupying the safety bar.
             self.after_idle(self._attach_command_summary)
+
+        def _log_folder_text(self):
+            folder = os.path.dirname(self.conn_mgr.log_path)
+            warning = self.conn_mgr.log_folder_warning
+            return f"로그 저장 위치  {folder}" + (f"\n{warning}" if warning else "")
+
+        def _on_choose_log_folder(self):
+            current = os.path.dirname(self.conn_mgr.log_path)
+            options = {"initialdir": current} if os.path.isdir(current) else {}
+            folder = filedialog.askdirectory(parent=self, title="로그 저장 폴더 선택", mustexist=True, **options)
+            if not folder:
+                return
+            try:
+                self.conn_mgr.set_log_folder(folder)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("로그 폴더 변경 실패", str(exc), parent=self)
+                return
+            self.var_log_folder.set(self._log_folder_text())
+            self._log(f"통신 기록 저장 위치 변경: {self.conn_mgr.log_path}")
 
         def _attach_command_summary(self):
             ttk.Label(self.console_details, textvariable=self.var_active_cmd_summary, foreground="#64748B",
@@ -430,7 +465,7 @@
                 self.var_idn_display.set(f"{info.interface_type}  ·  {info.resource_name}  ·  {info.idn_string}")
             else:
                 self.lbl_conn_badge.configure(text="연결 안 됨", bg="#E2E8F0", fg="#64748B")
-                self.var_idn_display.set("모델과 연결 방식을 선택하세요.")
+                self.var_idn_display.set("연결을 누르면 기준기를 찾습니다.")
             self._refresh_connection_controls()
 
         def _refresh_oper_badge(self):
@@ -441,4 +476,8 @@
             else:
                 text, bg, fg = "STBY · 출력 대기", "#DCFCE7", "#166534"
             self.lbl_output_state.configure(text=text, bg=bg, fg=fg)
+            if self.conn_mgr.info.connected and self.conn_mgr.zero_adjustment_due:
+                self.lbl_zero_adjustment.pack(side="left", after=self.lbl_output_state, padx=(0, 10))
+            else:
+                self.lbl_zero_adjustment.pack_forget()
 

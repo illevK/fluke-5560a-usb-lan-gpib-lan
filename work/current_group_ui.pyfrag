@@ -232,20 +232,23 @@
             else:
                 apply()
 
-        def _start_filtered_sequence(self, start_idx, stop_idx):
+        def _start_filtered_sequence(self, start_idx, stop_idx, *, remaining=None):
             if self._io_busy:
                 return
             try:
                 dwell = float(self.var_seq_dwell_sec.get())
                 if not math.isfinite(dwell) or dwell < .2:
                     raise ValueError("유지시간은 0.2초 이상의 유한한 숫자여야 합니다.")
-                plan = [i for i in range(start_idx, stop_idx + 1) if self._step_in_current_group(self.seq_steps[i])]
+                rows = range(start_idx, stop_idx + 1) if remaining is None else remaining
+                plan = [i for i in rows if 0 <= i < len(self.seq_steps) and self._step_in_current_group(self.seq_steps[i])]
                 for i in plan:
                     step = self.seq_steps[i]
                     if not step.scpi_cmd or step.func_type == "ERROR":
                         raise ValueError(f"#{step.step_no}행 설정을 확인하세요: {step.actual_out_desc}")
                     command, _ = self._sequence_output_command(step)
                     MODEL_PROFILES[self._selected_model()].validate_command(command)
+                if any(self.seq_steps[i].dut_channel is not None for i in plan):
+                    plan.sort(key=lambda i: (self._sequence_channel_order(i), i))
             except (ValueError, IndexError) as exc:
                 self._show_report("순차 실행 설정 확인", str(exc))
                 return
@@ -260,14 +263,21 @@
                 return
             if not self._ensure_connected_or_sim():
                 return
-            for i in range(start_idx, stop_idx + 1):
-                if i in plan:
-                    self.seq_steps[i].status = "대기"
+            for i in plan:
+                self.seq_steps[i].status = "대기"
             self._refresh_current_group_preview()
             self.progress_var.set(0)
             self.seq_running = True
             self._log(f"[그룹 순차 시작] {self._current_group_label()} | 표의 실행 행: {', '.join(str(i + 1) for i in plan)} | 유지 {dwell:g}초")
-            self._run_next_auto_step(start_idx, stop_idx, int(dwell * 1000))
+            self._run_next_auto_step(0, int(dwell * 1000))
+
+        def _sequence_channel_order(self, index):
+            step = self.seq_steps[index]
+            if step.dut_channel is not None:
+                return step.dut_channel
+            if self._sequence_dut_enabled() and step.func_type in self._DUT_SEQUENCE_QUANTITIES:
+                return self._dut_channel_for_step(step)
+            return math.inf
 
         def _on_seq_start_from_selected_or_range(self, *, all_rows=False):
             if not self.seq_steps:
@@ -282,9 +292,13 @@
             if not self.seq_steps:
                 return
             if self.seq_paused_idx < 0:
-                self._on_seq_start_from_selected_or_range()
+                self._log("재개할 행이 없습니다. 새 측정은 시작을 누르세요.")
                 return
-            _, stop_idx = self._get_start_and_stop_indices()
+            start_idx, stop_idx = self._get_start_and_stop_indices()
+            if self.seq_paused_idx in self._seq_active_indices:
+                position = self._seq_active_indices.index(self.seq_paused_idx)
+                self._start_filtered_sequence(start_idx, stop_idx, remaining=self._seq_active_indices[position:])
+                return
             if self.seq_paused_idx > stop_idx:
                 stop_idx = len(self.seq_steps) - 1
                 self.var_seq_stop_row.set(str(stop_idx + 1))
@@ -302,7 +316,7 @@
                     if self.conn_mgr.info.connected:
                         self._on_stby_clicked()
                     return
-                self._seq_active_indices = [index]
+                self._seq_active_indices = []
                 self._execute_sequence_step(index)
             except ValueError as exc:
                 self._show_report("전류 그룹 확인", str(exc))
@@ -315,7 +329,7 @@
                 index = next((i for i in range(self.seq_current_idx - 1, -1, -1)
                               if self._step_in_current_group(self.seq_steps[i])), None)
                 if index is not None:
-                    self._seq_active_indices = [index]
+                    self._seq_active_indices = []
                     self._execute_sequence_step(index)
             except ValueError as exc:
                 self._show_report("전류 그룹 확인", str(exc))

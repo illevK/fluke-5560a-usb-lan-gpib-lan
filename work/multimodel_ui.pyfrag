@@ -43,6 +43,9 @@
             if requested not in MODEL_PROFILES:
                 self.var_model.set(self._configured_model)
                 return
+            self._apply_calibrator_model(requested)
+
+        def _apply_calibrator_model(self, requested):
             self._configured_model = requested
             self._sync_model_controls()
             self.seq_current_idx = self.seq_paused_idx = -1
@@ -57,9 +60,9 @@
                 choices = [f"{device} | {description}" for device, description in ports]
                 current = self.var_serial_port.get().split(" | ", 1)[0]
                 self.combo_serial_port.configure(values=choices)
-                if not current and choices:
-                    self.var_serial_port.set(choices[0])
-                note = ("COM 포트를 선택하세요. 다른 장치에는 연결하지 않습니다." if choices else
+                if current and current not in {device for device, _ in ports}:
+                    self.var_serial_port.set("")
+                note = ("COM을 선택하거나 비워 두고 연결하면 자동으로 찾습니다." if choices else
                         "COM 포트가 없습니다. 컨버터 드라이버/케이블을 확인하세요." if HAS_PYSERIAL else
                         "pyserial이 없습니다. 통신라이브러리_설치.cmd를 실행하세요.")
                 self.var_idn_display.set(note)
@@ -84,6 +87,7 @@
                     rebuilt = SequenceStep(st.step_no, st.vi_cond_raw, st.freq_cond_raw, st.pf_cond_raw,
                                            st.nominal_raw, "ERROR", "", str(exc), "⚠ 설정 확인", st.breakpoint)
                     self._log(f"[#{st.step_no}행 설정 확인] {exc}")
+                rebuilt.measured_raw = st.measured_raw
                 rebuilt_steps.append(rebuilt)
             self.seq_steps = rebuilt_steps
             self.excel_grid.render_steps(self.seq_steps, active_idx=-1)

@@ -1,3 +1,5 @@
+        _SEQUENCE_HOLD_STATUS = "출력 유지"
+        _SEQUENCE_STOPPED_STATUS = "정지됨"
         _DUT_SEQUENCE_QUANTITIES = {
             "ACV": ("voltage", "V"), "DCV": ("dc_voltage", "V"),
             "ACI": ("current", "A"), "DCI": ("dc_current", "A"),
@@ -64,9 +66,7 @@
                         raise ValueError("이 DUT는 자동 기록을 지원하지 않습니다. 직접 측정하려면 DUT 자동 기록을 끄세요.")
                     if self._dut_busy:
                         raise RuntimeError("진행 중인 DUT 조회가 끝난 뒤 다시 시작하세요.")
-                    channel = int(self.var_dut_channel.get())
-                    if not 1 <= channel <= self.dut_session.profile.channels:
-                        raise ValueError("DUT 입력 채널을 확인하세요.")
+                    channel = self._dut_channel_for_step(step)
                     if dwell_ms is None:
                         dwell = float(self.var_seq_dwell_sec.get())
                         if not .2 <= dwell <= 86_400:
@@ -84,7 +84,9 @@
             step.status = "… 출력 안정화 대기"
             self.excel_grid._update_single_row_visual(index, step, is_active=True)
             self.excel_grid.scroll_to_row(index)
-            self.var_active_row_banner.set(f"#{step.step_no}행 완료 응답 대기: {command}")
+            active_channel = channel if linked else step.dut_channel
+            row_label = f"#{step.step_no}행" + (f" · CH{active_channel}" if active_channel is not None else "")
+            self.var_active_row_banner.set(f"{row_label} 완료 응답 대기: {command}")
             self.lbl_active_row_banner.configure(bg="#FEF3C7", fg="#92400E")
             self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={command}")
 
@@ -99,6 +101,9 @@
                 self.progress_var.set((plan.index(index) + 1) / len(plan) * 100 if index in plan else 100)
 
             def failed(exc):
+                if (same_step() and step.status == self._SEQUENCE_STOPPED_STATUS
+                        and (isinstance(exc, OperationCancelled) or isinstance(getattr(exc, "__cause__", None), OperationCancelled))):
+                    return
                 if linked:
                     if current_capture():
                         self._sequence_dut_failure(index, step, exc)
@@ -184,6 +189,8 @@
                     failed("DUT 조회를 시작할 수 없습니다.")
 
             def done(state):
+                if same_step() and step.status in (self._SEQUENCE_HOLD_STATUS, self._SEQUENCE_STOPPED_STATUS):
+                    return
                 if linked and not current_capture():
                     return
                 if not same_step():
@@ -198,7 +205,7 @@
                     return
                 step.status = "… 유지시간 대기" if linked else "▶ 측정 진행 중"
                 output, _ = self._sequence_output_preview(step)
-                self.var_active_row_banner.set(f"[#{step.step_no}/{len(self.seq_steps)}행 출력 확인] {step.nominal_raw} → {output}")
+                self.var_active_row_banner.set(f"[{row_label} 출력 확인] {step.nominal_raw} → {output}")
                 self.lbl_active_row_banner.configure(bg="#DBEAFE", fg="#0F172A")
                 self.excel_grid._update_single_row_visual(index, step, is_active=True)
                 self._log(f"[#{step.step_no}행 완료 응답 확인] 유지시간 시작")

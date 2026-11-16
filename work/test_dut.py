@@ -268,6 +268,102 @@ class DUTProtocolTests(unittest.TestCase):
         self.assertEqual(instrument.items[":NUMERIC:NORMAL:ITEM9"], "IDC,1")
         self.assertEqual(instrument.event_filter, "NEVER")
 
+    def test_hioki_models_confirm_autorange_sync_and_read_fresh_rms_and_dc(self):
+        for variant, channels in (("PW3390-03", 4), ("PW6001-04", 4), ("PW6001-16", 6)):
+            with self.subTest(model=variant):
+                query = "*WAI;:MEAS? Urms2,Irms2,P2,S2,Q2,PF2,FREQ2,Udc2,Idc2"
+                profile_replies = {":MODE?": "TYPE1", ":RATE?": "50ms"}
+                for channel in range(1, channels + 1):
+                    profile_replies.update({
+                        f":WIRING{channel}?": "1P2W",
+                        f":VOLTAGE{channel}:AUTO?": "ON",
+                        f":CURRENT{channel}:AUTO?": "ON",
+                        f":SOURCE{channel}?": f"U{channel}",
+                    })
+                instrument = FakeInstrument(f"HIOKI,{variant},123,V1.00", replies={
+                    **profile_replies, ":RS232:ANSWER?": "OFF", ":HEADER?": "OFF", ":HOLD?": "OFF",
+                    query: "1.20000E+02,1.00000E+00,60,120,+9999.9E+99,0.5,60,-0.0123,-0.002"
+                })
+                session, _ = self.make_session(instrument)
+                self.assertTrue(session.supports_fresh_capture)
+                self.assertIn("50 ms", session.apply_measurement_defaults())
+                self.assertNotIn(":MODE TYPE1", instrument.commands)
+                self.assertEqual(session.input_channels, tuple(range(1, channels + 1)))
+                for channel in session.input_channels:
+                    for command in (f":VOLTAGE{channel}:AUTO ON", f":CURRENT{channel}:AUTO ON", f":SOURCE{channel} U{channel}"):
+                        self.assertIn(command, instrument.commands)
+                self.assertEqual(":RATE 50MS" in instrument.commands, variant.startswith("PW6001"))
+                value = session.read(2, include_dc=True, fresh=True)
+                self.assertEqual(value.raw_values["voltage"], "1.20000E+02")
+                self.assertEqual(value.values["dc_voltage"], -.0123)
+                self.assertEqual(value.values["pf"], .5)
+                self.assertIsNone(value.values["reactive"])
+                self.assertEqual(instrument.commands[-2:], [":HOLD?", query])
+
+    def test_hioki_switches_grouped_wiring_before_setting_all_channels(self):
+        for variant, grouped_mode in (("PW3390-01", "TYPE8"), ("PW6001-04", "TYPE5")):
+            with self.subTest(model=variant):
+                replies = {":RS232:ANSWER?": "OFF", ":HEADER?": "OFF", ":MODE?": grouped_mode,
+                           ":RATE?": "50ms", ":HOLD?": "PEAK"}
+                for channel in range(1, 5):
+                    replies.update({f":WIRING{channel}?": "1P2W",
+                                    f":VOLTAGE{channel}:AUTO?": "ON", f":CURRENT{channel}:AUTO?": "ON",
+                                    f":SOURCE{channel}?": f"U{channel}"})
+                instrument = FakeInstrument(f"HIOKI,{variant},123,V1.00", replies=replies)
+                write = instrument.write
+
+                def switch_wiring(command):
+                    write(command)
+                    if command == ":MODE TYPE1":
+                        replies[":MODE?"] = "TYPE1"
+
+                with patch.object(instrument, "write", side_effect=switch_wiring):
+                    session, _ = self.make_session(instrument)
+                    self.assertIn("1P2W 독립 4CH", session.apply_measurement_defaults())
+                changed = instrument.commands.index(":MODE TYPE1")
+                self.assertEqual(instrument.commands[changed + 1], ":MODE?")
+                for channel in range(1, 5):
+                    for command in (f":VOLTAGE{channel}:AUTO ON", f":CURRENT{channel}:AUTO ON",
+                                    f":SOURCE{channel} U{channel}"):
+                        self.assertIn(command, instrument.commands[changed + 2:])
+                with self.assertRaisesRegex(ValueError, "PEAK HOLD"):
+                    session.read(1, fresh=True)
+                self.assertFalse(any(":MEAS?" in command for command in instrument.commands))
+
+    def test_hioki_rejects_failed_wiring_verification_before_channel_settings(self):
+        for variant, mode, final_channel in (("PW3390-03", "TYPE8", "1P2W"),
+                                             ("PW6001-04", "TYPE1", "1P3W")):
+            with self.subTest(model=variant):
+                instrument = FakeInstrument(f"HIOKI,{variant},123,V1.00", replies={
+                    ":RS232:ANSWER?": "OFF", ":HEADER?": "OFF", ":MODE?": mode,
+                    ":WIRING1?": "1P2W", ":WIRING2?": "1P2W",
+                    ":WIRING3?": "1P2W", ":WIRING4?": final_channel,
+                })
+                session, _ = self.make_session(instrument)
+                with self.assertRaisesRegex(ValueError, ":MODE TYPE1|1P2W 독립 결선"):
+                    session.apply_measurement_defaults()
+                self.assertFalse(any(":AUTO" in command or ":SOURCE" in command for command in instrument.commands))
+                self.assertEqual(session.input_channels, ())
+
+    def test_hioki_lan_checks_model_against_the_selected_port(self):
+        for port, variant in ((3390, "PW3390-03"), (23, "PW6001-14")):
+            with self.subTest(port=port):
+                identity = f"HIOKI,{variant},123,V1.00"
+                sock = Mock()
+                sock.recv.return_value = (identity + "\r\n").encode("ascii")
+                settings = f.DUTSettings(mode="HIOKI_LAN", address="192.0.2.43", port=port)
+                with patch.object(f.socket, "create_connection", return_value=sock) as open_socket:
+                    session = f.DUTSession()
+                    self.assertEqual(session.connect(settings), identity)
+                    session.disconnect()
+                    wrong_model = "PW6001-14" if port == 3390 else "PW3390-03"
+                    sock.recv.return_value = f"HIOKI,{wrong_model},123,V1.00\r\n".encode("ascii")
+                    with self.assertRaisesRegex(ValueError, "LAN 포트"):
+                        session.connect(settings)
+                    self.assertTrue(all(call.args[0] == ("192.0.2.43", port) for call in open_socket.call_args_list))
+                self.assertEqual(sock.sendall.call_count, 2)
+                self.assertTrue(all(call.args[0] == b"*IDN?\r\n" for call in sock.sendall.call_args_list))
+
     def test_wt310e_connection_defaults_accept_actual_readbacks(self):
         session, instrument = self.make_session(FakeInstrument(replies={
             ":COMMUNICATE:HEADER?": "0",
@@ -397,7 +493,7 @@ class DUTProtocolTests(unittest.TestCase):
     def test_serial_configuration_and_no_telnet_negotiation(self):
         serial_port = Mock(in_waiting=1)
         serial_port.write.return_value = 7
-        serial_port.read.side_effect = [b'O', b'K\r\n']
+        serial_port.read.side_effect = [b'*ID', b'N?\r\nO', b'K\r\n']
         transport = f.DUTTransport(f.DUTSettings(mode='SERIAL', address='COM5', baudrate=38400, flow='RTS/CTS'), threading.Event())
         with patch.object(f.serial, 'Serial', return_value=serial_port) as constructor:
             transport.open()
@@ -405,6 +501,27 @@ class DUTProtocolTests(unittest.TestCase):
         self.assertEqual(transport.query('*IDN?'), 'OK')
         serial_port.write.assert_called_once_with(b'*IDN?\r\n')
         transport.close()
+
+    def test_gpib_readback_accepts_eoi_and_releases_only_this_dut(self):
+        manager, resource = Mock(), Mock()
+        manager.open_resource.return_value = resource
+        resource.read.return_value = "NEWTONS4TH,PPA5511,123,1.00\r"
+        settings = f.DUTSettings(mode="GPIB", address="GPIB0::5::INSTR", eol="LF")
+        with patch.object(f.pyvisa, "ResourceManager", return_value=manager):
+            session = f.DUTSession()
+            try:
+                self.assertEqual(session.connect(settings), "NEWTONS4TH,PPA5511,123,1.00")
+                self.assertIsNone(resource.read_termination)
+                self.assertEqual(resource.write_termination, "\n")
+                resource.control_ren.assert_not_called()
+                resource.read.side_effect = ("3\r", "0\r", "0\r", "0\r", "0\r")
+                self.assertIn("FAST", session.apply_measurement_defaults())
+                resource.control_ren.assert_called_once_with(f.pyvisa.constants.RENLineOperation.asrt_address)
+            finally:
+                session.disconnect()
+        self.assertEqual([call.args[0] for call in resource.control_ren.call_args_list],
+                         [f.pyvisa.constants.RENLineOperation.asrt_address, f.pyvisa.constants.RENLineOperation.address_gtl])
+        resource.close.assert_called_once()
 
     def test_visa_vxi11_and_cleanup_on_failed_configuration(self):
         manager, resource = Mock(), Mock()
@@ -453,8 +570,9 @@ class DUTGuiTests(unittest.TestCase):
         app = self.app
         with patch.object(app, '_dut_start') as start:
             for mode, address, resource, ip in (
-                    ('USB / GPIB · VISA', 'USB0::0x0F7E::0x800A::7165657::INSTR', 'USB0::0x0F7E::0x800A::7165657::INSTR', ''),
-                    ('COM · USB / RS232', 'COM5', 'COM5 / 9600 / 8N1 / NONE', ''),
+                    ('USB · VISA', 'USB0::0x0F7E::0x800A::7165657::INSTR', 'USB0::0x0F7E::0x800A::7165657::INSTR', ''),
+                    ('RS232 · COM', 'COM5', 'COM5 / 9600 / 8N1 / NONE', ''),
+                    ('GPIB · VISA', '4', 'GPIB::4::INSTR', ''),
                     ('LAN · PPA', '192.168.1.3', 'TCPIP::192.168.1.3::3490::SOCKET', '192.168.1.3')):
                 app.conn_mgr.info = f.ConnectionInfo(True, 'test', resource, 'FLUKE,5560A,1,1', ip)
                 app.var_dut_mode.set(mode)

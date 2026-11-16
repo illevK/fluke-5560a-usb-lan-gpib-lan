@@ -4,32 +4,50 @@
             self.conn_mgr.operation_timeout = self._get_operation_timeout()
             full_cmd = f"{cmd}; OPER" if auto_oper else cmd
             self.conn_mgr.profile.validate_command(full_cmd)
+            model = self.conn_mgr.profile.model
+            parts = [part.strip().upper() for part in cmd.split(";")]
+            requests_output = auto_oper or "OPER" in parts
+            requested_post = None
+            if model != "5560A" and "OPER" not in parts and not self.conn_mgr.info.interface_type.startswith("SIMULATION"):
+                requested_post = next((part.split(maxsplit=1)[1] for part in reversed(parts)
+                                       if part.startswith("CUR_POST ")), None)
             self.var_active_cmd_summary.set(f"전송 요청: {full_cmd}")
             self.is_operating = None
             self._refresh_oper_badge()
             def operation():
-                if dual_current and self.conn_mgr.query("OPER?").strip() != "0":
+                changing_active_post = (requested_post is not None
+                                        and self.conn_mgr.query("OPER?") == "1"
+                                        and self.conn_mgr.query("CUR_POST?").upper() != requested_post)
+                if changing_active_post or (dual_current and self.conn_mgr.query("OPER?") != "0"):
                     self.conn_mgr.send_command("STBY")
                     if self.conn_mgr.query("OPER?").strip() != "0":
-                        raise InstrumentProtocolError("5560A STBY를 확인하지 못했습니다. 본체 출력 상태를 확인하세요.")
-                if verify_setpoint or dual_current:
+                        raise InstrumentProtocolError(f"{model} STBY를 확인하지 못했습니다. 본체 출력 상태를 확인하세요.")
+                if verify_setpoint or dual_current or requested_post is not None:
                     self.conn_mgr.send_command(cmd, check_before=True)
                     if dual_current and not self.conn_mgr.info.interface_type.startswith("SIMULATION"):
                         self.conn_mgr.profile.verify_dual_current_readback(cmd, self.conn_mgr.query("OUT?"))
+                    if requested_post is not None:
+                        actual_post = self.conn_mgr.query("CUR_POST?").upper()
+                        if actual_post != requested_post:
+                            if self.conn_mgr.query("OPER?") != "0":
+                                self.conn_mgr.send_command("STBY")
+                                if self.conn_mgr.query("OPER?") != "0":
+                                    raise InstrumentProtocolError(f"{model} 전류 단자 불일치 후 STBY를 확인하지 못했습니다.")
+                            raise InstrumentCommandError(
+                                f"{model} 전류 단자 불일치 · 설정 {requested_post}, 본체 {actual_post}. "
+                                "STBY 확인 완료, 연결 유지.")
                     if auto_oper:
-                        self.conn_mgr.send_command("OPER")
+                        self.conn_mgr.send_command("OPER", check_before=model != "5560A")
                 else:
-                    command = cmd.strip().upper()
-                    check_before = self.conn_mgr.profile.model == "5560A" and (
-                        auto_oper or command.startswith("OUT ") or command == "OPER")
+                    check_before = requests_output or any(part.startswith("OUT ") for part in parts)
                     self.conn_mgr.send_command(full_cmd, check_before=check_before)
                 state = self.conn_mgr.query("OPER?").strip()
                 if state not in ("0", "1"):
                     self.conn_mgr.disconnect(standby=False)
                     raise InstrumentProtocolError(f"출력 상태 확인 실패: {state}")
-                if self.conn_mgr.profile.model == "5560A" and (auto_oper or cmd.strip().upper() == "OPER") and state == "0":
+                if requests_output and state == "0":
                     error = self.conn_mgr.query("ERR?")
-                    raise InstrumentCommandError(f"5560A 출력 중단 · {error}. STBY 확인 완료, 연결 유지.")
+                    raise InstrumentCommandError(f"{model} 출력 중단 · {error}. STBY 확인 완료, 연결 유지.")
                 return state == "1"
             def done(state):
                 self.is_operating = state
@@ -100,22 +118,14 @@
                 failed(exc)
                 return False
 
-        def _run_next_auto_step(self, idx, stop_idx, dwell_ms):
+        def _run_next_auto_step(self, position, dwell_ms):
             self.seq_after_id = None
             if not self.seq_running or self._io_busy:
                 return
-            try:
-                while idx <= stop_idx and idx < len(self.seq_steps) and not self._step_in_current_group(self.seq_steps[idx]):
-                    step = self.seq_steps[idx]
-                    reason = step.actual_out_desc if step.func_type == "OUT_OF_RANGE" else "다른 그룹"
-                    self._log(f"[#{idx + 1}행 건너뜀] {reason}")
-                    idx += 1
-            except ValueError as exc:
-                self.seq_running = False
-                self._show_report("전류 그룹 확인", str(exc))
-                return
-            if idx > stop_idx or idx >= len(self.seq_steps):
-                self.seq_running = False
+            plan = self._seq_active_indices
+            if position >= len(plan):
+                self._on_seq_stop_auto(silent=True)
+                self.seq_paused_idx = -1
                 def finished(_state):
                     for r_i, step in enumerate(self.seq_steps):
                         if step.status == "▶ 측정 진행 중":
@@ -126,25 +136,48 @@
                     self.lbl_active_row_banner.configure(bg="#DCFCE7", fg="#166534")
                 self._send_and_log("STBY", on_done=finished)
                 return
+
+            idx = plan[position]
+            linked = self._seq_dut_run and self.seq_steps[idx].func_type in self._DUT_SEQUENCE_QUANTITIES
+            next_position = position + 1
+
             def completed():
-                if not self.seq_running:
+                if not self.seq_running or self._seq_active_indices is not plan:
                     return
-                if self.seq_steps[idx].breakpoint:
+                if self.seq_steps[idx].breakpoint and next_position < len(plan):
                     self.seq_steps[idx].status = "🛑 중단점 도달"
-                    self.seq_running = False
-                    self.seq_paused_idx = min(len(self.seq_steps) - 1, idx + 1)
-                    self.var_active_row_banner.set(f"#{idx + 1}행 중단점 도달 — 다음 행부터 재개 가능")
+                    self.seq_paused_idx = plan[next_position]
+                    self.var_active_row_banner.set(f"#{idx + 1}행 중단점 도달 · 재개하면 #{self.seq_paused_idx + 1}행부터 시작")
                     self.excel_grid._update_single_row_visual(idx, self.seq_steps[idx], is_active=False)
+                    if self._seq_dut_run:
+                        self._seq_dut_resume_required = True
+                        self._on_stby_clicked()
+                    else:
+                        self._on_seq_stop_auto(silent=True)
                     return
-                self.seq_after_id = self.after(dwell_ms, lambda: self._run_next_auto_step(idx + 1, stop_idx, dwell_ms))
-            if not self._execute_sequence_step(idx, on_complete=completed):
-                self.seq_running = False
+                self.seq_after_id = self.after(0 if linked else dwell_ms,
+                    lambda: self._run_next_auto_step(next_position, dwell_ms))
+
+            if not self._execute_sequence_step(idx, on_complete=completed, dwell_ms=dwell_ms):
+                if self._seq_dut_run and self.conn_mgr.info.connected:
+                    self._on_stby_clicked()
+                else:
+                    self._on_seq_stop_auto(silent=True)
 
         def _on_oper_clicked(self):
             try:
                 self._send_and_log("OPER")
             except Exception as exc:
                 messagebox.showerror("출력 요청 오류", str(exc))
+
+        def _on_seq_hold_clicked(self):
+            if self.seq_running or self._sequence_dut_reserved():
+                self._on_seq_stop_auto(silent=False, keep_output=True)
+
+        def _on_seq_stop_clicked(self):
+            self._on_seq_stop_auto(silent=False)
+            if self.conn_mgr.info.connected:
+                self._on_stby_clicked()
 
         def _on_stby_clicked(self):
             self._on_seq_stop_auto(silent=True)

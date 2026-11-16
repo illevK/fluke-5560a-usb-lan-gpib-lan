@@ -102,7 +102,7 @@
             choices = [f"{a['idx']}: {a['name']} [{a['state']}]" for a in adapters]
             choices.append("자동: Windows 경로 사용")
             self.combo_adapter.configure(values=choices)
-            self.var_adapter_choice.set(next((v for v in choices if v.split(":", 1)[0] == current), choices[0]))
+            self.var_adapter_choice.set(next((v for v in choices if v.split(":", 1)[0] == current), choices[-1]))
 
         def _get_selected_adapter_id(self):
             value = self.var_adapter_choice.get().split(":", 1)[0]
@@ -114,8 +114,8 @@
                 raise ValueError("제한 시간은 0.2~60초 사이여야 합니다.")
             operation_timeout = self._get_operation_timeout()
             mode = self.var_conn_mode.get()
-            return dict(preferred_mode=mode, lan_ip=self.var_lan_ip.get(), model=self._selected_model(),
-                        lan_port=int(self.var_lan_port.get()) if mode in ("AUTO", "LAN") else 3490,
+            return dict(preferred_mode=mode, lan_ip=self.var_lan_ip.get(), model="AUTO" if mode == "AUTO" else self._selected_model(),
+                        lan_port=(self.var_lan_port.get().strip() or "3490") if mode in ("AUTO", "LAN") else 3490,
                         gpib_addr=int(self.var_gpib_addr.get()) if mode in ("AUTO", "GPIB") else 1,
                         timeout_sec=timeout, eol=self.var_eol.get(), adapter_idx=self._get_selected_adapter_id(),
                         visa_resource=self.var_visa_resource.get(), operation_timeout_sec=operation_timeout,
@@ -160,6 +160,8 @@
                 self._log(event)
                 if event.startswith("[출력 안정화 대기]"):
                     self.var_idn_display.set(event)
+                elif event.startswith("[영점 조정 필요]"):
+                    self._refresh_oper_badge()
             try:
                 complete, value, error, on_error = self._io_results.get_nowait()
             except queue.Empty:
@@ -203,11 +205,12 @@
         def _on_lan_diagnose(self):
             try:
                 args = self._connection_arguments()
-                if "LAN" not in MODEL_PROFILES[self._selected_model()].interfaces:
+                if args['model'] != "AUTO" and "LAN" not in MODEL_PROFILES[self._selected_model()].interfaces:
                     raise ValueError("선택한 모델에는 LAN 포트가 없습니다. RS232 또는 GPIB를 사용하세요.")
+                profile = MODEL_PROFILES[self._selected_model()]
                 def diagnose():
                     self.conn_mgr.expected_model = args['model']
-                    self.conn_mgr.profile = MODEL_PROFILES[args['model']]
+                    self.conn_mgr.profile = profile
                     return self.conn_mgr.diagnose_lan(args['lan_ip'], args['lan_port'], args['timeout_sec'],
                                                       eol=args['eol'], adapter_idx=args['adapter_idx'])
                 def done(report):

@@ -171,6 +171,17 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(int(self.grid._row_widgets[1]['frames'][9].grid_info()['column']), 6)
         self.app.conn_mgr.send_command.assert_not_called()
 
+    def test_unsigned_pf_triplet_paste_in_table_and_existing_pf_columns(self):
+        self.app._handle_excel_paste_at_cell(PowerFactorTests.UNSIGNED_SAMPLE, 0, 2)
+        expected = ["1 LEAD", "0.5 LEAD", "0.5 LAG"] * 2
+        self.assertEqual([row.nominal_raw for row in self.app.seq_steps], expected)
+        for column in (4, 5):
+            self.app._handle_excel_paste_at_cell("1\n0.5\n0.5", 0, column)
+            self.assertEqual([row.nominal_raw for row in self.app.seq_steps], expected)
+            self.assertIn("DPF 0.5, LEAD", self.app.seq_steps[1].scpi_cmd)
+            self.assertIn("DPF 0.5, LAG", self.app.seq_steps[2].scpi_cmd)
+        self.app.conn_mgr.send_command.assert_not_called()
+
 
 class PowerFactorTests(unittest.TestCase):
     SAMPLE = '\n'.join((
@@ -178,6 +189,28 @@ class PowerFactorTests(unittest.TestCase):
         'Lead\t308001\t\t60 Hz\t120 V\t10 A\t0.5',
         'Lag\t308001\t\t60 Hz\t120 V\t10 A\t0.5',
     ) * 5)
+    UNSIGNED_SAMPLE = '\n'.join(
+        f'{label}\t\t{frequency} Hz\t{voltage} V\t1 A\t{target}'
+        for frequency, voltage in ((50, 120), (60, 240))
+        for label, target in ((f'{voltage} V / 1 A', '1'), ('', '0.5'), ('', '0.5'))
+    )
+
+    def test_unsigned_trio_uses_position_to_assign_directions(self):
+        parser = f.SmartClipboardSequenceParser
+        steps = parser.build_sequence_steps(self.UNSIGNED_SAMPLE)
+        self.assertEqual([row.nominal_raw for row in steps], ["1 LEAD", "0.5 LEAD", "0.5 LAG"] * 2)
+        text = "\n".join(f"50 Hz 120 V 1 A {target}" for target in ("1", ".500", "0.5"))
+        self.assertEqual([row.nominal_raw for row in parser.build_sequence_steps(text)],
+                         ["1 LEAD", "0.5 LEAD", "0.5 LAG"])
+
+    def test_pf_triplet_requires_matching_conditions_and_unsigned_values(self):
+        parser = f.SmartClipboardSequenceParser
+        for values, frequencies, expected in (
+                (("1", "0.5", "0.5"), (50, 60, 60), ["1 LEAD", "0.5 LAG", "0.5 LAG"]),
+                (("1", "0.5 LAG", "-0.5"), (60, 60, 60), ["1 LEAD", "0.5 LAG", "0.5 LEAD"]),
+                (("1", "+0.5", "0.5"), (60, 60, 60), ["1 LEAD", "0.5 LAG", "0.5 LAG"])):
+            text = "\n".join(f"{hz} Hz\t120 V\t1 A\t{value}" for hz, value in zip(frequencies, values))
+            self.assertEqual([row.nominal_raw for row in parser.build_sequence_steps(text)], expected)
 
     def test_exact_user_table_all_rows_direction_and_reference_number(self):
         for model in f.MODEL_PROFILES:

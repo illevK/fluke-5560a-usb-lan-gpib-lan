@@ -33,6 +33,18 @@ class SerialEndpoint:
 
 
 class SerialLineTransport(TelnetLineTransport):
+    reply_gap = 0.0
+
+    def query(self, *args, **kwargs):
+        reply = super().query(*args, **kwargs)
+        if self.reply_gap:
+            cancel = kwargs.get("cancel_event")
+            if cancel is None:
+                time.sleep(self.reply_gap)
+            elif cancel.wait(self.reply_gap):
+                raise OperationCancelled("사용자가 현재 응답 대기를 중단했습니다.")
+        return reply
+
     def _feed(self, raw):
         # RS-232 is not Telnet. Never send IAC negotiation bytes to a serial port.
         self.buffer.extend(raw)

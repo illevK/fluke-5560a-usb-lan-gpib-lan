@@ -1,0 +1,17 @@
+{
+  "version": "v6.10.14",
+  "exe_path": "C:\\Users\\HCT-2714\\Documents\\Codex\\2026-10-29\\fluke-5560a-usb-lan-gpib-lan\\outputs\\Fluke 교정기.exe",
+  "exe_sha256": "61D633548B38C3AA4FE05D40EC895262CA77D951CC0CEC665FA64094CDDB4F29",
+  "source_sha256": "42161DEBC2821B43DD36741FA48396CF476920B444DB780DAF44552529AFC175",
+  "desktop_copied": [
+    "C:\\Users\\HCT-2714\\Desktop\\Fluke 교정기.exe"
+  ],
+  "focused_tests_passed": 9,
+  "executable_self_check": true,
+  "physical_output_tested": false,
+  "standby_live_tests": [
+    "5560A LAN: AC power setup, disconnect, and reconnect",
+    "5560A LAN: hold and stop without activating output"
+  ],
+  "previous_executable_backup": "C:\\Users\\HCT-2714\\AppData\\Local\\Temp\\fluke-v6.10.14-build-20261113171753150\\previous-desktop.exe"
+}

@@ -126,8 +126,8 @@ def enhance_source(source, root):
                 return (vi_cond_str, freq_str, pf_str, power_nom_str)
             if pf_match and any(
                     SIUnits.split(token[2])[0] == "HZ" for token in cls.TOKEN_FINDER.finditer(rest)):
-                _, _, display = cls.parse_power_factor(pf_str)
-                return vi_cond_str, freq_str, display, display
+                cls.parse_power_factor(pf_str)
+                return vi_cond_str, freq_str, pf_str, pf_str
             dc = cls.parse_dc_power_row(vi_cond_str)
             return vi_cond_str, freq_str, "1", dc[3]''', 1)
     parser = parser.replace('            pf_str = pf_match.group(1) if pf_match else "1"', '''            pf_str = pf_match.group(1) if pf_match else "1"
@@ -146,6 +146,12 @@ def enhance_source(source, root):
 
     @classmethod
     def build_Single_step_from_fields(''', 1)
+    parser = parser.replace('''        for raw_line in raw_text.splitlines():
+            parsed_fields = cls.parse_line_to_fields(raw_line)
+            if parsed_fields is None:
+                continue
+            vi_c, fq_c, pf_c, nom_c = parsed_fields''', '''        rows = [fields for line in raw_text.splitlines() if (fields := cls.parse_line_to_fields(line)) is not None]
+        for vi_c, fq_c, pf_c, nom_c in cls.resolve_unsigned_pf_triplets(rows):''', 1)
     source = source[:start] + parser + source[end:]
     source = source.replace('DPF {dpf_val:.2f}', 'DPF {dpf_val:.6g}')
 
@@ -160,14 +166,22 @@ def enhance_source(source, root):
         source = source.replace(f'float(self.var_{field}.get())', f'SIUnits.input_value(self.var_{field}.get(), "{unit}")')
     source = source.replace('W/kW', 'W 계열')
 
-    source = source.replace('    breakpoint: bool = False\n', '    breakpoint: bool = False\n    measured_raw: str = ""\n', 1)
+    source = source.replace('    breakpoint: bool = False\n', '    breakpoint: bool = False\n    measured_raw: str = ""\n    dut_channel: int | None = None\n', 1)
     start = source.index('    class ExcelSheetGrid(')
     end = source.index('    class Fluke5560AControllerApp(', start)
     grid = source[start:end]
-    grid = grid.replace('("상태", 110, "center", False),', '("상태", 110, "center", False),\n            ("측정값", 130, "e", True),')
-    grid = grid.replace('            self._build_grid_skeleton()', '            self._steps = []\n            self._rendering_measurements = False\n            self.show_commands = False\n            self.show_measurements = True\n            self._init_measurement_selection()\n            self._build_grid_skeleton()\n            self._bind_measurement_header()', 1)
+    grid = grid.replace('("상태", 110, "center", False),', '("상태", 110, "center", False),\n            ("측정값", 130, "e", True),\n            ("채널", 55, "center", False),')
+    grid = grid.replace('            self._build_grid_skeleton()', '            self._steps = []\n            self._rendering_measurements = False\n            self.show_commands = False\n            self.show_measurements = True\n            self.show_channels = False\n            self._init_measurement_selection()\n            self._build_grid_skeleton()\n            self._bind_measurement_header()', 1)
     grid = grid.replace('column=c_idx,', 'column=self._display_column(c_idx),')
-    grid = grid.replace('grid_columnconfigure(6,', 'grid_columnconfigure(7,')
+    grid = grid.replace('grid_columnconfigure(6,', 'grid_columnconfigure(8,')
+    grid = grid.replace('labels[10] = btn_go', 'labels["start"] = btn_go').replace('labels[11]', 'labels["breakpoint"]')
+    grid = grid.replace('            labels[8].configure(text=st.status,',
+        '            channel = f"CH{st.dut_channel}" if st.dut_channel is not None else ""\n'
+        '            labels[10].configure(text=channel, bg=row_bg, fg=row_fg, font=row_font)\n'
+        '            labels[8].configure(text=st.status,')
+    grid = grid.replace('            self.set_command_visibility(self.show_commands)\n            self.cells_frame.update_idletasks()',
+        '            self.show_channels = any(step.dut_channel is not None for step in steps)\n'
+        '            self.set_command_visibility(self.show_commands)\n            self.cells_frame.update_idletasks()')
     grid = grid.replace('            while len(self._row_widgets) > len(steps):', '            if self._steps is not steps or len(self._row_widgets) != len(steps):\n                self._reset_measurement_selection()\n            self._steps = steps\n            while len(self._row_widgets) > len(steps):')
     grid = grid.replace('        def _update_single_row_visual(self, r_idx: int, st: SequenceStep, is_active: bool = False) -> None:\n',
         '        def _update_single_row_visual(self, r_idx: int, st: SequenceStep, is_active: bool = False) -> None:\n            self._steps[r_idx] = st\n')
@@ -276,6 +290,7 @@ def enhance_source(source, root):
             if parsed_rows and (append or tabular or len(parsed_rows) == len(lines)):
                 new_steps = []
                 for offset''', 1)
+    source = source.replace('enumerate(parsed_rows):', 'enumerate(SmartClipboardSequenceParser.resolve_unsigned_pf_triplets(parsed_rows)):', 1)
     source = source.replace('''                        break
 
                     if target_idx < len(self.seq_steps):
@@ -308,7 +323,25 @@ def enhance_source(source, root):
                     self._log(text)
                 for i, st''', 1)
     source = source.replace('            for offset, ln in enumerate(lines):\n                target_idx',
-        '            if tabular or replace_all or append:\n                return\n            for offset, ln in enumerate(lines):\n                ln = ln.strip()\n                target_idx', 1)
+        '''            if tabular or replace_all or append:
+                return
+            pf_inputs = []
+            if start_col_idx in (4, 5):
+                for index, line in enumerate(lines, start_row_idx):
+                    if index < len(self.seq_steps) and self.seq_steps[index].func_type == "PF":
+                        row = self.seq_steps[index]
+                        value = line.strip()
+                        pf_inputs.append((row.vi_cond_raw, row.freq_cond_raw, value, value))
+                    else:
+                        pf_inputs.append(("", "", "", ""))
+                pf_inputs = SmartClipboardSequenceParser.resolve_unsigned_pf_triplets(pf_inputs)
+            for offset, ln in enumerate(lines):
+                ln = ln.strip()
+                target_idx''', 1)
+    source = source.replace('                nom_c = ln if start_col_idx == 5 else st.nominal_raw\n',
+        '                nom_c = ln if start_col_idx == 5 else st.nominal_raw\n'
+        '                if pf_inputs and pf_inputs[offset][3]:\n'
+        '                    pf_c = nom_c = pf_inputs[offset][3]\n', 1)
     app_start = source.index('    class Fluke5560AControllerApp(')
     source = source[:app_start] + source[app_start:].replace(
         'SmartClipboardSequenceParser.build_Single_step_from_fields(', 'SmartClipboardSequenceParser.build_sheet_step(')
