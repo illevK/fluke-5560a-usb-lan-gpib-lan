@@ -1,12 +1,11 @@
 from __future__ import annotations
-from dataclasses import replace
-from PySide6.QtCore import Qt, QSignalBlocker
+from dataclasses import dataclass, replace
+from PySide6.QtCore import Qt, QSignalBlocker, Signal
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel,
     QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QDialogButtonBox,
-    QGroupBox, QPushButton, QPlainTextEdit, QMessageBox, QSizePolicy)
+    QGroupBox, QPushButton, QPlainTextEdit, QMessageBox, QSizePolicy, QGridLayout, QToolButton)
 from ..services.connections import ConnectionSettings
 from ..services.drivers import REGISTRY
-from ..domain.document import RunOptions
 from ..domain.commands import MODEL_PROFILES, serial_baudrates
 from ..domain.connection_guide import address_modes, connection_guide, supported_modes
 from ..domain.units import SIUnits
