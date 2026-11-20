@@ -262,7 +262,7 @@
             self._sequence_details_open = False
             self.var_seq_start_row = tk.StringVar(value="1")
             self.var_seq_stop_row = tk.StringVar(value="1")
-            self.var_seq_dwell_sec = tk.StringVar(value="3.0")
+            self.var_seq_dwell_sec = tk.StringVar(value="3.5")
             self.var_seq_auto_oper = tk.BooleanVar(value=True)
             range_row = tk.Frame(self.sequence_details, bg="white")
             range_row.pack(fill="x", pady=(0, 5))
@@ -369,6 +369,13 @@
                                                  foreground="#64748B", wraplength=600)
             self.group_summary_label.pack(side="left", fill="x", expand=True)
             self.group_summary_label.bind("<Configure>", lambda e: self.group_summary_label.configure(wraplength=max(100, e.width)))
+            self._dut_current_group = SequenceCurrentFilter.DUT_3A
+            self.var_dut_current_group = tk.StringVar(value=self._dut_current_group)
+            self.dut_current_group_panel = ttk.Frame(self.group_panel)
+            self._ui_label(self.dut_current_group_panel, "34465A 입력")
+            combo_dmm = self._ui_combo(self.dut_current_group_panel, self.var_dut_current_group,
+                                       SequenceCurrentFilter.DUT_34465_GROUPS, 22)
+            combo_dmm.bind("<<ComboboxSelected>>", lambda _e: self._on_dut_current_group_changed())
             row = tk.Frame(self.sequence_details, bg="white")
             row.pack(fill="x")
             self._ui_label(row, "전류 분리 기준")
@@ -469,7 +476,9 @@
             self._refresh_connection_controls()
 
         def _refresh_oper_badge(self):
-            if self.is_operating is None:
+            if self.conn_mgr.output_unconfirmed:
+                text, bg, fg = "출력 상태 미확인 · 본체에서 STBY 확인", "#FECACA", "#991B1B"
+            elif self.is_operating is None:
                 text, bg, fg = "출력 상태 미확인 · 본체 확인", "#FEF3C7", "#92400E"
             elif self.is_operating:
                 text, bg, fg = "OPER · 출력 중", "#FEE2E2", "#991B1B"

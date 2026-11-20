@@ -1,0 +1,96 @@
+{
+  "version": "1.0.4",
+  "recorded_utc": "2026-11-19T10:18:29.773300+00:00",
+  "artifact": "C:\\Users\\HCT-2714\\Documents\\교정자동화 배포본\\교정자동화.exe",
+  "desktop": "C:\\Users\\HCT-2714\\Desktop\\교정자동화.exe",
+  "artifact_sha256": "11112ae50f1cb8449571477a695d78faa75eb0ad4f3057d4592d1ba2aadf98c5",
+  "release_copy_verified": true,
+  "test_count": 63,
+  "test_scope": [
+    "same-device identification, LAN loopback, USB virtual COM selection and recovery, RS232 and GPIB VISA",
+    "5730A remote/operate/standby status, current post, fault handling, fixed resistance/2-wire zero and DUT recording",
+    "measured column and rectangle copy with an editor open, blank cells and the last cell included"
+  ],
+  "excel_paste_checks": {
+    "application": "Microsoft Excel for Windows",
+    "passed": 3,
+    "cases": [
+      "whole column with a pending final edit",
+      "to end with empty last cell",
+      "2-column selection including rightmost cell"
+    ]
+  },
+  "windows_clipboard_after_exit": true,
+  "hardware_output_tested": false,
+  "packaged_check": {
+    "version": "1.0.4",
+    "passed": true,
+    "window_title": "교정자동화 · v1.0.4",
+    "calibrator_choice": "5730A",
+    "copied_rows": [
+      "[미리보기] 0.999 V",
+      "[미리보기] 0.999 V"
+    ],
+    "cleared_sheet_preserving_setup": true,
+    "timed_run_without_entry": true,
+    "dut_choices": [
+      "AUTO",
+      "WT",
+      "PPA",
+      "HIOKI",
+      "34401A",
+      "34461A",
+      "34465A"
+    ],
+    "calibrator_only_entries": [
+      "0.999 V",
+      "0.999 V"
+    ],
+    "empty_start_rows": 0,
+    "tk_loaded": false,
+    "simulated_only": true,
+    "state": "완료",
+    "packaged_seconds": 6.15,
+    "exe_bytes": 39174485,
+    "console": false,
+    "native_windows_plugin": true,
+    "communication_modules_bundled": true
+  },
+  "references": [
+    "https://media.fluke.com/93510cc7-9ea1-4f36-8729-b10800c20179_original%20file.pdf",
+    "https://media.fluke.com/10956dd5-0cf4-49d2-9a31-b2e30092b82d_original%20file.pdf"
+  ],
+  "source_sha256": {
+    "app.py": "70fa13bb387ea1b118d6afcc5603e6b01c22c04b3ceca023cdd02797e3d3ae0f",
+    "build.py": "f90b234b98c51442e1cd79a09f5d8c48319227dd5a933129982e7bdd240f68ac",
+    "requirements.txt": "243ae44c48bc969495859682e92e6dc7bc890a84b0af11473f2044cbb37156d7",
+    "assets\\version_info.txt": "6dbbacce89fe10c2eb0f6f1b1716b803b2896e9c04a0658a001c26e0e7f5ce3e",
+    "THIRD_PARTY_NOTICES.md": "e99432779ff7a386a1c89b9b9838bc1f87335f99c313bf90a24caf4157dfdfea",
+    "calibration\\__init__.py": "b611991d8ea92cf84973a0b06018d4690ea91b12e1c0f329fe98e862c8b0bc8e",
+    "calibration\\domain\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\domain\\clipboard.py": "ff4158797b285a89b863ff0522888abddfddafef78fa0b9895af9d40f0d2eb6a",
+    "calibration\\domain\\commands.py": "5d9a7eec7c8e5e172503531bc94729f44cad6aced9c8db3ef966d574ba0f0567",
+    "calibration\\domain\\document.py": "170acb031edb9e34ed914d33f5f70a749832338c2cbbb0402cd807568f597148",
+    "calibration\\domain\\groups.py": "586fe8fbb726b9639da3932236091dfcbefda8313e54b39664a4982c41bdb495",
+    "calibration\\domain\\planning.py": "9d3be6e3711b1560f5b801bac845417d372470b220c0ba985c4ba8365f21ce0f",
+    "calibration\\domain\\types.py": "ece8e7d080484705a4fdd53d9a08a4b5ec8d0e05db3592d71ee41e3ca072f0a5",
+    "calibration\\domain\\units.py": "63da026613d48640b8641ee05c988baa1930e3860a7c9ce84d2dbbc60748e813",
+    "calibration\\instruments\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\instruments\\catalog.py": "8c3c03788669fbb2ff297adba29a7e90797079d689ed69116c029ac1b682a79e",
+    "calibration\\instruments\\discovery.py": "04b76061215bf4de277dcf8cf27caae7d66ce9347b0b95b4301b34bdd21658b8",
+    "calibration\\instruments\\dut.py": "4e6a6e034b68c9b5251a0f2244c8f31afbcfd3e12944420a015701889b006267",
+    "calibration\\instruments\\fluke.py": "1edcb9d8b3b7fe4a09a073791632b54353bf50e7cd7c6965a3e8bf917cab180b",
+    "calibration\\instruments\\transport.py": "51d58382dc40b9bd36c2e0e8fb92b899f403485eaa85f239dfacbfd27069c86e",
+    "calibration\\services\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\services\\connections.py": "d62b22c4acfc719698c2d627003d16cbe3c7cb0327257524d28d9dd3b00a4d6d",
+    "calibration\\services\\drivers.py": "c99fe6a18b26b8d2807c5aaed272c94fde6c19c4365c7ea329eb15ca9140ec0c",
+    "calibration\\services\\engine.py": "3c16114b2e3249fad92503b4177ba10e9cf0c061b671124870fd429f09b2816f",
+    "calibration\\services\\storage.py": "ac472adb3c8c9200342131132c9fa25418de81c91147e42c5f69fd64df5b5e39",
+    "calibration\\ui\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\ui\\dialogs.py": "e880c679f17a1b3e2c17245d8e43e26d9e8d88ad7e8b8bfd0990c2bd8a72b41a",
+    "calibration\\ui\\table.py": "0ae10c7411ef8a72473b08ee2657297f5f908cf498759a8860aa7880d0c7a929",
+    "calibration\\ui\\theme.py": "e7a38ec7d3f136f9e6c912dc038366a9c63e566ba5cc47fee5e6589c6a4b695a",
+    "calibration\\ui\\window.py": "3166aa5e9fdc0797d5610b7925d3df15b707dee4db6cdd5fe0cc85383a79a4aa",
+    "calibration\\ui\\worker.py": "bab9aae62f57cad24fba381c1d2c4e9452ad1b5353a5f1338fd361c94f74522f"
+  }
+}

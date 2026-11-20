@@ -138,36 +138,47 @@ def _dut_wired_source(host, adapters):
     return str(best.ip) if best else ""
 
 
-def _dut_serial_targets(excluded_resource, diagnostics):
-    if not HAS_PYSERIAL:
-        diagnostics.append(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
-        return {}
-    try:
-        ports = serial.tools.list_ports.comports()
-    except OSError as exc:
-        diagnostics.append(f"COM 포트 목록을 읽지 못했습니다: {exc}")
-        return {}
+def _dut_serial_port_names(excluded_resource):
+    ports = serial.tools.list_ports.comports()
     excluded_com = excluded_resource.split(" / ", 1)[0]
     ports = [port for port in ports if port.vid != 0x0F7E
              and not (getattr(port, "hwid", "") or "").upper().startswith(("BTHENUM", "BTHLE", "BTHMODEM"))
              and "bluetooth" not in (getattr(port, "description", "") or "").casefold()]
     ports.sort(key=lambda port: (port.vid is None, port.device.upper()))
-    addresses = list(dict.fromkeys(port.device.upper() for port in ports if port.device.upper() != excluded_com))
+    return list(dict.fromkeys(port.device.upper() for port in ports if port.device.upper() != excluded_com))
+
+
+def _dut_serial_targets(excluded_resource, diagnostics):
+    if not HAS_PYSERIAL:
+        diagnostics.append(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
+        return {}
+    try:
+        addresses = _dut_serial_port_names(excluded_resource)
+    except OSError as exc:
+        diagnostics.append(f"COM 포트 목록을 읽지 못했습니다: {exc}")
+        return {}
     diagnostics.append(f"자동 검색용 COM 포트 {len(addresses)}개를 확인했습니다.")
-    # PPA RS232 / USB virtual COM, then common serial defaults. Other
-    # settings remain available via manual COM.
-    presets = ((19200, "RTS/CTS", "CR"), (19200, "NONE", "CR"),
-               (38400, "RTS/CTS", "CRLF"), (9600, "XON/XOFF", "LF"),
-               (9600, "RTS/CTS", "CRLF"), (9600, "NONE", "CRLF"))
-    return {(address, baud, flow): DUTSettings(mode="SERIAL", address=address, baudrate=baud, flow=flow, eol=eol)
-            for baud, flow, eol in presets for address in addresses}
+    # Try the PW3390 factory setting before sending at other baud rates.
+    # PPA RS232 and virtual COM settings still use a CR terminator.
+    presets = ((38400, "NONE", "CRLF", 8, "N", 1), (19200, "RTS/CTS", "CR", 8, "N", 1),
+               (19200, "NONE", "CR", 8, "N", 1), (9600, "DTR/DSR", "LF", 7, "E", 2),
+               (9600, "DTR/DSR", "LF", 8, "N", 2), (38400, "RTS/CTS", "CRLF", 8, "N", 1),
+               (19200, "NONE", "CRLF", 8, "N", 1), (19200, "RTS/CTS", "CRLF", 8, "N", 1),
+               (9600, "XON/XOFF", "LF", 8, "N", 1), (9600, "NONE", "CRLF", 8, "N", 1),
+               (9600, "RTS/CTS", "CRLF", 8, "N", 1))
+    return {(address, baud, flow, eol, parity): DUTSettings(
+                mode="SERIAL", address=address, baudrate=baud, flow=flow, eol=eol,
+                data_bits=bits, parity=parity, stop_bits=stop)
+            for baud, flow, eol, bits, parity, stop in presets for address in addresses}
 
 
 def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=True, include_lan=True,
-                  include_serial=False, include_gpib=False, adapters=None, lan_ip="", saved_lan=None):
-    """Return all recognized, closed probe sessions and discovery diagnostics.
+                  include_serial=False, include_gpib=False, adapters=None, lan_ip="", saved_lan=None, direct_mask=""):
+    """Return recognized, closed probe sessions and discovery diagnostics.
 
-    Discovery never needs network configuration changes or address-range scans.
+    Only try COM ports when automatic discovery found no USB, LAN, or GPIB DUT.
+
+    Direct LAN alignment applies only to the entered instrument address.
     Literal IPv4 VISA resources avoid probing DNS aliases for the calibrator.
     An entered LAN address is checked using the supported DUT protocols.
     The factory PW3390 address is tried on a matching wired subnet.
@@ -199,6 +210,20 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
     excluded_usb = _dut_discovery_usb_key(excluded_resource)
     excluded_gpib = _dut_gpib_key(excluded_resource)
     excluded_hosts = {_dut_discovery_ipv4(excluded_ip), _dut_discovery_resource_ip(excluded_resource)}
+    entered_host = _dut_discovery_ipv4(lan_ip) if lan_ip else None
+    aligned_source = ""
+    alignment_error = ""
+    if include_lan and direct_mask and entered_host and entered_host not in excluded_hosts:
+        if adapters is None:
+            adapters = AutoNetworkAligner.list_ethernet_interfaces(refresh=True)
+        try:
+            aligned_source = align_dut_direct_lan(entered_host, direct_mask, cancel, adapters)
+        except InterruptedError:
+            raise
+        except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            alignment_error = f"DUT 직결 LAN 설정 실패 · {exc}"
+            diagnostics.append(alignment_error)
+            excluded_hosts.add(entered_host)
 
     targets = {}
     listed_gpib = {}
@@ -224,11 +249,13 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         if host is None or host in excluded_hosts:
             continue
         if kind == "INSTR" and endpoint in (None, "INST0"):
-            settings = DUTSettings(mode="WT_LAN", address=host, eol="LF")
+            settings = DUTSettings(mode="VXI11", address=host, eol="LF")
         elif kind == "SOCKET" and endpoint == "10001":
             settings = DUTSettings(mode="PPA_LAN", address=host)
         elif kind == "SOCKET" and endpoint == "10002":
             settings = DUTSettings(mode="WT5000_TCP", address=host, port=10002, eol="LF")
+        elif kind == "SOCKET" and endpoint == str(_DMM_SOCKET_PORT):
+            settings = DUTSettings(mode="DMM_TCP", address=host, port=_DMM_SOCKET_PORT, eol="LF")
         elif kind == "SOCKET" and endpoint in ("23", "3390"):
             settings = DUTSettings(mode="HIOKI_LAN", address=host, port=int(endpoint))
         else:
@@ -239,7 +266,6 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
     if include_usb and visa_ready:
         diagnostics.append(f"VISA USB-TMC 후보 {usb_count}개를 확인했습니다.")
     lan_issues = []
-    entered_host = _dut_discovery_ipv4(lan_ip) if lan_ip else None
     if include_lan:
         if adapters is None:
             adapters = AutoNetworkAligner.list_ethernet_interfaces()
@@ -247,7 +273,7 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
                 diagnostics.append(AutoNetworkAligner.last_error)
         preferred = {}
         if entered_host and entered_host not in excluded_hosts:
-            source = _dut_wired_source(entered_host, adapters)
+            source = aligned_source or _dut_wired_source(entered_host, adapters)
             if saved_lan and _dut_discovery_ipv4(saved_lan.get("ip", "")) == entered_host:
                 try:
                     previous = DUTSettings(mode=saved_lan["mode"], address=entered_host,
@@ -256,11 +282,12 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
                 except (KeyError, TypeError, ValueError):
                     pass
                 else:
-                    if previous.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN") and (visa_ready or previous.mode != "WT_LAN"):
+                    if previous.mode in _DUT_LAN_MODES and (visa_ready or previous.mode not in _DUT_VXI11_MODES):
                         preferred[(previous.mode, entered_host, previous.port)] = previous
-            protocols = [("HIOKI_LAN", 3390, "CRLF"), ("PPA_LAN", 10001, "CRLF"), ("HIOKI_LAN", 23, "CRLF")]
+            protocols = [("HIOKI_LAN", 3390, "CRLF"), ("PPA_LAN", 10001, "CRLF"),
+                         ("DMM_TCP", _DMM_SOCKET_PORT, "LF"), ("HIOKI_LAN", 23, "CRLF")]
             if visa_ready:
-                protocols.append(("WT_LAN", 10001, "LF"))
+                protocols.append(("VXI11", 10001, "LF"))
             for mode, port, eol in protocols:
                 preferred.setdefault((mode, entered_host, port), DUTSettings(
                     mode=mode, address=entered_host, port=port, eol=eol, source_ip=source))
@@ -273,8 +300,8 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         if visa_ready:
             for host in _dut_discover_vxi11(cancel, adapters, diagnostics):
                 if host not in excluded_hosts:
-                    settings = DUTSettings(mode="WT_LAN", address=host, eol="LF")
-                    targets.setdefault(("WT_LAN", host, settings.port), settings)
+                    settings = DUTSettings(mode="VXI11", address=host, eol="LF")
+                    targets.setdefault(("VXI11", host, settings.port), settings)
         for key, settings in listed_lan.items():
             targets.setdefault(key, settings)
         for key, settings in targets.items():
@@ -283,14 +310,17 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
     if include_gpib and visa_ready:
         diagnostics.append(f"VISA GPIB 후보 {len(listed_gpib)}개를 확인했습니다.")
         targets.update({("GPIB", key): settings for key, settings in listed_gpib.items()})
-    if include_serial:
-        targets.update(_dut_serial_targets(excluded_resource, diagnostics))
+    serial_targets = _dut_serial_targets(excluded_resource, diagnostics) if include_serial else {}
+    targets.update(serial_targets)
 
     deadline = time.monotonic() + 8.0
     identified_addresses = set()
     attempts = 0
     for settings in targets.values():
         _dut_discovery_check_cancel(cancel)
+        if settings.mode == "SERIAL" and candidates and candidates[0].settings.mode != "SERIAL":
+            diagnostics.append("USB/LAN/GPIB에서 DUT를 확인해 COM 자동 탐색을 생략했습니다.")
+            break
         address_key = settings.address if settings.mode != "VISA" else None
         if address_key is not None and address_key in identified_addresses:
             continue
@@ -329,10 +359,12 @@ def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=T
         if include_gpib and visa_ready:
             message += (" " if message else "") + "GPIB에서 찾지 못한 DUT는 본체 주소를 직접 입력하세요."
         if include_serial:
-            message += (" " if message else "") + "COM에서 찾지 못한 DUT는 RS232 방식을 선택해 본체 통신 설정과 맞추세요."
+            message += (" " if message else "") + (
+                "COM에서 찾지 못한 DUT는 RS232 방식을 선택해 본체 통신 설정과 맞추세요." if serial_targets else
+                "DUT용 COM 포트가 없습니다. USB–RS232 변환기 연결과 장치 관리자에서 COM 포트가 생기는지 확인하세요.")
         if lan_issues:
             message = f"LAN {entered_host}에서 장비 응답을 확인하지 못했습니다. {lan_issues[0]} {message}"
-        diagnostics.append(message)
+        diagnostics.append(f"{alignment_error} {message}".strip())
     return candidates, diagnostics
 
 

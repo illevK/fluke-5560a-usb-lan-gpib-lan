@@ -1,0 +1,86 @@
+{
+  "version": "1.0.1",
+  "recorded_utc": "2026-11-18T15:57:13.155035+00:00",
+  "artifact": "C:\\Users\\HCT-2714\\Desktop\\교정자동화.exe",
+  "artifact_sha256": "42dfcb66eb820735ba9bc9a0dcb3da9e63365d1d726bdecf460a27117410be8c",
+  "desktop_copy_verified": true,
+  "legacy_preserved": true,
+  "legacy_sha256": "73ae0082b9a123dd0a7c417cd0551568d5d5bc5a1e789b349e9576c31d49574a",
+  "test_count": 96,
+  "test_scope": [
+    "DUT model selection and discovery",
+    "DUT protocols and linked measurement",
+    "calibrator-only entry, stop and wiring",
+    "measurement sheet and settings"
+  ],
+  "hardware_check": {
+    "device": "Keysight 34461A",
+    "transport": "LAN TCP 5025",
+    "observed": [
+      "*IDN?",
+      "FUNC? = \"VOLT\"",
+      "ROUT:TERM? = FRON",
+      "AC and DC current terminals = +3"
+    ]
+  },
+  "hardware_output_tested": false,
+  "packaged_check": {
+    "version": "1.0.1",
+    "passed": true,
+    "dut_choices": [
+      "AUTO",
+      "WT",
+      "PPA",
+      "HIOKI",
+      "34401A",
+      "34461A",
+      "34465A"
+    ],
+    "calibrator_only_entries": [
+      "0.999 V",
+      "0.999 V"
+    ],
+    "empty_start_rows": 0,
+    "tk_loaded": false,
+    "simulated_only": true,
+    "state": "완료",
+    "packaged_seconds": 9.91,
+    "exe_bytes": 39165282,
+    "console": false,
+    "native_windows_plugin": true,
+    "communication_modules_bundled": true
+  },
+  "source_sha256": {
+    "app.py": "66eccaad794aa7b3e021b638d23de47f94e5c7995b098cdef2eb0e9176960e01",
+    "build.py": "f90b234b98c51442e1cd79a09f5d8c48319227dd5a933129982e7bdd240f68ac",
+    "requirements.txt": "243ae44c48bc969495859682e92e6dc7bc890a84b0af11473f2044cbb37156d7",
+    "assets\\version_info.txt": "3c932d5814f15f47e5165bcb79187723bda0be57764c9d4dde102d10741023bf",
+    "THIRD_PARTY_NOTICES.md": "e99432779ff7a386a1c89b9b9838bc1f87335f99c313bf90a24caf4157dfdfea",
+    "calibration\\__init__.py": "dca5df01c039af3cd05ccb5fc291e98606c9359740d1759a5bdea4756552649c",
+    "calibration\\domain\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\domain\\clipboard.py": "0996891e294d0032bc6c4cc4a64849ff226d588135551b9d6f5b26b46bbd7621",
+    "calibration\\domain\\commands.py": "6c639612356e10e1fce3b22f1d6e2cd8eec2d7b6148b2b40c05f90f6b054f59b",
+    "calibration\\domain\\document.py": "2213c619211c355b5ba96ecec88682e8fb344ea4fe66dd233da93c12c7be909d",
+    "calibration\\domain\\groups.py": "620d23742f517a99b08514d698fadd500decc82e5de3c48a460e91197d7b2464",
+    "calibration\\domain\\planning.py": "5ec1dde9fde80ec2351728e9e7489ecce217d7a880113e9db5cd3d036da4ed6e",
+    "calibration\\domain\\types.py": "ece8e7d080484705a4fdd53d9a08a4b5ec8d0e05db3592d71ee41e3ca072f0a5",
+    "calibration\\domain\\units.py": "63da026613d48640b8641ee05c988baa1930e3860a7c9ce84d2dbbc60748e813",
+    "calibration\\instruments\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\instruments\\catalog.py": "8c3c03788669fbb2ff297adba29a7e90797079d689ed69116c029ac1b682a79e",
+    "calibration\\instruments\\discovery.py": "04b76061215bf4de277dcf8cf27caae7d66ce9347b0b95b4301b34bdd21658b8",
+    "calibration\\instruments\\dut.py": "4e6a6e034b68c9b5251a0f2244c8f31afbcfd3e12944420a015701889b006267",
+    "calibration\\instruments\\fluke.py": "aa4c7cbacf044833def5ccee279a9d1c164a56dccf7f8ddeeaa841c51bb79bff",
+    "calibration\\instruments\\transport.py": "51d58382dc40b9bd36c2e0e8fb92b899f403485eaa85f239dfacbfd27069c86e",
+    "calibration\\services\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\services\\connections.py": "43a069a8e4e5d556d28ad4ff8430b6107de4bcacc7875646f6f65b7cb5ecf1b9",
+    "calibration\\services\\drivers.py": "0d7c363bfd0055af8104ae854da4cd07294a78efba696a95de9ddcd784c03397",
+    "calibration\\services\\engine.py": "3c16114b2e3249fad92503b4177ba10e9cf0c061b671124870fd429f09b2816f",
+    "calibration\\services\\storage.py": "ac472adb3c8c9200342131132c9fa25418de81c91147e42c5f69fd64df5b5e39",
+    "calibration\\ui\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\ui\\dialogs.py": "ec38c9ff8a8f9aa84b9da9c24ff0f479ee3b9345b65529ac950ea26adb2a35f8",
+    "calibration\\ui\\table.py": "fdb8f544553c005b4ee59f9d096faa1caaa579016ced93d41a9fbff0de3b92ec",
+    "calibration\\ui\\theme.py": "e7a38ec7d3f136f9e6c912dc038366a9c63e566ba5cc47fee5e6589c6a4b695a",
+    "calibration\\ui\\window.py": "44e1bd0e92847160137fde8ff4821bc73ccd67fce0412b070a506648bca2a26b",
+    "calibration\\ui\\worker.py": "bab9aae62f57cad24fba381c1d2c4e9452ad1b5353a5f1338fd361c94f74522f"
+  }
+}

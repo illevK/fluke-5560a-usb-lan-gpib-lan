@@ -1,0 +1,12 @@
+[2026-11-17T09:56:23.899] [LAN 연결 시도] 127.0.0.1:54131
+[2026-11-17T09:56:23.909] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T09:56:24.116] [출력 상태 미확인] 기준기 응답이 끊겼습니다. 본체에서 STBY를 확인하세요.
+[2026-11-17T09:56:24.118] TX COMMAND >> STBY
+[2026-11-17T09:56:24.120] TX QUERY >> *IDN? | STBY 복구
+[2026-11-17T09:56:24.123] RX << FLUKE,5560A,TEST-1234,4.0 | STBY 복구
+[2026-11-17T09:56:24.124] TX QUERY >> OPER? | timeout=2.995757299999241
+[2026-11-17T09:56:24.126] RX << 0 | OPER? | 0.002s
+[2026-11-17T09:56:24.128] TX QUERY >> ERR? | timeout=2.992485900002066
+[2026-11-17T09:56:24.130] RX << 4102,"Compliance current limit exceeded" | ERR? | 0.002s
+[2026-11-17T09:56:24.131] 조회 OPER?: InstrumentResponseTimeout: OPER?: 0.2초 동안 완전한 응답 없음 (부분 수신: 없음).
+5560A 응답 4102,"Compliance current limit exceeded". STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다.

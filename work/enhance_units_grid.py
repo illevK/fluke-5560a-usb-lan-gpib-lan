@@ -134,15 +134,23 @@ def enhance_source(source, root):
             direction = re.search(r"\\b(LEAD|LAG)\\b", rem_str, re.I)
             if direction:
                 pf_str += " " + direction[1]''')
+    parser = parser.replace('    @classmethod\n    def _is_header_line',
+        (root / 'work/clipboard_measurement_labels.pyfrag').read_text(encoding='utf-8')
+        + '    @classmethod\n    def _is_header_line', 1)
     parser = parser.replace('    @classmethod\n    def build_Single_step_from_fields(', '''    @classmethod
     def build_sheet_step(cls, *, step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw, nominal_raw,
-                         breakpoint=False, **settings):
+                         breakpoint=False, declared_kind=None, **settings):
+        if declared_kind and (issue := cls._clipboard_type_issue(declared_kind, vi_cond_raw, freq_cond_raw, nominal_raw)):
+            return SequenceStep(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw, nominal_raw,
+                                "ERROR", "", issue, "⚠ 측정 항목 확인", breakpoint, declared_kind=declared_kind)
         try:
-            return cls.build_Single_step_from_fields(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw,
+            step = cls.build_Single_step_from_fields(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw,
                                                      nominal_raw, breakpoint=breakpoint, **settings)
         except OutputRangeError as exc:
-            return SequenceStep(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw, nominal_raw,
+            step = SequenceStep(step_no, vi_cond_raw, freq_cond_raw, pf_cond_raw, nominal_raw,
                                 "OUT_OF_RANGE", "", str(exc).splitlines()[0], "⚠ 출력 범위 초과", breakpoint)
+        step.declared_kind = declared_kind
+        return step
 
     @classmethod
     def build_Single_step_from_fields(''', 1)
@@ -150,8 +158,20 @@ def enhance_source(source, root):
             parsed_fields = cls.parse_line_to_fields(raw_line)
             if parsed_fields is None:
                 continue
-            vi_c, fq_c, pf_c, nom_c = parsed_fields''', '''        rows = [fields for line in raw_text.splitlines() if (fields := cls.parse_line_to_fields(line)) is not None]
-        for vi_c, fq_c, pf_c, nom_c in cls.resolve_unsigned_pf_triplets(rows):''', 1)
+            vi_c, fq_c, pf_c, nom_c = parsed_fields''', '''        rows, kinds = [], []
+        heading = None
+        for line in raw_text.splitlines():
+            fields, heading, _, kind = cls.parse_labeled_clipboard_line(line, heading)
+            if fields is not None:
+                rows.append(fields)
+                kinds.append(kind)
+        for (vi_c, fq_c, pf_c, nom_c), kind in zip(cls.resolve_unsigned_pf_triplets(rows), kinds):
+            if kind:
+                step_counter += 1
+                steps.append(cls.build_sheet_step(step_no=step_counter, vi_cond_raw=vi_c, freq_cond_raw=fq_c,
+                    pf_cond_raw=pf_c, nominal_raw=nom_c, declared_kind=kind, use_coil=use_coil,
+                    coil_turns=coil_turns, default_zcomp=default_zcomp, current_post=current_post, model=model))
+                continue''', 1)
     source = source[:start] + parser + source[end:]
     source = source.replace('DPF {dpf_val:.2f}', 'DPF {dpf_val:.6g}')
 
@@ -166,7 +186,17 @@ def enhance_source(source, root):
         source = source.replace(f'float(self.var_{field}.get())', f'SIUnits.input_value(self.var_{field}.get(), "{unit}")')
     source = source.replace('W/kW', 'W 계열')
 
-    source = source.replace('    breakpoint: bool = False\n', '    breakpoint: bool = False\n    measured_raw: str = ""\n    dut_channel: int | None = None\n', 1)
+    source = source.replace('    breakpoint: bool = False\n', '''    breakpoint: bool = False
+    measured_raw: str = ""
+    dut_channel: int | None = None
+    dut_channel_suffix: str = ""
+    channel_hint: tuple[int, str] | None = None
+    declared_kind: str | None = None
+
+    @property
+    def channel_key(self):
+        return (self.dut_channel, self.dut_channel_suffix) if self.dut_channel is not None else None
+''', 1)
     start = source.index('    class ExcelSheetGrid(')
     end = source.index('    class Fluke5560AControllerApp(', start)
     grid = source[start:end]
@@ -176,7 +206,7 @@ def enhance_source(source, root):
     grid = grid.replace('grid_columnconfigure(6,', 'grid_columnconfigure(8,')
     grid = grid.replace('labels[10] = btn_go', 'labels["start"] = btn_go').replace('labels[11]', 'labels["breakpoint"]')
     grid = grid.replace('            labels[8].configure(text=st.status,',
-        '            channel = f"CH{st.dut_channel}" if st.dut_channel is not None else ""\n'
+        '            channel = channel_name(st.channel_key)\n'
         '            labels[10].configure(text=channel, bg=row_bg, fg=row_fg, font=row_font)\n'
         '            labels[8].configure(text=st.status,')
     grid = grid.replace('            self.set_command_visibility(self.show_commands)\n            self.cells_frame.update_idletasks()',
@@ -273,23 +303,29 @@ def enhance_source(source, root):
     source = source.replace('start_col_idx: int) -> None:', 'start_col_idx: int, *, replace_all=False, append=False) -> None:', 1)
     source = source.replace('            parsed_rows: List[Tuple[str, str, str, str]] = []',
         '            if append:\n                start_row_idx = len(self.seq_steps)\n'
+        '            channel_hints, declared_kinds = [], []\n'
+        '            heading, skipped_headings = None, 0\n'
         '            parsed_rows: List[Tuple[str, str, str, str]] = []', 1)
     source = source.replace('''            for ln in lines:
                 try:
                     pf = SmartClipboardSequenceParser.parse_line_to_fields(ln)''',
         '''            for line_no, ln in enumerate(lines, 1):
                 try:
-                    pf = SmartClipboardSequenceParser.parse_line_to_fields(ln)
-                    if append and pf is None and not SmartClipboardSequenceParser._is_header_line(ln):
+                    pf, heading, is_heading, kind = SmartClipboardSequenceParser.parse_labeled_clipboard_line(ln, heading)
+                    skipped_headings += is_heading
+                    if append and pf is None and not is_heading and not SmartClipboardSequenceParser._is_header_line(ln):
                         raise ValueError(f"붙여넣은 {line_no}행의 출력 조건을 인식할 수 없습니다.")''', 1)
     source = source.replace('''            if len(parsed_rows) == len(lines) and parsed_rows:
                 if start_row_idx == 0 and len(parsed_rows) > 1:
                     self.seq_steps = []
 
                 for offset''', '''            tabular = any("\\t" in line for line in lines)
-            if parsed_rows and (append or tabular or len(parsed_rows) == len(lines)):
+            if parsed_rows and (append or tabular or len(parsed_rows) + skipped_headings == len(lines)):
                 new_steps = []
                 for offset''', 1)
+    source = source.replace('                    parsed_rows.append(pf)\n',
+        '                    parsed_rows.append(pf)\n                    declared_kinds.append(kind)\n'
+        '                    channel_hints.append(pasted_channel_hint(ln))\n', 1)
     source = source.replace('enumerate(parsed_rows):', 'enumerate(SmartClipboardSequenceParser.resolve_unsigned_pf_triplets(parsed_rows)):', 1)
     source = source.replace('''                        break
 
@@ -299,6 +335,7 @@ def enhance_source(source, root):
                         self.seq_steps.append(new_step)
 
                 for i, st''', '''                        return
+                    new_step.channel_hint = channel_hints[offset]
                     new_steps.append(new_step)
 
                 if replace_all or (not append and start_row_idx == 0 and len(new_steps) > 1):
@@ -316,7 +353,7 @@ def enhance_source(source, root):
                 if out_of_range:
                     notes.append("출력 범위 초과 · 실행 제외 " + ", ".join(out_of_range) + "행")
                 if invalid_rows:
-                    notes.append("전력 조건과 명목값 확인 · " + ", ".join(invalid_rows) + "행")
+                    notes.append("측정 항목·출력 조건 확인 · " + ", ".join(invalid_rows) + "행")
                 if notes:
                     text = " | ".join(notes)
                     self.var_active_row_banner.set(text)

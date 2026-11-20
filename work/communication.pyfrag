@@ -285,6 +285,20 @@ class TelnetLineTransport:
         self._recent_writes = self._recent_writes[-16:]
 
 
+@dataclass(frozen=True)
+class CalibratorRecoveryTarget:
+    interface: str
+    address: str
+    identity: str
+    model: str
+    timeout: float
+    eol: str = "CRLF"
+    port: int = DEFAULT_LAN_PORT
+    source_ip: str = ""
+    serial_settings: tuple = ()
+    usb_serial_key: str = ""
+
+
 class Fluke5560AConnectionManager:
     def __init__(self):
         self.info = ConnectionInfo()
@@ -295,6 +309,10 @@ class Fluke5560AConnectionManager:
         self.zero_adjustment_due = False
         self._transport = None
         self._serial_port = None
+        self._active_endpoint = None
+        self.recovery_target = None
+        self.recovery_pending = False
+        self.output_unconfirmed = False
         self.expected_model = "5560A"
         self.profile = MODEL_PROFILES["5560A"]
         self._lock = threading.RLock()
@@ -424,7 +442,9 @@ class Fluke5560AConnectionManager:
                 and fields[1].upper() in MODEL_PROFILES
                 and self.expected_model in ("AUTO", fields[1].upper()))
 
-    def _identify(self, value, interface):
+    def _identify(self, value, interface, expected_identity=""):
+        if expected_identity and value != expected_identity:
+            raise InstrumentProtocolError("재연결한 기준기의 식별 정보가 기존 장비와 다릅니다.")
         if not self._validate_idn(value):
             raise InstrumentProtocolError(f"선택 모델 {self.expected_model}과 식별 응답이 다릅니다: {value}")
         profile = MODEL_PROFILES[value.split(",")[1].strip().upper()]
@@ -605,8 +625,8 @@ class Fluke5560AConnectionManager:
                 if mode == "RS232" and serial_port.strip():
                     candidates = [serial_port.strip()]
                 else:
-                    previous_com = next((item["com"] for item in histories if item.get("com")), None)
-                    candidates = self._serial_candidates(serial_port, previous_com)
+                    recent_serial = next((item for item in histories if item.get("com")), {})
+                    candidates = self._serial_candidates(serial_port, recent_serial.get("com"), recent_serial.get("serial_usb_key", ""))
                 candidates = [port for port in candidates if port.upper() != excluded_com]
                 if not candidates:
                     errors.append("검색할 COM 포트가 없습니다. USB–RS-232 컨버터를 확인하세요." if HAS_PYSERIAL else
@@ -639,16 +659,19 @@ class Fluke5560AConnectionManager:
                         if result.connected:
                             self.expected_model = self.profile.model
                             ending = "LF" if self.profile.model == "5560A" and ending == "CRLF" else ending
-                            self._remember_connection("RS232", com=port, serial_settings=[speed, bits, check, stop, flow, ending])
+                            self._remember_connection("RS232", com=port, serial_settings=[speed, bits, check, stop, flow, ending],
+                                                      serial_usb_key=self._active_endpoint.usb_serial_key if self._active_endpoint else "")
                             if self._transport is not None:
                                 self._transport.timeout = timeout_sec
+                            if self._active_endpoint is not None:
+                                self._active_endpoint = replace(self._active_endpoint, timeout=timeout_sec)
                             return result
                         errors.append(self.last_error)
         self.last_error = "\n".join(errors)
         raise ConnectionError(self.last_error or "연결할 인터페이스와 장비 IP/리소스를 지정하세요.")
 
     def _try_lan_socket(self, ip, port=3490, timeout_sec=3.0, allow_open_port_fallback=False,
-                        source_ip="", eol="CRLF", *, source_ips=None):
+                        source_ip="", eol="CRLF", *, source_ips=None, expected_identity=""):
         sock = None
         self._lan_tcp_failures = []
         stage = "TCP 연결"
@@ -660,13 +683,15 @@ class Fluke5560AConnectionManager:
             transport = TelnetLineTransport(sock, timeout_sec, eol)
             stage = "장비 식별 (*IDN?)"
             idn = transport.query("*IDN?", identity=True)
-            self._identify(idn, "LAN")
+            self._identify(idn, "LAN", expected_identity)
             # Identification is complete before sending any state-changing commands.
             stage = "Computer 통신 모드 확인"
             self._prepare_remote_stream(transport, "LAN")
             self._lan_sock, self._transport = sock, transport
             self._first_command_check = True
             self.info = ConnectionInfo(True, "LAN (Ethernet Socket)", f"TCPIP::{ip}::{port}::SOCKET", idn, ip, port)
+            self._active_endpoint = CalibratorRecoveryTarget("LAN", ip, idn, self.profile.model,
+                                                              timeout_sec, eol, port, self.source_ip)
             self._last_lan_source = (ip, port, self.source_ip)
             self.last_error = ""
             return self.info
@@ -687,17 +712,18 @@ class Fluke5560AConnectionManager:
         return [(p.device, p.description) for p in serial.tools.list_ports.comports()]
 
     @staticmethod
-    def _serial_candidates(explicit, previous):
-        candidates = [explicit.strip().upper()] if explicit.strip() else []
+    def _serial_candidates(explicit, previous, usb_key=""):
         if not HAS_PYSERIAL:
-            return candidates
+            return [explicit.strip().upper()] if explicit.strip() else []
         ports = [port for port in serial.tools.list_ports.comports()
                  if not (port.hwid or "").upper().startswith(("BTHENUM", "BTHLE", "BTHMODEM"))
                  and "bluetooth" not in (port.description or "").casefold()]
-        ports.sort(key=lambda port: (port.device.upper() != previous, port.vid is None, port.device.upper()))
-        return list(dict.fromkeys(candidates + [port.device.upper() for port in ports]))
+        ports.sort(key=lambda port: (port.device.upper() != explicit.strip().upper(),
+                                     not usb_key or _serial_usb_key(port) != usb_key,
+                                     port.device.upper() != previous, port.vid is None, port.device.upper()))
+        return list(dict.fromkeys(port.device.upper() for port in ports))
 
-    def _try_serial(self, port, timeout, eol, baudrate, data_bits, parity, stop_bits, flow_control):
+    def _try_serial(self, port, timeout, eol, baudrate, data_bits, parity, stop_bits, flow_control, *, expected_identity=""):
         if not HAS_PYSERIAL:
             self.last_error = dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR)
             return ConnectionInfo()
@@ -728,7 +754,7 @@ class Fluke5560AConnectionManager:
                 transport.reply_gap = .12
             stage = "장비 식별 (*IDN?)"
             idn = transport.query("*IDN?", identity=True)
-            self._identify(idn, "RS232")
+            self._identify(idn, "RS232", expected_identity)
             if self.profile.model == "5560A":
                 if input_eol == "CRLF":
                     transport.terminator = b"\n"
@@ -740,6 +766,11 @@ class Fluke5560AConnectionManager:
             self._first_command_check = True
             self.info = ConnectionInfo(True, "RS232 (COM / USB–RS-232)",
                                        f"{port} / {baudrate} / {data_bits}{parity}{stop_bits} / {flow_control}", idn)
+            self._active_endpoint = CalibratorRecoveryTarget(
+                "RS232", port, idn, self.profile.model, timeout,
+                "LF" if self.profile.model == "5560A" and eol == "CRLF" else eol,
+                serial_settings=(baudrate, data_bits, parity, stop_bits, flow_control),
+                usb_serial_key=_serial_key_for_address(port))
             self.last_error = ""
             return self.info
         except Exception as exc:
@@ -758,7 +789,7 @@ class Fluke5560AConnectionManager:
             return self.info
 
     def _try_visa_auto_scan(self, filter_mode, gpib_addr, timeout_sec, visa_resource="",
-                            *, excluded_gpib=None, excluded_usb=None):
+                            *, excluded_gpib=None, excluded_usb=None, expected_identity=""):
         if not HAS_PYVISA:
             self.last_error = dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR)
             return ConnectionInfo()
@@ -790,13 +821,14 @@ class Fluke5560AConnectionManager:
                     inst.read_termination = "\n"
                     inst.write_termination = "\n"
                     idn = inst.query("*IDN?").strip()
-                    self._identify(idn, interface)
+                    self._identify(idn, interface, expected_identity)
                     if interface == "GPIB":
                         inst.control_ren(pyvisa.constants.RENLineOperation.asrt_address)
                     self._visa_inst = inst
                     self._first_command_check = True
                     # REMOTE/LOCAL strings are Ethernet/serial commands, not GPIB/USBTMC.
                     self.info = ConnectionInfo(True, "USB (USBTMC)" if kind.startswith("USB") else "GPIB (IEEE-488.2)", resource, idn)
+                    self._active_endpoint = CalibratorRecoveryTarget(interface, resource, idn, self.profile.model, timeout_sec)
                     return self.info
                 except Exception as exc:
                     errors.append(f"{resource}: {exc}")
@@ -876,6 +908,7 @@ class Fluke5560AConnectionManager:
         self.zero_adjustment_due = False
         self._serial_port = None
         self.info = ConnectionInfo()
+        self._active_endpoint = None
 
     def _query(self, command, timeout=None, cancellable=True):
         """Caller holds the transaction lock and owns failure cleanup."""
@@ -935,6 +968,9 @@ class Fluke5560AConnectionManager:
 
     def _fail_control_session(self, context, exc, *, recover_standby=False):
         message = f"{context}: {type(exc).__name__}: {exc}"
+        target = self._active_endpoint
+        self.output_unconfirmed = True
+        self.record_event("[출력 상태 미확인] 기준기 응답이 끊겼습니다. 본체에서 STBY를 확인하세요.", notify=True)
         try:
             self._write("STBY")
         except Exception as standby_error:
@@ -947,14 +983,89 @@ class Fluke5560AConnectionManager:
                     message += f"\nSTBY 확인 실패: {recovery_error}"
                 else:
                     self.cancel_event.clear()
+                    self.output_unconfirmed = False
                     message = f"{message}\n{self.profile.model} 응답 {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
                     self.last_error = message
                     self.record_event(message, notify=True)
                     raise InstrumentCommandError(message) from exc
             message += "\nSTBY 전송 시도 후 연결 종료. 출력 차단 확인은 되지 않았으므로 본체의 STBY 상태를 확인하세요."
         self._drop_connection()
+        self.recovery_target = target
+        self.recovery_pending = target is not None
         self.last_error = message
         self.record_event(message, notify=True)
+
+    def check_output_state(self):
+        with self._lock:
+            state = self.query("OPER?").strip()
+            if state not in ("0", "1"):
+                error = InstrumentProtocolError(f"출력 상태 응답이 올바르지 않습니다: {state}")
+                self._fail_control_session("OPER? 응답 확인", error)
+                raise error
+            return state
+
+    def set_uncompensated_resistance_in_standby(self, command):
+        expected = self.profile.output_values(command.partition(";")[0])["OHM"]
+        self.send_command(command, check_before=True)
+        reply = self.query("OUT?")
+        fields = [field.strip().upper() for field in reply.split(",")]
+        confirmed = False
+        if len(fields) == 5 and (fields[1], fields[3]) == ("OHM", "0"):
+            try:
+                actual = float(fields[0])
+                if math.isfinite(actual) and float(fields[2]) == float(fields[4]) == 0:
+                    if self.profile.model == "5080A":
+                        # OUT? can report the characterized value of the selected fixed resistor.
+                        selected = min(RESISTORS_5080A, key=lambda nominal: abs(nominal - abs(actual)))
+                        confirmed = selected == expected and (actual >= 0 or expected == 0)
+                    else:
+                        confirmed = math.isclose(actual, expected, rel_tol=5e-6)
+            except ValueError:
+                pass
+        if not confirmed:
+            raise InstrumentReplyError(f"기준기 {expected:g} Ω 설정 확인 실패 · 응답 {reply[:120]}")
+        compensation = self.query("ZCOMP?").strip().upper()
+        if compensation not in ("NONE", "OFF"):
+            raise InstrumentReplyError(f"기준기 저항 보상 OFF 확인 실패 · 응답 {compensation[:80]}")
+
+    def recover_standby(self):
+        with self._lock:
+            saved = self.recovery_target
+            self.recovery_pending = False
+            if saved is None or self.info.connected:
+                raise ConnectionError("복구할 기준기 연결이 없습니다.")
+            self.expected_model = saved.model
+            self.profile = MODEL_PROFILES[saved.model]
+            timeout = min(2.0, saved.timeout)
+            try:
+                if saved.interface == "RS232":
+                    port = _wait_for_serial_address(saved.address, saved.usb_serial_key, self.cancel_event)
+                    connection = self._try_serial(port, timeout, saved.eol, *saved.serial_settings,
+                                                  expected_identity=saved.identity)
+                elif saved.interface == "LAN":
+                    connection = self._try_lan_socket(saved.address, saved.port, timeout, eol=saved.eol,
+                                                      source_ips=(saved.source_ip,), expected_identity=saved.identity)
+                else:
+                    connection = self._try_visa_auto_scan(saved.interface, 0, timeout, saved.address,
+                                                          expected_identity=saved.identity)
+                if not connection.connected:
+                    raise ConnectionError(self.last_error)
+                self._write("STBY")
+                if self._query("*OPC?", timeout=8.0, cancellable=False) != "1" or self._query(
+                        "OPER?", timeout=2.0, cancellable=False) != "0":
+                    raise InstrumentProtocolError("복구한 기준기의 STBY 응답을 확인하지 못했습니다.")
+                if self._transport is not None:
+                    self._transport.timeout = saved.timeout
+                elif self._visa_inst is not None:
+                    self._visa_inst.timeout = int(saved.timeout * 1000)
+                self._active_endpoint = replace(self._active_endpoint, timeout=saved.timeout)
+            except Exception:
+                self._drop_connection()
+                raise
+            self.recovery_target = None
+            self.output_unconfirmed = False
+            self.record_event(f"[기준기 복구] {connection.resource_name} · 동일 장비 · STBY 확인", notify=True)
+            return connection
 
     def query(self, cmd):
         command = self._validate_command(cmd)
@@ -986,35 +1097,46 @@ class Fluke5560AConnectionManager:
             if self._query("*OPC?", timeout=self.operation_timeout) != "1" or self._query("OPER?") != "0":
                 raise InstrumentProtocolError(f"{self.profile.model} 오류 {error}; STBY 확인 실패")
         hint = (" COM 포트의 속도·패리티·흐름 제어와 케이블을 확인하세요."
-                if int(error.partition(",")[0]) == -361 else "")
+                if self._serial_port is not None and int(error.partition(",")[0]) in (-361, 801) else "")
         raise InstrumentCommandError(
             f"{self.profile.model} 오류 ({phase}): {error}. STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다."
             + hint
         )
 
-    def _check_initial_error(self, error):
-        allowed = {-410, 8012} if self.profile.model == "5560A" else {1308}
-        serial_5560 = self.profile.model == "5560A" and self._serial_port is not None
-        if serial_5560:
-            allowed.add(-361)
-        serial_recovery = False
-        for _ in range(15):  # 5560A keeps up to 15 entries in its error queue.
-            code = int(error.partition(",")[0])
-            if code not in allowed or self._query("OPER?") != "0":
-                break
-            if serial_5560 and code in (-410, -361):
-                serial_recovery = True
-            else:
-                allowed.remove(code)
-            self.record_event(f"[첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: {error}")
-            error = self._query("ERR?")
-        if serial_recovery and int(error.partition(",")[0]) == 0:
+    def _is_552x_serial_framing(self, code):
+        return (code == 801 and self._serial_port is not None
+                and self.profile.model in ("5520A", "5522A"))
+
+    def _confirm_serial_standby_after_queue(self, error):
+        if int(error.partition(",")[0]) == 0:
             if self._query("*IDN?") != self.info.idn_string or self._query("OPER?") != "0":
                 raise InstrumentProtocolError("RS232 재확인 중 장비 식별 또는 STBY 상태가 일치하지 않습니다.")
             error = self._query("ERR?")
             if int(error.partition(",")[0]) == 0:
                 self.record_event("[RS232 복구 확인] 동일 장비 · STBY · 오류 없음", notify=True)
         return error
+
+    def _check_initial_error(self, error):
+        allowed = {-410, 8012} if self.profile.model == "5560A" else {1308}
+        serial_5560 = self.profile.model == "5560A" and self._serial_port is not None
+        if serial_5560:
+            allowed.add(-361)
+        if self._is_552x_serial_framing(801):
+            allowed.add(801)
+        serial_recovery = False
+        # Inspect the initial backlog up to the documented queue capacity. Stop
+        # on any other fault, including overflow, or if the output is active.
+        for _ in range(15):
+            code = int(error.partition(",")[0])
+            if code not in allowed or self._query("OPER?") != "0":
+                break
+            if (serial_5560 and code in (-410, -361)) or self._is_552x_serial_framing(code):
+                serial_recovery = True
+            else:
+                allowed.remove(code)
+            self.record_event(f"[첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: {error}")
+            error = self._query("ERR?")
+        return self._confirm_serial_standby_after_queue(error) if serial_recovery else error
 
     def send_command(self, cmd, *, check_before=False):
         command = self._validate_command(cmd)
@@ -1057,6 +1179,11 @@ class Fluke5560AConnectionManager:
                 if self._first_command_check and command.upper() == "STBY":
                     self._first_command_check = False
                     error = self._check_initial_error(error)
+                elif (command.upper() == "STBY"
+                      and self._is_552x_serial_framing(int(error.partition(",")[0]))
+                      and self._query("OPER?") == "0"):
+                    self.record_event(f"[STBY 확인] RS232 오류 재확인 · {error}")
+                    error = self._confirm_serial_standby_after_queue(self._query("ERR?"))
                 if not re.match(r"^\+?0\s*(?:,|$)", error):
                     self._stop_after_command_error(error, command)
                 self.record_event(f"[명령 완료] {command} | {time.monotonic() - started:.3f}s", notify=True)

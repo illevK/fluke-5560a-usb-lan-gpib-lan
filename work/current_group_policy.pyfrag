@@ -9,6 +9,11 @@ class SequenceCurrentFilter:
     CURRENT_ONLY = {"DCI", "ACI"}
     DUAL_FUNCTIONS = {"DCP", "ACP", "PF"}
     CURRENT_FUNCTIONS = CURRENT_ONLY | DUAL_FUNCTIONS
+    DUT_34465_10A_START = 3.0
+    DUT_3A = "3 A 단자 · 3 A 미만"
+    DUT_10A = "10 A 단자 · 3 A 이상"
+    DUT_10A_ALL = "10 A 단자 · 전체 전류"
+    DUT_34465_GROUPS = (DUT_3A, DUT_10A, DUT_10A_ALL)
     CURRENT_TOKEN = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)\s*(UA|MA|A)\s*$", re.I)
 
     @classmethod

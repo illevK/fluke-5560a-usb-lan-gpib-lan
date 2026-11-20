@@ -3,6 +3,9 @@
                 if self._dut_busy:
                     self.var_idn_display.set("DUT 연결 확인이 끝난 뒤 기준기를 연결하세요.")
                     return
+                if self.conn_mgr.recovery_target is not None:
+                    self._start_calibrator_recovery()
+                    return
                 args = self._connection_arguments()
                 dut = self.dut_session.settings
                 if dut is not None:
@@ -13,10 +16,8 @@
                                 excluded_usb=_dut_discovery_usb_key(target))
                 def connect():
                     info = self.conn_mgr.scan_and_auto_connect(**args)
-                    state = self.conn_mgr.query("OPER?").strip()
-                    if state not in ("0", "1"):
-                        self.conn_mgr.disconnect(standby=False)
-                        raise InstrumentProtocolError(f"출력 상태 응답이 올바르지 않습니다: {state}")
+                    state = self.conn_mgr.check_output_state()
+                    self.conn_mgr.output_unconfirmed = False
                     return info, state == "1"
                 def done(result):
                     info, self.is_operating = result
@@ -34,6 +35,9 @@
                     route = f" | PC 원본 IP: {self.conn_mgr.source_ip}" if info.discovered_ip else ""
                     self._log(f"[연결 성공] {info.interface_type} | {info.resource_name} | {info.idn_string}{route}")
                 def failed(exc):
+                    if self.conn_mgr.output_unconfirmed:
+                        self.var_idn_display.set("출력 상태 미확인 · 본체에서 STBY를 확인하세요.")
+                        return
                     if args["preferred_mode"] != "AUTO" or self.conn_mgr.info.connected:
                         self._show_report("통신 안내", self._last_report)
                         return
@@ -45,6 +49,27 @@
                 self._start_io("장비 연결 및 식별 확인 중…", connect, done, on_error=failed)
             except Exception as exc:
                 messagebox.showerror("입력 확인", str(exc))
+
+        def _start_calibrator_recovery(self):
+            if self._io_busy or self._dut_closing or self.conn_mgr.recovery_target is None:
+                return False
+            self.conn_mgr.recovery_pending = False
+
+            def done(info):
+                self.is_operating = False
+                self._update_connection_ui(info)
+                self._refresh_oper_badge()
+                if info.interface_type.startswith("RS232"):
+                    self.var_serial_port.set(info.resource_name.split(" / ", 1)[0])
+                self.var_idn_display.set(f"{info.resource_name} · STBY 확인 · 중단 행에서 재개하세요.")
+
+            def failed(_error):
+                self.is_operating = None
+                self._refresh_oper_badge()
+                self.var_idn_display.set("기준기 복구 실패 · 본체에서 STBY 확인 후 다시 연결하세요.")
+
+            return self._start_io("동일 기준기 재연결 및 STBY 확인 중…", self.conn_mgr.recover_standby,
+                                  done, on_error=failed, stop_sequence=False, standby=True)
 
         def _on_sim_connect_clicked(self):
             if self._io_busy:

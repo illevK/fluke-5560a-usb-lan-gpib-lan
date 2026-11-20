@@ -1,0 +1,5 @@
+[2026-11-17T11:46:14.316] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\logs\fluke_20261117_114613_673931_25876.log
+[2026-11-17T11:46:14.392] 실행 Python: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv\Scripts\python.exe | PyVISA=True | pyserial=True
+[2026-11-17T11:46:14.463] 시스템 준비 완료 (현재 내 PC IP: 감지 안 됨). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.
+[2026-11-17T11:46:14.835] [엑셀 붙여넣기 완료] #1번 행부터 아래로 총 1개 행이 칸별로 자동 입력되었습니다.
+[2026-11-17T11:46:14.855] [붙여넣기 입력 오류] 붙여넣은 2행의 출력 조건을 인식할 수 없습니다.

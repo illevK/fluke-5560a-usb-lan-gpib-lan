@@ -1,0 +1,698 @@
+"""v6.10.38 regression vectors, now exercising the v1 source modules only."""
+from tests.api_compat import api as f
+"""All peers are in-memory or localhost. Never connect to physical equipment."""
+import sys
+import tempfile
+import time
+import threading
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from tests.protocols.test_communications import FakeInstrument
+
+class SerialPeer:
+
+    def __init__(self, model='5522A', echo=True, missing=False, error='0,"No error"', *, recovery_reply=True, late_completion=False):
+        self.model, self.echo, self.missing = (model, echo, missing)
+        self.errors = [] if error == '0,"No error"' else [error]
+        self.recovery_reply, self.late_completion = (recovery_reply, late_completion)
+        self.trip = None
+        self.current_post = 'AUX'
+        self.ignore_post_change = False
+        self.is_open = True
+        self.pending = bytearray()
+        self.commands = []
+        self.timeout = 0.2
+        self.write_timeout = 1
+        self.operating = False
+        self.output_seen = False
+
+    @property
+    def in_waiting(self):
+        return len(self.pending)
+
+    def read(self, size):
+        if not self.pending:
+            time.sleep(min(self.timeout, 0.01))
+            return b''
+        data = bytes(self.pending[:min(size, 3)])
+        del self.pending[:len(data)]
+        return data
+
+    def write(self, data):
+        command = data.decode('ascii').strip()
+        self.commands.append(command)
+        if self.echo:
+            self.pending.extend((command + '\r\n').encode())
+        if command.startswith('OUT '):
+            self.output_seen = True
+        if 'OPER' in command and '?' not in command:
+            self.operating = True
+        for part in command.split(';'):
+            part = part.strip()
+            if part.startswith('CUR_POST ') and (not self.ignore_post_change):
+                self.current_post = part.split()[1]
+        if command.startswith('OUT ') and self.trip:
+            self.errors.append(self.trip)
+            self.operating = False
+            self.trip = None
+        if command in ('STBY', '*RST'):
+            self.operating = False
+            if self.late_completion:
+                self.pending.extend(b'1\r\n')
+        response = {'*IDN?': f'FLUKE,{self.model},TEST,1.0', '*OPC?': '1', 'COMM_MODE? SERIAL': 'COMP', 'OPER?': '1' if self.operating else '0', 'CUR_POST?': self.current_post, 'OUT?': '1 A, 60 HZ', 'FUNC?': 'ACI'}.get(command)
+        if self.model == '5730A':
+            if command in ('OPER?', 'ERR?', 'ZCOMP?'):
+                raise AssertionError(f'Invalid 5730A command {command}')
+            if command == 'ISR?':
+                response = str(2048 + int(self.operating))
+            if command == 'FAULT?':
+                response = self.errors.pop(0) if self.errors else '0'
+        if command == 'ERR?':
+            response = self.errors.pop(0) if self.errors else '0,"No error"'
+        if command == '*IDN?' and self.output_seen and (not self.recovery_reply):
+            response = None
+        if self.missing and self.output_seen and (command == '*OPC?') and self.operating:
+            response = None
+        if response is not None:
+            self.pending.extend((response + '\r\n').encode())
+        if self.echo:
+            self.pending.extend(b'=> ')
+        return len(data)
+
+    def close(self):
+        self.is_open = False
+
+class SerialTests(unittest.TestCase):
+
+    def setUp(self):
+        folder = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(f.Fluke5560AConnectionManager, '_connection_history_path', return_value=folder / 'connections.json'))
+
+    def connect(self, peer, **kwargs):
+        backend = Mock()
+        backend.Serial.return_value = peer
+        backend.tools.list_ports.comports.return_value = []
+        self.addCleanup(patch.stopall)
+        patch.object(f, 'serial', backend).start()
+        patch.object(f, 'HAS_PYSERIAL', True).start()
+        mgr = f.Fluke5560AConnectionManager()
+        self.addCleanup(lambda: mgr.disconnect(standby=False))
+        mgr.scan_and_auto_connect('RS232', model=peer.model, serial_port='COM7', timeout_sec=0.2, operation_timeout_sec=1, **kwargs)
+        return (mgr, backend)
+
+    def test_calibrator_serial_recovers_by_usb_identity_and_confirms_standby_only(self):
+
+        def listed(address, serial_number):
+            return SimpleNamespace(device=address, vid=1659, pid=9123, serial_number=serial_number, hwid='USB', description='USB Serial')
+        initial, wrong, restored = (SerialPeer('5520A'), SerialPeer('5522A'), SerialPeer('5520A'))
+        with patch.object(f, 'serial') as serial_backend:
+            serial_backend.tools.list_ports.comports.return_value = [listed('COM7', 'A')]
+            serial_backend.Serial.side_effect = (initial, wrong, restored)
+            mgr = f.Fluke5560AConnectionManager()
+            mgr.scan_and_auto_connect('RS232', model='5520A', serial_port='COM7', timeout_sec=0.25)
+            self.assertEqual(initial.timeout, 0.2)
+            self.assertEqual(initial.write_timeout, 1)
+            with patch.object(initial, 'write', side_effect=OSError('COM device removed')):
+                with self.assertRaises(OSError):
+                    mgr.send_command('OUT 1 V, 0 HZ; OPER')
+            self.assertTrue(mgr.output_unconfirmed)
+            self.assertTrue(mgr.recovery_pending)
+            serial_backend.tools.list_ports.comports.return_value = [listed('COM7', 'B'), listed('COM13', 'A')]
+            with self.assertRaisesRegex(ConnectionError, '식별 정보'):
+                mgr.recover_standby()
+            self.assertTrue(mgr.output_unconfirmed)
+            self.assertEqual(wrong.commands, ['*IDN?'])
+            result = mgr.recover_standby()
+            self.assertTrue(result.resource_name.startswith('COM13 /'))
+            self.assertEqual(restored.commands, ['*IDN?', 'REMOTE', '*OPC?', 'STBY', '*OPC?', 'OPER?'])
+            self.assertFalse(mgr.output_unconfirmed)
+            self.assertIsNone(mgr.recovery_target)
+            mgr.disconnect(standby=False)
+
+    def test_552x_serial_rechecks_startup_framing_before_output(self):
+        for model in ('5520A', '5522A'):
+            with self.subTest(model=model):
+                peer = SerialPeer(model, echo=False)
+                mgr, _ = self.connect(peer)
+                peer.errors = ['801,"Serial framing error REM"'] * 5
+                mgr.send_command('OUT 1 V, 0 HZ')
+                idx = peer.commands.index('OUT 1 V, 0 HZ')
+                self.assertEqual(peer.commands[idx - 3:idx], ['*IDN?', 'OPER?', 'ERR?'])
+                self.assertTrue(mgr.info.connected)
+
+    def test_5520a_serial_preserves_protection_and_stops_on_repeated_live_framing(self):
+        peer = SerialPeer('5520A', echo=False)
+        mgr, _ = self.connect(peer)
+        peer.errors = ['801,"Serial framing error REM"', '1500,"Compliance"']
+        with self.assertRaisesRegex(f.InstrumentCommandError, '1500'):
+            mgr.send_command('OUT 1 V, 0 HZ; OPER')
+        self.assertFalse(peer.output_seen)
+        mgr.send_command('STBY')
+        peer.errors = ['801,"Serial framing error REM"']
+        mgr.send_command('STBY')
+        self.assertEqual(peer.commands[-3:], ['*IDN?', 'OPER?', 'ERR?'])
+        peer.errors = ['801,"Serial framing error REM"'] * 2
+        with self.assertRaisesRegex(f.InstrumentCommandError, '케이블'):
+            mgr.send_command('STBY')
+        self.assertTrue(mgr.info.connected)
+        self.assertFalse(peer.operating)
+        peer.errors = ['801,"Serial framing error REM"'] * 16
+        with self.assertRaisesRegex(f.InstrumentCommandError, '801'):
+            mgr.send_command('OUT 1 V, 0 HZ; OPER', check_before=True)
+        self.assertFalse(peer.output_seen)
+
+    def test_5560_serial_rechecks_multiple_startup_errors_before_output(self):
+        peer = SerialPeer('5560A', echo=False)
+        mgr, _ = self.connect(peer)
+        peer.errors = ['-410,"interrupted"', '-410,"interrupted"', '-361,"serial framing"']
+        mgr.send_command('OUT 1 V, 0 HZ')
+        index = peer.commands.index('OUT 1 V, 0 HZ')
+        self.assertEqual(peer.commands[index - 3:index], ['*IDN?', 'OPER?', 'ERR?'])
+        peer.errors = ['-361,"serial framing"']
+        with self.assertRaisesRegex(f.InstrumentCommandError, '케이블'):
+            mgr.send_command('OUT 2 V, 0 HZ', check_before=True)
+        self.assertNotIn('OUT 2 V, 0 HZ', peer.commands)
+        self.assertTrue(mgr.info.connected)
+
+    def test_5560_serial_does_not_clear_a_following_protection_fault(self):
+        peer = SerialPeer('5560A', echo=False)
+        mgr, _ = self.connect(peer)
+        peer.errors = ['-361,"serial framing"', '4102,"compliance limit"']
+        with self.assertRaisesRegex(f.InstrumentCommandError, '4102'):
+            mgr.send_command('OUT 1 V, 0 HZ')
+        self.assertFalse(peer.output_seen)
+
+    def test_5560_serial_stops_if_transport_error_never_clears(self):
+        peer = SerialPeer('5560A', echo=False)
+        mgr, _ = self.connect(peer)
+        peer.errors = ['-361,"serial framing"'] * 17
+        with self.assertRaisesRegex(f.InstrumentCommandError, '-361'):
+            mgr.send_command('OUT 1 V, 0 HZ')
+        self.assertFalse(peer.output_seen)
+        self.assertIn('STBY', peer.commands)
+
+    def test_all_models_serial_identification_echo_fragmentation_and_output(self):
+        for model in f.MODEL_PROFILES:
+            with self.subTest(model=model):
+                peer = SerialPeer(model)
+                mgr, backend = self.connect(peer)
+                self.assertEqual(mgr.profile.model, model)
+                self.assertEqual(peer.commands[0], '*IDN?')
+                self.assertEqual('COMM_MODE? SERIAL' in peer.commands, model == '5560A')
+                mgr.send_command('OUT 1 A, 60 HZ; OPER')
+                self.assertEqual(mgr.query('OPER?'), '1')
+                mgr.disconnect()
+                self.assertIn('STBY', peer.commands)
+                self.assertIn('LOCAL', peer.commands)
+                self.assertFalse(peer.is_open)
+                self.assertEqual(backend.Serial.call_args.kwargs['port'], 'COM7')
+
+    def test_5560a_numbered_serial_prompt_and_computer_mode_transition(self):
+        peer = SerialPeer('5560A', echo=False)
+        mode = 'TERM'
+        prompt_no = 4
+        peer.pending.extend(b'3> ')
+
+        def write(data):
+            nonlocal mode, prompt_no
+            self.assertTrue(data.endswith(b'\n') and b'\r' not in data)
+            command = data.decode('ascii').strip()
+            peer.commands.append(command)
+            was_terminal = mode == 'TERM'
+            if was_terminal:
+                peer.pending.extend(data)
+            if command == 'COMM_MODE SERIAL, COMP':
+                mode = 'COMP'
+            replies = {'*IDN?': 'FLUKE,5560A,TEST,1.0', 'COMM_MODE? SERIAL': mode, '*OPC?': '1', 'OPER?': '0', 'ERR?': '0,"No Error"', 'FUNC?': 'DCV'}
+            if command in replies:
+                peer.pending.extend((replies[command] + '\r\n').encode('ascii'))
+            if was_terminal:
+                peer.pending.extend(f'Fault -410: 488.2 interrupted query\r\n{prompt_no}> '.encode('ascii'))
+                prompt_no += 1
+            return len(data)
+        peer.write = write
+        mgr, _ = self.connect(peer)
+        self.assertTrue(mgr.info.connected)
+        self.assertEqual(peer.commands[:6], ['*IDN?', 'COMM_MODE? SERIAL', 'COMM_MODE SERIAL, COMP', 'COMM_MODE? SERIAL', 'REMOTE', '*OPC?'])
+        self.assertEqual(mgr.query('OPER?'), '0')
+        mgr.disconnect()
+        self.assertIn('LOCAL', peer.commands)
+
+    def test_serial_settings_pass_through_without_modifying_instrument(self):
+        peer = SerialPeer('5080A', echo=False)
+        mgr, backend = self.connect(peer, baudrate=19200, data_bits=7, parity='E', stop_bits=2, flow_control='RTS/CTS')
+        settings = backend.Serial.call_args.kwargs
+        self.assertEqual((settings['baudrate'], settings['bytesize'], settings['parity'], settings['stopbits']), (19200, 7, 'E', 2))
+        self.assertTrue(settings['rtscts'])
+        self.assertFalse(settings['xonxoff'])
+        self.assertFalse(any((c.startswith('SP_SET ') for c in peer.commands)))
+
+    def test_wrong_model_is_closed_without_remote_or_output(self):
+        peer = SerialPeer('5080A')
+        backend = Mock(Serial=Mock(return_value=peer))
+        backend.tools.list_ports.comports.return_value = []
+        with patch.object(f, 'serial', backend), patch.object(f, 'HAS_PYSERIAL', True):
+            mgr = f.Fluke5560AConnectionManager()
+            with self.assertRaises(ConnectionError):
+                mgr.scan_and_auto_connect('RS232', model='5522A', serial_port='COM7', timeout_sec=0.2)
+        self.assertEqual(peer.commands, ['*IDN?'])
+        self.assertFalse(peer.is_open)
+
+    def test_output_timeout_attempts_standby_closes_and_never_replays(self):
+        peer = SerialPeer(missing=True, recovery_reply=False)
+        mgr, _ = self.connect(peer)
+        with self.assertRaises(TimeoutError):
+            mgr.send_command('OUT 1 A, 60 HZ; OPER')
+        self.assertEqual(peer.commands.count('OUT 1 A, 60 HZ; OPER'), 1)
+        self.assertEqual(peer.commands[-2:], ['STBY', '*IDN?'])
+        self.assertFalse(peer.is_open)
+        self.assertFalse(mgr.info.connected)
+
+    def test_serial_wait_can_be_cancelled(self):
+        peer = SerialPeer(missing=True, late_completion=True)
+        mgr, _ = self.connect(peer)
+        mgr.operation_timeout = 60
+        failures = []
+
+        def output():
+            try:
+                mgr.send_command('OUT 1 A, 60 HZ; OPER')
+            except Exception as exc:
+                failures.append(exc)
+        thread = threading.Thread(target=output)
+        thread.start()
+        deadline = time.monotonic() + 1
+        while not peer.output_seen and time.monotonic() < deadline:
+            time.sleep(0.005)
+        mgr.request_abort()
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(failures[0], f.InstrumentCommandError)
+        self.assertEqual(peer.commands[-4:], ['STBY', '*IDN?', 'OPER?', 'ERR?'])
+        self.assertTrue(mgr.info.connected)
+        self.assertTrue(peer.is_open)
+
+    def test_serial_device_error_preserves_confirmed_standby_connection(self):
+        peer = SerialPeer(error='4103,"Settling error"')
+        mgr, _ = self.connect(peer)
+        with self.assertRaises(f.InstrumentCommandError):
+            mgr.send_command('OUT 1 A, 60 HZ; OPER')
+        self.assertTrue(mgr.info.connected)
+        self.assertEqual(mgr.query('OPER?'), '0')
+
+    def test_legacy_initial_query_error_and_protection_reuse_same_com_port(self):
+        for model, fault_code in (('5522A', 1500), ('5520A', 1503), ('5080A', 1502)):
+            with self.subTest(model=model):
+                peer = SerialPeer(model, error='+1308,"Interrupted query"')
+                peer.trip = f'{fault_code},"Protection trip"'
+                mgr, _ = self.connect(peer)
+                output = 'OUT 1 A, 60 HZ; CUR_POST AUX; OPER'
+                with self.assertRaisesRegex(f.InstrumentCommandError, str(fault_code)):
+                    mgr.send_command(output, check_before=True)
+                start = peer.commands.index(output)
+                self.assertEqual(peer.commands[start - 3:start], ['ERR?', 'OPER?', 'ERR?'])
+                self.assertEqual(peer.commands[start + 1:], ['*OPC?', 'ERR?', 'OPER?'])
+                self.assertIs(mgr._serial_port, peer)
+                self.assertTrue(mgr.info.connected)
+                self.assertNotIn('STBY', peer.commands)
+                mgr.send_command(output, check_before=True)
+                self.assertEqual(mgr.query('OPER?'), '1')
+                mgr.disconnect()
+                self.assertLess(peer.commands.index('STBY'), peer.commands.index('LOCAL'))
+                self.assertFalse(peer.is_open)
+
+    def test_legacy_serial_terminal_fault_keeps_confirmed_session(self):
+        peer = SerialPeer('5522A', late_completion=True)
+        write = peer.write
+
+        def terminal_write(data):
+            if data.startswith(b'OUT '):
+                peer.pending.extend(b'!> Compliance voltage exceeded\r\n')
+            return write(data)
+        peer.write = terminal_write
+        mgr, _ = self.connect(peer)
+        output = 'OUT 1 A, 60 HZ; CUR_POST AUX; OPER'
+        with self.assertRaisesRegex(f.InstrumentCommandError, 'Compliance voltage exceeded'):
+            mgr.send_command(output)
+        self.assertEqual(peer.commands[-4:], ['STBY', '*IDN?', 'OPER?', 'ERR?'])
+        self.assertEqual(peer.commands.count(output), 1)
+        self.assertTrue(mgr.info.connected)
+        self.assertEqual(mgr.query('OPER?'), '0')
+
+    def test_legacy_query_interruption_does_not_hide_following_protection_fault(self):
+        peer = SerialPeer('5520A', error='1308,"Interrupted query"')
+        peer.errors.append('1500,"Compliance voltage exceeded"')
+        mgr, _ = self.connect(peer)
+        with self.assertRaisesRegex(f.InstrumentCommandError, '1500'):
+            mgr.send_command('OUT 1 A, 60 HZ; CUR_POST AUX; OPER', check_before=True)
+        self.assertFalse(any((c.startswith('OUT ') for c in peer.commands)))
+        self.assertTrue(mgr.info.connected)
+        self.assertNotIn('*CLS', peer.commands)
+        mgr.disconnect()
+        self.assertIn('LOCAL', peer.commands)
+
+    def test_missing_library_and_invalid_baud_explain_connection_failure(self):
+        with patch.object(f, 'HAS_PYSERIAL', False):
+            mgr = f.Fluke5560AConnectionManager()
+            with self.assertRaisesRegex(ConnectionError, 'pyserial'):
+                mgr.scan_and_auto_connect('RS232', serial_port='COM1')
+        peer = SerialPeer()
+        with self.assertRaises(ConnectionError):
+            self.connect(peer, baudrate=115200)
+
+class AutoConnectionTests(unittest.TestCase):
+
+    def setUp(self):
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        self.settings = Path(folder) / 'connections.json'
+        self.enterContext(patch.object(f.Fluke5560AConnectionManager, '_connection_history_path', return_value=self.settings))
+        self.enterContext(patch.object(f.AutoNetworkAligner, 'list_ethernet_interfaces', return_value=[]))
+
+    def test_auto_skips_bluetooth_probes_multiple_serial_ports_and_remembers_success(self):
+
+        def port(name, description, hwid, vid=None):
+            return SimpleNamespace(device=name, description=description, hwid=hwid, vid=vid)
+        ports = [port('COM9', 'Bluetooth', 'BTHENUM\\1'), port('COM10', 'Bluetooth', 'BTHENUM\\2'), port('COM11', 'USB converter', 'USB VID:PID=067B:23A3', 1659), port('COM7', 'USB converter', 'USB VID:PID=0403:6001', 1027), port('COM3', 'Serial port', 'ACPI\\1')]
+        wrong = SerialPeer('5080A')
+        right = SerialPeer('5560A')
+        wrong_port = Mock(side_effect=lambda **kwargs: {'COM7': right, 'COM11': wrong}[kwargs['port']])
+        backend = Mock(Serial=wrong_port)
+        backend.tools.list_ports.comports.return_value = ports
+        with patch.object(f, 'serial', backend), patch.object(f, 'HAS_PYSERIAL', True):
+            mgr = f.Fluke5560AConnectionManager()
+            mgr.scan_and_auto_connect('AUTO', timeout_sec=0.2)
+            self.assertTrue(mgr.info.resource_name.startswith('COM7 /'))
+            self.assertEqual(wrong.commands, ['*IDN?'])
+            self.assertFalse(wrong.is_open)
+            self.assertEqual([call.kwargs['port'] for call in backend.Serial.call_args_list], ['COM11', 'COM7'])
+            mgr.disconnect(standby=False)
+            backend.Serial.reset_mock()
+            backend.Serial.side_effect = lambda **_: SerialPeer('5560A')
+            mgr = f.Fluke5560AConnectionManager()
+            with patch.object(mgr, '_try_lan_socket') as lan:
+                mgr.scan_and_auto_connect('AUTO', '169.254.1.1', timeout_sec=0.2)
+                lan.assert_not_called()
+            backend.Serial.assert_called_once()
+            self.assertEqual(backend.Serial.call_args.kwargs['port'], 'COM7')
+            mgr.disconnect(standby=False)
+
+    def test_auto_uses_saved_lan_address_when_entered_endpoint_is_unavailable(self):
+        with FakeInstrument() as server:
+            mgr = f.Fluke5560AConnectionManager()
+            mgr.scan_and_auto_connect('LAN', '127.0.0.1', server.port, timeout_sec=0.3)
+            mgr.disconnect(standby=False)
+            mgr = f.Fluke5560AConnectionManager()
+            try_lan = mgr._try_lan_socket
+
+            def probe(ip, port, *args, **kwargs):
+                if port == 3490:
+                    mgr.last_error = 'Entered address is unavailable'
+                    return f.ConnectionInfo()
+                return try_lan(ip, port, *args, **kwargs)
+            with patch.object(mgr, '_try_lan_socket', side_effect=probe) as attempt:
+                info = mgr.scan_and_auto_connect('AUTO', '169.254.1.1', 3490, timeout_sec=0.3)
+            self.assertEqual(info.discovered_port, server.port)
+            self.assertEqual([call.args[:2] for call in attempt.call_args_list], [('169.254.1.1', 3490), ('127.0.0.1', server.port)])
+            mgr.disconnect(standby=False)
+
+    def test_auto_identifies_legacy_calibrator_on_com_without_preselecting_model(self):
+        peer = SerialPeer('5522A')
+        backend = Mock(Serial=Mock(return_value=peer))
+        backend.tools.list_ports.comports.return_value = [SimpleNamespace(device='COM5', description='USB converter', hwid='USB', vid=1027)]
+        mgr = f.Fluke5560AConnectionManager()
+        with patch.object(f, 'serial', backend), patch.object(f, 'HAS_PYSERIAL', True), patch.object(f, 'HAS_PYVISA', False):
+            info = mgr.scan_and_auto_connect('AUTO', model='AUTO', timeout_sec=0.2)
+        self.assertEqual(mgr.profile.model, '5522A')
+        self.assertIn('COM5', info.resource_name)
+        self.assertEqual(peer.commands, ['*IDN?', 'REMOTE', '*OPC?'])
+        mgr.disconnect(standby=False)
+
+class ModelTransportTests(unittest.TestCase):
+
+    def test_5730a_lan_status_fault_and_standby_on_loopback(self):
+        state = {'oper': False, 'fault': 0}
+        def respond(conn, cmd):
+            if cmd in ('OPER', 'STBY'):
+                state['oper'] = cmd == 'OPER'
+            if cmd == 'FAULT?':
+                value, state['fault'] = str(state['fault']), 0
+            else:
+                value = {'*IDN?': 'FLUKE,5730A,BENCH,1.0+B+*', 'ISR?': str(2048 + int(state['oper'])),
+                         '*OPC?': '1', 'EXPLAIN? 3142': '"DC Range Compliance"'}.get(cmd)
+            if value is not None:
+                conn.sendall((value + '\r\n').encode())
+        with FakeInstrument(handler=respond) as server:
+            mgr = f.Fluke5560AConnectionManager()
+            self.addCleanup(mgr.disconnect, standby=False)
+            mgr.scan_and_auto_connect('LAN', '127.0.0.1', server.port, model='AUTO', timeout_sec=1)
+            self.assertEqual(server.commands[:3], ['*IDN?', 'REMOTE', 'REM_MODE ENET, COMP'])
+            self.assertEqual(mgr.check_output_state(), '0')
+            mgr.send_command('OUT 1 V, 0 HZ', check_before=True)
+            mgr.send_command('OPER', check_before=True)
+            self.assertEqual(mgr.check_output_state(), '1')
+            state['fault'] = 3142
+            with self.assertRaisesRegex(f.InstrumentCommandError, '3142'):
+                mgr.send_command('OUT 2 V, 0 HZ', check_before=True)
+            self.assertEqual(mgr.check_output_state(), '0')
+            self.assertNotIn('OUT 2 V, 0 HZ', server.commands)
+            self.assertNotIn('OPER?', server.commands)
+            self.assertNotIn('ERR?', server.commands)
+            mgr.disconnect()
+            self.assertIn('LOCAL', server.commands)
+
+    def test_5730a_usb_virtual_com_discovery_and_recovery(self):
+        port = SimpleNamespace(device='COM9', vid=10, pid=9, hwid='USB', description='5730A USB',
+                               manufacturer='Fluke', serial_number='AB', location='1-1')
+        for mode, model in (('USB', '5730A'), ('USB', 'AUTO'), ('AUTO', 'AUTO')):
+            with self.subTest(mode=mode, model=model), tempfile.TemporaryDirectory() as folder, \
+                    patch.object(f.Fluke5560AConnectionManager, '_connection_history_path', return_value=Path(folder) / 'connections.json'), \
+                    patch.object(f, 'serial') as serial_backend, patch.object(f, 'HAS_PYVISA', False):
+                mgr = f.Fluke5560AConnectionManager()
+                serial_backend.tools.list_ports.comports.return_value = [port]
+                original, restored = SerialPeer('5730A'), SerialPeer('5730A')
+                serial_backend.Serial.side_effect = [original, restored]
+                mgr.scan_and_auto_connect(mode, model=model, lan_unavailable='모의 검사', timeout_sec=.4)
+                self.assertEqual(mgr._active_endpoint.interface, 'USB-COM')
+                self.assertIn('REM_MODE USB, COMP', original.commands)
+                self.assertEqual(mgr.check_output_state(), '0')
+                mgr.recovery_target = mgr._active_endpoint
+                mgr.disconnect(standby=False)
+                mgr.recover_standby()
+                self.assertIn('REM_MODE USB, COMP', restored.commands)
+                self.assertIn('STBY', restored.commands)
+                self.assertNotIn('OPER', restored.commands)
+                mgr.disconnect()
+
+    def test_5080_lan_does_not_send_5560_comm_mode(self):
+        with FakeInstrument(identity='FLUKE,5080A,TEST,1.0', fragmented=True) as server:
+            mgr = f.Fluke5560AConnectionManager()
+            mgr.scan_and_auto_connect('LAN', '127.0.0.1', server.port, model='5080A', timeout_sec=1)
+            self.assertEqual(server.commands, ['*IDN?', 'REMOTE', '*OPC?'])
+            mgr.send_command('OUT 1 A, 60 HZ; CUR_POST AUX; LCOMP ON; OPER')
+            mgr.disconnect()
+            self.assertFalse(any((c.startswith('COMM_MODE') for c in server.commands)))
+
+    def test_5080_lan_timeout_recovers_with_fresh_identity_and_reconnects(self):
+        peer = SerialPeer('5080A', echo=False, missing=True, late_completion=True, error='1308,"Interrupted query"')
+
+        def handle(conn, command):
+            peer.write((command + '\r\n').encode())
+            if peer.pending:
+                conn.sendall(peer.pending)
+                peer.pending.clear()
+        mgr = f.Fluke5560AConnectionManager()
+        self.addCleanup(lambda: mgr.disconnect(standby=False))
+        with FakeInstrument(handler=handle) as server:
+            mgr.scan_and_auto_connect('LAN', '127.0.0.1', server.port, model='5080A', timeout_sec=0.2, operation_timeout_sec=1)
+            first = mgr._lan_sock
+            output = 'OUT 1 A, 60 HZ; CUR_POST AUX; OPER'
+            with self.assertRaisesRegex(f.InstrumentCommandError, '5080A.*STBY'):
+                mgr.send_command(output)
+            self.assertEqual(peer.commands[-4:], ['STBY', '*IDN?', 'OPER?', 'ERR?'])
+            self.assertIs(mgr._lan_sock, first)
+            self.assertEqual(peer.commands.count(output), 1)
+            peer.late_completion = False
+            mgr.disconnect()
+            self.assertIn('LOCAL', peer.commands)
+            mgr.scan_and_auto_connect('LAN', '127.0.0.1', server.port, model='5080A', timeout_sec=0.2)
+            self.assertTrue(mgr.info.connected)
+            mgr.disconnect(standby=False)
+
+    def test_legacy_gpib_handles_pending_query_and_compliance(self):
+        for model in ('5522A', '5520A'):
+            with self.subTest(model=model):
+                visa = Mock()
+                inst = visa.ResourceManager.return_value.open_resource.return_value
+                errors = iter(['1308,"Interrupted query"', '0,"No error"', '1500,"Compliance voltage exceeded"', '0,"No error"'])
+
+                def reply(command):
+                    if command == 'ERR?':
+                        return next(errors)
+                    return {'*IDN?': f'FLUKE,{model},TEST,1.0', '*OPC?': '1', 'OPER?': '0'}[command]
+                inst.query.side_effect = reply
+                with patch.object(f, 'pyvisa', visa), patch.object(f, 'HAS_PYVISA', True):
+                    mgr = f.Fluke5560AConnectionManager()
+                    mgr.scan_and_auto_connect('GPIB', model=model, visa_resource='GPIB0::4::INSTR')
+                    output = 'OUT 1 A, 60 HZ; CUR_POST AUX; OPER'
+                    with self.assertRaisesRegex(f.InstrumentCommandError, '1500'):
+                        mgr.send_command(output)
+                    inst.write.assert_called_once_with(output)
+                    self.assertTrue(mgr.info.connected)
+                    mgr.disconnect()
+                    inst.control_ren.assert_called_with(visa.constants.RENLineOperation.address_gtl)
+
+    def test_wrong_selected_model_over_lan_receives_only_idn(self):
+        with FakeInstrument(identity='FLUKE,5080A,TEST,1.0') as server:
+            mgr = f.Fluke5560AConnectionManager()
+            with self.assertRaises(ConnectionError):
+                mgr.scan_and_auto_connect('LAN', '127.0.0.1', server.port, model='5560A')
+            self.assertEqual(server.commands, ['*IDN?'])
+
+    def test_supported_native_visa_paths_assert_gpib_remote_without_serial_commands(self):
+        for model, mode in [('5560A', 'USB'), ('5560A', 'GPIB'), ('5522A', 'GPIB'), ('5520A', 'GPIB'), ('5730A', 'GPIB')]:
+            with self.subTest(model=model, mode=mode):
+                visa = Mock()
+                resource = 'USB0::TEST::INSTR' if mode == 'USB' else 'GPIB1::8::INSTR'
+                rm = visa.ResourceManager.return_value
+                inst = rm.open_resource.return_value
+                inst.query.side_effect = lambda cmd: {'*IDN?': f'FLUKE,{model},TEST,1.0', '*OPC?': '1',
+                                                      'ISR?': '2048', 'FAULT?': '0', 'ERR?': '0,"No error"'}[cmd]
+                with patch.object(f, 'pyvisa', visa), patch.object(f, 'HAS_PYVISA', True):
+                    mgr = f.Fluke5560AConnectionManager()
+                    mgr.scan_and_auto_connect(mode, model=model, visa_resource=resource)
+                    mgr.send_command('OUT 1 A, 0 HZ')
+                    self.assertNotIn('REMOTE', [c.args[0] for c in inst.write.call_args_list])
+                    if mode == 'GPIB':
+                        inst.control_ren.assert_called_with(visa.constants.RENLineOperation.asrt_address)
+                    mgr.disconnect(standby=False)
+                inst.close.assert_called_once()
+                rm.close.assert_called_once()
+
+    def test_unsupported_interfaces_rejected_before_open(self):
+        with patch.object(f.socket, 'create_connection') as tcp:
+            for model, interface in [('5520A', 'LAN'), ('5522A', 'USB'), ('5080A', 'USB'), ('5080A', 'GPIB')]:
+                with self.subTest(model=model, interface=interface), self.assertRaises(ValueError):
+                    f.Fluke5560AConnectionManager().scan_and_auto_connect(interface, model=model)
+            tcp.assert_not_called()
+
+    def test_simulation_all_models_and_limits_before_output(self):
+        for model in f.MODEL_PROFILES:
+            with self.subTest(model=model):
+                mgr = f.Fluke5560AConnectionManager()
+                mgr.scan_and_auto_connect('SIMULATION', model=model)
+                self.assertIn(model, mgr.query('*IDN?'))
+                current = min(20, mgr.profile.max_current)
+                mgr.send_command(f'OUT {current} A, 0 HZ; OPER')
+                self.assertEqual(mgr.query('OPER?'), '1')
+                before = mgr.query('OUT?')
+                with self.assertRaises(ValueError):
+                    mgr.send_command('OUT 31 A, 0 HZ; OPER')
+                self.assertEqual(mgr.query('OUT?'), before)
+                with self.assertRaises(ValueError):
+                    mgr.query('OUT 31 A; OPER; *OPC?')
+                mgr.disconnect()
+
+class ModelCommandTests(unittest.TestCase):
+
+    def test_5730a_base_output_limits_fixed_resistors_and_compensation(self):
+        builder = f.CalibratorCommandBuilder('5730A')
+        self.assertEqual(builder.build_current_cmd(mode='DCI', input_value=-2.2)[0],
+                         'OUT -2.2 A, 0 HZ; *WAI; CUR_POST NORMAL')
+        with self.assertRaises(ValueError):
+            builder.build_current_cmd(mode='DCI', input_value=2.21)
+        with self.assertRaises(ValueError):
+            builder.build_resistance_cmd(value=500)
+        self.assertIn('RCOMP ON', builder.build_resistance_cmd(value=19e3, zcomp='WIRE2')[0])
+        self.assertEqual(builder.build_resistance_cmd(value=10e6, zcomp='WIRE2')[0],
+                         'OUT 10000000 OHM; *WAI; EXTSENSE OFF')
+        self.assertEqual(builder.build_resistance_cmd(value=100e6, zcomp='WIRE4')[0],
+                         'OUT 100000000 OHM; *WAI; EXTSENSE OFF')
+        with self.assertRaises(ValueError):
+            builder.profile.validate_command('OUT 10 MOHM; RCOMP ON')
+        with self.assertRaises(ValueError):
+            builder.build_current_cmd(mode='ACI', input_value=1, freq_hz=11000)
+        with self.assertRaises(ValueError):
+            builder.profile.validate_command('OUT 2 V, 1 A, 60 HZ')
+
+    def current(self, model, amps=100, hz=60, coil=True):
+        return f.CalibratorCommandBuilder(model).build_current_cmd(mode='ACI', input_value=amps, unit='A', freq_hz=hz, use_coil=coil, coil_turns=50)[0]
+
+    def test_coil_and_lcomp_current_and_power_for_all_models(self):
+        for model in f.MODEL_PROFILES:
+            with self.subTest(model=model):
+                cmd = self.current(model)
+                self.assertIn('OUT 2 A, 60 HZ', cmd)
+                if model in ('5560A', '5730A'):
+                    self.assertNotIn('LCOMP', cmd)
+                else:
+                    self.assertIn('LCOMP ON', cmd)
+                builder = f.CalibratorCommandBuilder(model)
+                if not f.MODEL_PROFILES[model].supports_power:
+                    with self.assertRaisesRegex(ValueError, '전력'):
+                        builder.build_power_cmd(mode='ACP', calc_method='VI', voltage_v=120, current_or_power_val=100)
+                    continue
+                power = builder.build_power_cmd(mode='ACP', calc_method='VI', voltage_v=120, current_or_power_val=100, use_coil=True, coil_turns=50)
+                self.assertEqual(power['actual_current_a'], 2)
+                self.assertEqual('LCOMP ON' in power['cmd'], model != '5560A')
+
+    def test_lcomp_frequency_edges_and_noncoil_switch_off(self):
+        for model in ('5522A', '5520A'):
+            self.assertIn('LCOMP ON', self.current(model, amps=10, hz=439))
+            self.assertIn('LCOMP OFF', self.current(model, amps=10, hz=440))
+            self.assertIn('LCOMP ON', self.current(model, amps=16.5, hz=999))
+            self.assertIn('LCOMP OFF', self.current(model, amps=16.5, hz=1000))
+        self.assertIn('LCOMP ON', self.current('5080A', hz=64))
+        self.assertIn('LCOMP OFF', self.current('5080A', hz=65))
+        self.assertIn('LCOMP OFF', self.current('5520A', amps=1, coil=False))
+
+    def test_model_current_caps_and_terminal_selection(self):
+        for model in ('5522A', '5520A', '5080A'):
+            with self.subTest(model=model):
+                self.assertIn('CUR_POST A20', self.current(model, amps=3, coil=False))
+                self.assertIn('CUR_POST AUX', self.current(model, amps=2, coil=False))
+                self.current(model, amps=20.5, coil=False)
+                with self.assertRaises(ValueError):
+                    self.current(model, amps=20.5001, coil=False)
+        self.current('5560A', amps=30, coil=False)
+        with self.assertRaises(ValueError):
+            f.MODEL_PROFILES['5560A'].validate_command('OUT 1 A, 60 HZ; CUR_POST A20')
+
+    def test_fixed_resistors_and_model_compensation_limits(self):
+        builder = f.CalibratorCommandBuilder('5080A')
+        for value in f.RESISTORS_5080A:
+            command, _ = builder.build_resistance_cmd(value=value, unit='OHM', zcomp='WIRE4')
+            self.assertIn('ZCOMP NONE' if value >= 1000000.0 else 'ZCOMP WIRE4', command)
+        with self.assertRaises(ValueError):
+            builder.build_resistance_cmd(value=500, unit='OHM')
+        for model in ('5520A', '5522A'):
+            command, _ = f.CalibratorCommandBuilder(model).build_resistance_cmd(value=110000, unit='OHM', zcomp='WIRE4')
+            self.assertIn('ZCOMP NONE', command)
+
+    def test_uncompensated_resistance_confirms_zero_and_ten_megohms_on_supported_models(self):
+        for model in f.MODEL_PROFILES:
+            with self.subTest(model=model):
+                manager = f.Fluke5560AConnectionManager()
+                manager.profile = f.MODEL_PROFILES[model]
+                builder = f.CalibratorCommandBuilder(model)
+                for value, actual in ((0, 0.016 if model == '5080A' else 0), (10000000, 10007200 if model == '5080A' else 10000000)):
+                    command, _ = builder.build_resistance_cmd(value=value, unit='OHM', zcomp='NONE')
+                    replies = (f'{actual},OHM,0', '2048') if model == '5730A' else (f'{actual},OHM,0E+00,0,0E+00', 'NONE')
+                    with patch.object(manager, 'send_command') as send, patch.object(manager, 'query', side_effect=replies):
+                        manager.set_uncompensated_resistance_in_standby(command)
+                        send.assert_called_once_with(command, check_before=True)
+
+    def test_parser_applies_coil_and_three_amp_groups_for_older_models(self):
+        for model in ('5522A', '5520A', '5080A'):
+            steps = f.SmartClipboardSequenceParser.build_sequence_steps('0.1 A\n1 A\n3 A\n5 A\n2 A', model=model)
+            self.assertEqual([s.step_no for s in steps if f.SequenceCurrentFilter.includes(s, model=model)], [1, 2, 5])
+            self.assertEqual([s.step_no for s in steps if f.SequenceCurrentFilter.includes(s, True, f.SequenceCurrentFilter.POSTS, model)], [3, 4])
+            step = f.SmartClipboardSequenceParser.build_Single_step_from_fields(1, '-', '60 Hz', '-', '100 A', use_coil=True, coil_turns=50, model=model)
+            self.assertIn('LCOMP ON', step.scpi_cmd)
+            self.assertEqual(f.SequenceCurrentFilter.actual_current(step), 2)
+
+    def test_nonfinite_and_invalid_output_rejected(self):
+        for command in ('OUT nan A, 60 HZ', 'OUT 1E999 V', 'OUT 1 V, -50 HZ', 'OUT 1001 A', 'OUT 1 V; OUT 2 A'):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                f.MODEL_PROFILES['5080A'].validate_command(command)

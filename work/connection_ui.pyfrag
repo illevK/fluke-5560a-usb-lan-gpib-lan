@@ -162,6 +162,9 @@
                     self.var_idn_display.set(event)
                 elif event.startswith("[영점 조정 필요]"):
                     self._refresh_oper_badge()
+                elif event.startswith("[출력 상태 미확인]"):
+                    self.is_operating = None
+                    self._refresh_oper_badge()
             try:
                 complete, value, error, on_error = self._io_results.get_nowait()
             except queue.Empty:
@@ -171,13 +174,16 @@
                 for button in self._connection_buttons:
                     button.configure(state="normal")
                 if error:
-                    self.is_operating = False if isinstance(error, InstrumentCommandError) else None
+                    self.is_operating = (False if isinstance(error, InstrumentCommandError)
+                                         and not self.conn_mgr.output_unconfirmed else None)
                     self._update_connection_ui(self.conn_mgr.info)
                     self._refresh_oper_badge()
                     self._last_report = self.conn_mgr.last_error or str(error)
                     self._log(f"[오류] {self._last_report}")
                     if on_error:
                         on_error(error)
+                    elif self.conn_mgr.output_unconfirmed:
+                        self.var_idn_display.set("출력 상태 미확인 · 본체에서 STBY를 확인하세요.")
                     elif not isinstance(error, OperationCancelled):
                         self._show_report("통신 안내", self._last_report)
                 else:
@@ -191,6 +197,8 @@
                     self.is_operating = None
                     self._refresh_oper_badge()
                 self.lbl_conn_badge.configure(text="● DISCONNECTED", bg="#334155", fg="#E2E8F0")
+            if not self._io_busy and not self._dut_closing and self.conn_mgr.recovery_pending:
+                self._start_calibrator_recovery()
             self._refresh_connection_controls()
             self._poll_after_id = self.after(100, self._poll_io_result)
 

@@ -66,12 +66,15 @@ def enhance_dut_sequence(source, root):
         '                if not .2 <= dwell <= 86_400:\n'
         '                    raise ValueError("유지시간은 0.2~86400초 사이여야 합니다.")\n')
     patch_method("_start_filtered_sequence", "                    command, _ = self._sequence_output_command(step)\n",
-        "                    if self._sequence_dut_enabled() and step.func_type in self._DUT_SEQUENCE_QUANTITIES:\n"
-        "                        self._dut_channel_for_step(step)\n"
+        "                    if self._sequence_dut_quantity(step) is not None:\n"
+        "                        if self._sequence_dut_requires_connection():\n"
+        "                            raise ValueError('DUT를 다시 연결한 뒤 중단된 행에서 재개하세요.')\n"
+        "                        if self._sequence_dut_enabled():\n"
+        "                            self._dut_channel_for_step(step)\n"
         "                    command, _ = self._sequence_output_command(step)\n")
     patch_method("_start_filtered_sequence", "            self.seq_running = True\n",
         "            self._seq_dut_run = self._sequence_dut_enabled() and any(\n"
-        "                self.seq_steps[i].func_type in self._DUT_SEQUENCE_QUANTITIES for i in plan)\n"
+        "                self._sequence_dut_quantity(self.seq_steps[i]) is not None for i in plan)\n"
         "            self._seq_dut_resume_required = False\n"
         "            self.seq_running = True\n"
         "            self._dut_sync_controls()\n")
@@ -89,7 +92,7 @@ def enhance_dut_sequence(source, root):
         "                self._seq_dut_resume_required = True\n"
         "            self._seq_dut_run = False\n"
         "            self._seq_dut_pending = None\n"
-        "            if self._seq_dut_reading:\n"
+        "            if self._seq_dut_reading or had_linked_capture:\n"
         "                self.dut_session.cancel.set()\n")
     patch_method("_on_seq_stop_auto",
         '                self._log(f"[일시중단] #{self.seq_current_idx + 1}번 행에서 순차 실행을 중단했습니다.")\n',
@@ -164,7 +167,10 @@ def enhance_dut_sequence(source, root):
         '                        self.conn_mgr._fail_control_session("OPER? 응답 확인", error)\n'
         '                    raise error\n'
         '                if standby and state != "0":\n'
-        '                    raise InstrumentProtocolError("STBY 요청 후에도 OPER 상태입니다. 본체에서 출력을 끄세요.")\n')
+        '                    self.conn_mgr.output_unconfirmed = True\n'
+        '                    raise InstrumentProtocolError("STBY 요청 후에도 OPER 상태입니다. 본체에서 출력을 끄세요.")\n'
+        '                if standby:\n'
+        '                    self.conn_mgr.output_unconfirmed = False\n')
     patch_method("_send_and_log",
         "                                  operation, done, on_error=on_error, stop_sequence=stop_sequence)\n",
         "                                  operation, done, on_error=on_error, stop_sequence=stop_sequence,\n"
@@ -187,7 +193,8 @@ def enhance_dut_sequence(source, root):
         '                    elif operation == "read":\n'
         '                        result = self.dut_session.read(channel)\n'
         '                    elif operation == "sequence_read":\n'
-        '                        result = self.dut_session.read(settings[0], include_dc=settings[1], fresh=True)\n')
+        '                        checks = settings[3] if len(settings) > 3 else {}\n'
+        '                        result = self.dut_session.read(settings[0], include_dc=settings[1], fresh=True, **checks)\n')
     patch_method("_dut_start", "                    self._dut_results.put((operation, result, error))\n",
         '                    if operation == "sequence_read":\n'
         "                        result = (settings[2], result)\n"

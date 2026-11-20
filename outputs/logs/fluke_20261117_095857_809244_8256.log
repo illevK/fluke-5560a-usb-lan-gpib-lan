@@ -1,0 +1,9 @@
+[2026-11-17T09:58:57.810] [LAN 연결 시도] 127.0.0.1:64710
+[2026-11-17T09:58:57.814] TX COMMAND >> OUT 1 V; OPER
+[2026-11-17T09:58:57.815] TX QUERY >> *OPC? | timeout=1
+[2026-11-17T09:58:57.816] RX << 1 | *OPC? | 0.001s
+[2026-11-17T09:58:57.817] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T09:58:57.818] RX << 4102,"Compliance current limit exceeded" | ERR? | 0.001s
+[2026-11-17T09:58:57.818] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T09:58:57.820] RX << 0 | OPER? | 0.001s
+[2026-11-17T09:58:57.820] 5560A 오류 (OUT 1 V; OPER): 4102,"Compliance current limit exceeded". STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다.

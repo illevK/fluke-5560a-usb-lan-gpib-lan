@@ -1,0 +1,54 @@
+    @classmethod
+    def parse_labeled_clipboard_line(cls, raw_line, heading=None):
+        text = SIUnits.clean(raw_line)
+        label = clipboard_measurement_kind(text)
+        if label:
+            return None, label, True, None
+        inline = None
+        if "\t" in text:
+            cells = text.split("\t")
+            labeled = [(i, kind) for i, cell in enumerate(cells[:-1])
+                       if (kind := clipboard_measurement_kind(cell))]
+            if labeled:
+                inline = labeled[0][1]
+                indexes = {i for i, _ in labeled}
+                text = "\t".join(cell for i, cell in enumerate(cells) if i not in indexes)
+        else:
+            start_value = re.search(r"(?<!\w)[+-]?(?:\d|\.\d)", text)
+            if start_value:
+                inline = clipboard_measurement_kind(text[:start_value.start()])
+                if inline:
+                    text = text[start_value.start():]
+
+        kind = inline or heading
+        fields = cls.parse_line_to_fields(text)
+        if fields is None and inline:
+            fields = ("-", "DC", "-", text.strip().split("\t")[-1])
+        if fields is None or kind is None:
+            return fields, heading, False, None
+        vi, frequency, pf, nominal = fields
+        has_explicit_frequency = any(
+            (quantity := cls.parse_value_and_unit(token[0])) and quantity[1] in cls.FREQ_UNITS
+            for token in cls.TOKEN_FINDER.finditer(text)
+        )
+        if not has_explicit_frequency:
+            frequency = "DC" if kind.startswith("DC") else "AC"
+        return (vi, frequency, pf, nominal), heading, False, kind
+
+    @classmethod
+    def _clipboard_type_issue(cls, kind, vi, frequency, nominal):
+        quantity = cls.parse_value_and_unit(nominal)
+        unit = SIUnits.split(quantity[1])[0] if quantity else None
+        expected = {"V": "V", "I": "A", "P": "W"}.get(kind[-1])
+        name = MEASUREMENT_NAMES[kind]
+        if unit != expected or kind == "PF" and not cls.VI_SLASH_PATTERN.fullmatch(vi.strip()):
+            return f"{name} 표기와 명목값({nominal})이 맞지 않습니다."
+        reading = cls.parse_value_and_unit(frequency)
+        hz = SIUnits.to_base(*reading, "HZ") if reading and reading[1] in cls.FREQ_UNITS else None
+        if kind.startswith("DC"):
+            if hz != 0 and frequency.strip().upper() not in ("", "-", "DC", "0"):
+                return f"{name} 행의 주파수를 DC 또는 0 Hz로 입력하세요."
+        elif hz is None or hz <= 0:
+            return f"{name} 행에 0 Hz보다 큰 주파수를 입력하세요."
+        return ""
+

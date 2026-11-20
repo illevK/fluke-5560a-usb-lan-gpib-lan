@@ -1,0 +1,10 @@
+[2026-11-17T09:21:07.947] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\logs\fluke_20261117_092107_442113_17352.log
+[2026-11-17T09:21:08.022] 실행 Python: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv\Scripts\python.exe | PyVISA=True | pyserial=True
+[2026-11-17T09:21:08.097] 시스템 준비 완료 (현재 내 PC IP: 감지 안 됨). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.
+[2026-11-17T09:21:08.524] [DUT 채널 배정] CH1 · CH2 · 2행
+[2026-11-17T09:21:08.543] 장비 연결 및 식별 확인 중…
+[2026-11-17T09:21:08.550] [LAN 연결 시도] 127.0.0.1:54578
+[2026-11-17T09:21:08.558] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T09:21:08.559] RX << 0 | OPER? | 0.001s
+[2026-11-17T09:21:08.655] [LAN 연결 시도] 127.0.0.1:54578
+[2026-11-17T09:21:08.662] [연결 성공] LAN (Ethernet Socket) | TCPIP::127.0.0.1::54578::SOCKET | FLUKE,5560A,TEST-1234,4.0 | PC 원본 IP: 127.0.0.1

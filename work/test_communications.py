@@ -131,7 +131,7 @@ class TransportTests(unittest.TestCase):
             mgr=f.Fluke5560AConnectionManager()
             self.assertFalse(mgr._try_lan_socket('127.0.0.1',server.port,timeout_sec=.2,
                                                  allow_open_port_fallback=True).connected)
-            self.assertIn('TimeoutError',mgr.last_error)
+            self.assertIn('InstrumentResponseTimeout',mgr.last_error)
             self.assertIsNone(mgr._lan_sock)
 
     def test_readonly_diagnosis_sends_only_identity(self):

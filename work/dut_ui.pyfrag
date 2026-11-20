@@ -4,6 +4,7 @@
             self._dut_busy = self._dut_disconnect_requested = self._dut_closing = False
             self._dut_poll_id = None
             self._dut_next_read = self._dut_received_monotonic = 0
+            self._dut_health_due = time.monotonic() + _DUT_IDLE_CHECK_SECONDS
             self._dut_old = False
             self._dut_candidates = {}
             self._dut_modes = {
@@ -11,6 +12,8 @@
                 "USB · VISA": "VISA", "GPIB · VISA": "GPIB", "LAN · WT": "WT_LAN",
                 "LAN · WT5000 TCP": "WT5000_TCP",
                 "LAN · PPA": "PPA_LAN", "LAN · Hioki PW": "HIOKI_LAN", "RS232 · COM": "SERIAL",
+                "RS232 · Hioki PW3390": "SERIAL", "RS232 · 34401A": "SERIAL",
+                "LAN · 34465A": "DMM_TCP", "LAN · VISA (VXI-11)": "VXI11",
                 "미리보기 · 가상 DUT": "DEMO",
             }
             self.var_dut_mode = tk.StringVar(value="AUTO")
@@ -21,6 +24,8 @@
                 saved_lan = {"ip": legacy["ip"], "mode": "HIOKI_LAN", "port": 3390, "eol": "CRLF"} if isinstance(legacy, dict) and legacy.get("ip") else {}
             self._dut_saved_lan = saved_lan
             self.var_dut_lan_ip = tk.StringVar(value=_dut_discovery_ipv4(saved_lan.get("ip")) or "")
+            self.var_dut_direct = tk.BooleanVar(value=saved_lan.get("direct", True))
+            self.var_dut_mask = tk.StringVar(value=saved_lan.get("mask") or "255.255.255.0")
             self.var_dut_port = tk.StringVar(value="10001")
             self.var_dut_channel = tk.StringVar(value="1")
             self.var_dut_auto = tk.BooleanVar(value=False)
@@ -34,7 +39,7 @@
             self.var_dut_flow = tk.StringVar(value="RTS/CTS")
             self.var_dut_status = tk.StringVar(value="연결 안 됨 · 캘리브레이터와 별도로 연결합니다.")
             self.var_dut_identity = tk.StringVar(value="USB, LAN, GPIB 또는 USB COM으로 연결한 DUT를 찾습니다.")
-            self.var_dut_note = tk.StringVar(value="WT 계열, PPA, Hioki PW3390·PW6001 등 지원 장비의 채널별 측정값을 조회합니다.")
+            self.var_dut_note = tk.StringVar(value="전력계와 34401A·34465A의 측정값을 조회합니다.")
             self.var_dut_time = tk.StringVar(value="수신 기록 없음")
             self.var_dut_hint = tk.StringVar()
             self.dut_canvas = tk.Canvas(self.tab_dut, bg="white", highlightthickness=0)
@@ -69,6 +74,13 @@
             self._ui_label(self.dut_lan_row, "장비의 통신 메뉴에 표시된 IP · PW3390은 SYSTEM → Interface")
             row = self.dut_common_row = ttk.Frame(self.dut_details, style="Card.TFrame")
             row.pack(fill="x", pady=4)
+            self.dut_direct_row = ttk.Frame(self.dut_details, style="Card.TFrame")
+            self.check_dut_direct = ttk.Checkbutton(self.dut_direct_row, text="직결 LAN 자동 맞춤",
+                                                    variable=self.var_dut_direct, command=self._dut_sync_controls)
+            self.check_dut_direct.pack(side="left", padx=(0, 10))
+            self._ui_label(self.dut_direct_row, "DUT 서브넷 마스크")
+            self.entry_dut_mask = self._ui_entry(self.dut_direct_row, self.var_dut_mask, 16)
+            self._ui_label(self.dut_direct_row, "보조 IP가 필요할 때 Windows 관리자 승인")
             for title, variable, width in (("응답 대기(초)", self.var_dut_timeout, 5), ("TCP 포트", self.var_dut_port, 6)):
                 self._ui_label(row, title)
                 self._dut_config_widgets.append(self._ui_entry(row, variable, width))
@@ -77,9 +89,9 @@
             row = self.dut_serial_row = ttk.Frame(self.dut_details, style="Card.TFrame")
             row.pack(fill="x", pady=4)
             for title, variable, options, width in (
-                    ("속도", self.var_dut_baud, (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200), 8),
+                    ("속도", self.var_dut_baud, (300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200), 8),
                     ("데이터", self.var_dut_bits, (7, 8), 3), ("패리티", self.var_dut_parity, ("N", "E", "O"), 3),
-                    ("정지", self.var_dut_stop, (1, 2), 3), ("흐름", self.var_dut_flow, ("RTS/CTS", "NONE", "XON/XOFF"), 10)):
+                    ("정지", self.var_dut_stop, (1, 2), 3), ("흐름", self.var_dut_flow, ("RTS/CTS", "NONE", "XON/XOFF", "DTR/DSR"), 10)):
                 self._ui_label(row, title)
                 self._dut_config_widgets.append(self._ui_combo(row, variable, options, width))
             self.dut_status_frame = ttk.Frame(pad, style="Card.TFrame")
@@ -103,7 +115,7 @@
                 self.dut_tree.heading(key, text=title)
                 self.dut_tree.column(key, width=width, minwidth=60, anchor=anchor)
             self.dut_tree.tag_configure("old", foreground="#64748B")
-            for key, title, unit in DUT_METRICS:
+            for key, title, unit in (*DUT_METRICS, DUT_DMM_METRICS[-1]):
                 self.dut_tree.insert("", "end", iid=key, values=(title, "—", unit, "수신 전"))
             self.dut_tree.pack(fill="x")
             ttk.Label(pad, textvariable=self.var_dut_note, foreground="#64748B", wraplength=940).pack(anchor="w", pady=(10, 4))
@@ -126,6 +138,8 @@
 
         def _dut_mode_changed(self, _event=None):
             mode = self._dut_modes[self.var_dut_mode.get()]
+            pw3390_serial = self.var_dut_mode.get() == "RS232 · Hioki PW3390"
+            dmm_serial = self.var_dut_mode.get() == "RS232 · 34401A"
             hints = {
                 "AUTO": "연결을 누르면 USB, LAN, RS232, GPIB에서 DUT를 찾습니다.",
                 "VISA": "목록에서 USB 계측기의 VISA 리소스를 선택하세요.",
@@ -134,28 +148,51 @@
                 "WT5000_TCP": "소켓 통신을 지원하는 WT5000의 IP를 입력하세요. TCP 10002와 LF를 사용합니다. 본체 Command Type은 WT5000으로 설정하세요.",
                 "PPA_LAN": "PPA의 IP 주소를 입력하세요 (기본 TCP 포트 10001). 본체 REMOTE 인터페이스도 LAN으로 선택하세요.",
                 "HIOKI_LAN": "본체 SYSTEM → Interface에 표시된 IP를 입력하세요. TCP 포트는 PW3390은 3390, PW6001은 23입니다.",
+                "DMM_TCP": "34465A 본체 IP를 입력하세요. LAN Settings에서 Sockets를 켜세요. 기본 TCP 포트는 5025입니다.",
+                "VXI11": "VXI-11을 켠 장비의 IP를 입력하세요. LAN–GPIB 게이트웨이 주소는 연결한 장비의 VISA 리소스 형식으로 USB · VISA에서 직접 입력할 수 있습니다.",
                 "SERIAL": "‘목록’에서 COM 포트를 고르고 본체 설정과 맞추세요. PPA55xx 기본값은 19200 / 8N1 / RTS/CTS / CR입니다.",
                 "DEMO": "화면 확인용 고정 예제입니다. 실제 장비 연결이나 측정은 하지 않습니다.",
             }
             self.var_dut_hint.set(hints[mode])
+            if pw3390_serial:
+                self.var_dut_hint.set("PW3390 본체 SYSTEM → Interface의 RS com speed와 맞추세요. 기본 38400 / 8N1 / NONE / CRLF · RS232 크로스 케이블.")
+            if dmm_serial:
+                self.var_dut_hint.set("34401A I/O MENU에서 RS232와 속도·패리티를 확인하세요. 기본 9600 / 7E2 / DTR/DSR / LF입니다. DTR/DSR이 교차 연결된 널모뎀 케이블이 필요합니다.")
             self._dut_candidates.clear()
             self.combo_dut_address.configure(values=())
             if _event is not None:
                 self.var_dut_address.set(self.var_dut_lan_ip.get()
                                          if mode == self._dut_saved_lan.get("mode") else "")
-                self.var_dut_eol.set("LF" if mode in ("GPIB", "WT_LAN", "WT5000_TCP", "SERIAL") else "CRLF")
+                self.var_dut_eol.set("LF" if mode in ("GPIB", "WT_LAN", "WT5000_TCP", "DMM_TCP", "VXI11", "SERIAL") else "CRLF")
                 if mode == "SERIAL":
                     self.var_dut_flow.set("XON/XOFF")
-            if _event is not None and mode in ("PPA_LAN", "HIOKI_LAN"):
-                self.var_dut_port.set("3390" if mode == "HIOKI_LAN" else "10001")
+                if pw3390_serial:
+                    self.var_dut_baud.set("38400")
+                    self.var_dut_bits.set("8")
+                    self.var_dut_parity.set("N")
+                    self.var_dut_stop.set("1")
+                    self.var_dut_flow.set("NONE")
+                    self.var_dut_eol.set("CRLF")
+                if dmm_serial:
+                    self.var_dut_baud.set("9600")
+                    self.var_dut_bits.set("7")
+                    self.var_dut_parity.set("E")
+                    self.var_dut_stop.set("2")
+                    self.var_dut_flow.set("DTR/DSR")
+            if _event is not None and mode in ("PPA_LAN", "HIOKI_LAN", "DMM_TCP"):
+                self.var_dut_port.set(str({"HIOKI_LAN": 3390, "PPA_LAN": 10001, "DMM_TCP": _DMM_SOCKET_PORT}[mode]))
                 if mode == self._dut_saved_lan.get("mode"):
                     self.var_dut_port.set(str(self._dut_saved_lan.get("port", self.var_dut_port.get())))
-            if mode in ("PPA_LAN", "HIOKI_LAN", "SERIAL") and not self._dut_details_open:
+            if mode in (*_DUT_LAN_MODES, "SERIAL") and not self._dut_details_open:
                 self._dut_toggle_details()
             if mode == "AUTO":
                 self.dut_lan_row.pack(fill="x", pady=4, before=self.dut_common_row)
             else:
                 self.dut_lan_row.pack_forget()
+            if mode in ("AUTO", *_DUT_LAN_MODES):
+                self.dut_direct_row.pack(fill="x", pady=4, before=self.dut_common_row)
+            else:
+                self.dut_direct_row.pack_forget()
             if mode == "SERIAL":
                 self.dut_serial_row.pack(fill="x", pady=4)
             else:
@@ -178,7 +215,8 @@
             settings = DUTSettings(mode=mode, address=address,
                 port=int(self.var_dut_port.get() or 0), timeout=float(self.var_dut_timeout.get()), eol=self.var_dut_eol.get(),
                 baudrate=int(self.var_dut_baud.get()), data_bits=int(self.var_dut_bits.get()), parity=self.var_dut_parity.get(),
-                stop_bits=int(self.var_dut_stop.get()), flow=self.var_dut_flow.get())
+                stop_bits=int(self.var_dut_stop.get()), flow=self.var_dut_flow.get(),
+                model_hint="34401A" if self.var_dut_mode.get() == "RS232 · 34401A" else "")
             settings.validate()
             return settings
 
@@ -208,6 +246,14 @@
                 if self.seq_running or self._io_busy:
                     raise ValueError("기준기 작업이 끝난 뒤 DUT를 연결하세요.")
                 mode = self._dut_modes[self.var_dut_mode.get()]
+                saved = self.dut_session.recovery_target
+                if mode == "AUTO" and saved is not None:
+                    entered = self.var_dut_lan_ip.get().strip()
+                    if not entered or saved.settings.mode not in _DUT_LAN_MODES or entered == saved.settings.address:
+                        if not self._dut_recovery_allowed():
+                            raise ValueError("기준기 STBY를 확인한 뒤 DUT를 복구하세요.")
+                        self._dut_start("recover")
+                        return
                 if mode == "AUTO":
                     if not self._dut_candidates:
                         self._dut_scan()
@@ -257,7 +303,7 @@
                 else:
                     transport = "LAN"
                     address = settings.address
-                    if settings.mode in ("PPA_LAN", "WT5000_TCP", "HIOKI_LAN"):
+                    if settings.mode not in _DUT_VXI11_MODES:
                         address += f":{settings.port}"
                 label = f"{candidate.profile.model} · {transport} · {address}"
                 if label in self._dut_candidates:
@@ -296,6 +342,11 @@
             self._dut_clear_values("채널 변경 · 조회 대기")
             self._dut_next_read = 0
 
+        def _dut_recovery_allowed(self):
+            return (not self._io_busy and not self._sequence_dut_reserved()
+                    and not self.conn_mgr.output_unconfirmed
+                    and (not self.conn_mgr.info.connected or self.is_operating is False))
+
         def _dut_start(self, operation, settings=None):
             if self._dut_busy or (self._dut_closing and operation != "disconnect"):
                 return
@@ -310,18 +361,26 @@
             selected = self._dut_candidates.get(self.var_dut_address.get()) if mode == "AUTO" else None
             lan_ip = self.var_dut_lan_ip.get().strip()
             saved_lan = self._dut_saved_lan
+            direct_mask = (self.var_dut_mask.get().strip() or "255.255.255.0") if self.var_dut_direct.get() else ""
             self._dut_busy = True
             self.dut_session.cancel.clear()
-            self._dut_mark_old("이전 수신값")
-            self.var_dut_status.set({"connect": "DUT 연결 중…", "disconnect": "DUT 연결 해제 중…",
+            if operation != "health":
+                self._dut_mark_old("이전 수신값")
+                self.var_dut_status.set({"connect": "DUT 연결 중…", "disconnect": "DUT 연결 해제 중…",
                                      "read": "조회 중… · 표시된 값은 이전 수신값입니다.", "scan": "연결 목록 조회 중…",
+                                     "recover": "동일 DUT 재연결 중…",
                                      "discover": "USB / LAN / GPIB / COM DUT 검색 중…"}[operation])
             self._dut_sync_controls()
             def run():
                 result, error = None, None
                 try:
                     if operation == "connect":
-                        identity = self.dut_session.connect(settings)
+                        connection = settings
+                        if (direct_mask and not settings.source_ip
+                                and settings.mode in _DUT_LAN_MODES):
+                            source = align_dut_direct_lan(settings.address, direct_mask, self.dut_session.cancel)
+                            connection = replace(settings, source_ip=source)
+                        identity = self.dut_session.connect(connection)
                         if selected is not None and identity != selected.identity:
                             self.dut_session.disconnect()
                             raise ConnectionError("검색 때 확인한 장비와 다릅니다. 다시 자동 검색하세요.")
@@ -334,15 +393,19 @@
                     elif operation == "discover":
                         result = discover_duts(self.dut_session.cancel, excluded_resource=info.resource_name,
                                                excluded_ip=excluded_ip, include_serial=True, include_gpib=True,
-                                               lan_ip=lan_ip, saved_lan=saved_lan)
+                                               lan_ip=lan_ip, saved_lan=saved_lan, direct_mask=direct_mask)
                     elif operation == "disconnect":
                         self.dut_session.disconnect()
+                    elif operation == "health":
+                        self.dut_session.check_connection()
+                    elif operation == "recover":
+                        result = self.dut_session.recover_connection()
                     elif operation == "read":
                         result = self.dut_session.read(channel)
                     elif mode == "SERIAL":
                         if not HAS_PYSERIAL:
                             raise RuntimeError("COM 조회를 위한 pyserial을 불러올 수 없습니다.")
-                        result = [item.device for item in serial.tools.list_ports.comports()]
+                        result = _dut_serial_port_names(info.resource_name.upper())
                     else:
                         if not HAS_PYVISA:
                             raise RuntimeError(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
@@ -357,7 +420,7 @@
                         finally:
                             manager.close()
                 except Exception as exc:
-                    error = str(exc)
+                    error = exc
                 finally:
                     if self.dut_session.cancel.is_set():
                         self.dut_session.disconnect()
@@ -379,14 +442,14 @@
             self._dut_received_monotonic = 0
             self._dut_old = False
             self.var_dut_time.set("수신 기록 없음")
-            for key, title, unit in DUT_METRICS:
+            for key, title, unit in (*DUT_METRICS, DUT_DMM_METRICS[-1]):
                 self.dut_tree.item(key, values=(title, "—", unit, state), tags=("old",))
 
         def _dut_mark_old(self, state):
             if not self._dut_received_monotonic:
                 return
             self._dut_old = True
-            for key, _, _ in DUT_METRICS:
+            for key in self.dut_tree.get_children():
                 values = list(self.dut_tree.item(key, "values"))
                 values[3] = state
                 self.dut_tree.item(key, values=values, tags=("old",))
@@ -395,23 +458,33 @@
             self._dut_received_monotonic = time.monotonic()
             self._dut_old = False
             modes = dict(zip(("voltage", "current"), sample.vi_modes)) if sample.vi_modes else {}
-            for key, title, unit in DUT_METRICS:
+            shown = DUT_DMM_METRICS if self.dut_session.profile.family == "DMM" else DUT_METRICS
+            for key, title, unit in shown:
                 if key in modes:
                     title = title.removesuffix("RMS") + modes[key]
-                value = sample.values[key]
-                state = "범위 초과 / 값 없음" if value is None else "가상 예제" if sample.simulated else "수신됨"
+                value = sample.values.get(key)
+                state = ("—" if key not in sample.values else "범위 초과 / 값 없음" if value is None
+                         else "가상 예제" if sample.simulated else "수신됨")
                 self.dut_tree.item(key, values=(title, "—" if value is None else f"{value:.10g}", unit, state), tags=())
             self.var_dut_time.set(f"{'가상' if sample.simulated else '수신'} {sample.received_at[11:]} · CH{sample.channel}")
             self.var_dut_note.set(sample.note)
             self.var_dut_status.set("미리보기 · 실제 측정값 아님" if sample.simulated else "조회 완료 · 실제 장비의 수신값")
 
         def _dut_sync_controls(self):
+            self._sync_dut_current_group_panel()
+            profile = self.dut_session.profile
+            rows = DUT_DMM_METRICS if profile and profile.family == "DMM" else DUT_METRICS
+            children = tuple(key for key, _, _ in rows)
+            if self.dut_tree.get_children() != children:
+                self.dut_tree.set_children("", *children)
             locked = self._dut_busy or self.dut_session.connected or self._dut_closing
             for widget in [self.combo_dut_mode] + self._dut_config_widgets:
                 widget.configure(state="disabled" if locked else "readonly" if isinstance(widget, ttk.Combobox) else "normal")
             mode = self._dut_modes[self.var_dut_mode.get()]
             auto = mode == "AUTO"
             self.entry_dut_lan_ip.configure(state="disabled" if locked else "normal")
+            self.check_dut_direct.configure(state="disabled" if locked else "normal")
+            self.entry_dut_mask.configure(state="disabled" if locked or not self.var_dut_direct.get() else "normal")
             if auto and not self._dut_candidates:
                 self.combo_dut_address.pack_forget()
             elif not self.combo_dut_address.winfo_manager():
@@ -425,7 +498,8 @@
                 self.btn_dut_scan.configure(state="disabled" if locked else "normal")
             else:
                 self.btn_dut_scan.pack_forget()
-            self.btn_dut_disconnect.configure(state="normal" if self._dut_busy or self.dut_session.connected else "disabled")
+            self.btn_dut_disconnect.configure(state="normal" if self._dut_busy or self.dut_session.connected
+                                              or self.dut_session.recovery_target is not None else "disabled")
             ready = self.dut_session.connected and not self._dut_busy and not self._dut_closing
             self.btn_dut_read.configure(state="normal" if ready else "disabled")
             self.check_dut_auto.configure(state="normal" if self.dut_session.connected and not self._dut_closing else "disabled")
@@ -438,6 +512,7 @@
                 pass
             else:
                 self._dut_busy = False
+                self._dut_health_due = time.monotonic() + _DUT_IDLE_CHECK_SECONDS
                 if self._dut_disconnect_requested or self._dut_closing:
                     self._dut_disconnect_requested = False
                     self._dut_clear_values("연결 해제됨")
@@ -448,20 +523,26 @@
                 elif error:
                     if operation == "connect":
                         self._dut_candidates.clear()
-                    self.var_dut_auto.set(False)
-                    self._dut_clear_values("조회 실패")
-                    self.var_dut_status.set(f"DUT 오류: {error}")
-                    self._log(f"[DUT {operation}] {error}")
+                    if isinstance(error, DUTDataNotReadyError):
+                        self._dut_clear_values("새 데이터 대기 초과")
+                        self.var_dut_status.set(f"새 데이터 대기 초과 · DUT 연결 유지 · {error}")
+                    else:
+                        self.var_dut_auto.set(False)
+                        detail = self.dut_session.last_io_failure if operation in ("health", "read", "sequence_read") else ""
+                        self._dut_clear_values("통신 끊김" if detail and not self.dut_session.connected else "조회 실패")
+                        self.var_dut_status.set(detail or f"DUT 오류: {error}")
+                        self._log(f"[DUT {operation}] {detail or error}")
                 elif operation == "connect":
                     identity, defaults = result
                     settings = self.dut_session.settings
                     self.var_dut_identity.set(identity)
-                    if settings and settings.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN"):
+                    if settings and settings.mode in _DUT_LAN_MODES:
                         host = AutoNetworkAligner.normalize_ipv4(settings.address)
-                        endpoint = host if settings.mode == "WT_LAN" else f"{host}:{settings.port}"
+                        endpoint = host if settings.mode in _DUT_VXI11_MODES else f"{host}:{settings.port}"
                         self.var_dut_identity.set(f"LAN · {endpoint} · {identity}")
                         self.var_dut_lan_ip.set(host)
                         self._dut_saved_lan = {"ip": host, "mode": settings.mode, "port": settings.port, "eol": settings.eol}
+                        self._dut_saved_lan.update(direct=self.var_dut_direct.get(), mask=self.var_dut_mask.get().strip())
                         self.conn_mgr._remember_connection("LAN", history_key="DUT-LAN", **self._dut_saved_lan)
                     elif settings and settings.mode in ("VISA", "SERIAL", "GPIB"):
                         interface = {"VISA": "USB", "SERIAL": "RS232", "GPIB": "GPIB"}[settings.mode]
@@ -482,14 +563,25 @@
                         self._log(f"[DUT 연결 설정] {defaults}")
                 elif operation == "read":
                     self._dut_show_sample(result)
+                elif operation == "recover":
+                    self._dut_clear_values("수신 전")
+                    settings = self.dut_session.settings
+                    self.var_dut_identity.set(f"{settings.address} · {result}")
+                    self.var_dut_status.set("동일 DUT 연결 복구됨 · 중단된 행에서 재개하세요.")
+                    self._log(f"[DUT 연결 복구] {settings.address} · {result}")
+                elif operation == "health":
+                    pass
                 elif operation == "discover":
                     self._dut_show_candidates(result)
                 elif operation == "scan":
                     self.combo_dut_address.configure(values=result)
                     if len(result) == 1:
                         self.var_dut_address.set(result[0])
+                    mode = self._dut_modes[self.var_dut_mode.get()]
+                    empty = ("DUT용 COM 포트가 없습니다. USB–RS232 변환기 연결과 Windows 장치 관리자를 확인하세요."
+                             if mode == "SERIAL" else "장치가 목록에 없습니다. 케이블과 VISA 드라이버를 확인하세요.")
                     self.var_dut_status.set(f"연결 목록 {len(result)}개 · 주소 칸에서 선택하세요." if result else
-                        "장치가 목록에 없습니다. USB 드라이버·케이블을 확인하거나 LAN/COM 주소를 직접 입력하세요.")
+                        empty)
                 else:
                     self._dut_candidates.clear()
                     self._dut_clear_values("연결 해제됨")
@@ -503,6 +595,13 @@
                 self._dut_sync_controls()
             if self._dut_received_monotonic and not self._dut_old and time.monotonic() - self._dut_received_monotonic > 5:
                 self._dut_mark_old("이전 수신값")
+            if not self._dut_closing and not self._dut_busy and self._dut_recovery_allowed():
+                if self.dut_session.recovery_pending:
+                    self._dut_start("recover")
+                elif (self.dut_session.connected and self.dut_session.settings is not None
+                      and self.dut_session.settings.mode in _DUT_LAN_MODES and not self.var_dut_auto.get()
+                      and time.monotonic() >= self._dut_health_due):
+                    self._dut_start("health")
             if not self._dut_closing and self.var_dut_auto.get() and not self._dut_busy and self.dut_session.connected and time.monotonic() >= self._dut_next_read:
                 self._dut_start("read")
             self._dut_poll_id = self.after(100, self._dut_poll)

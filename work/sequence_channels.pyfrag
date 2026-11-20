@@ -3,6 +3,35 @@ CHANNEL_MEASUREMENT_NAMES = {
     "DCP": "DC 전력", "ACP": "AC 전력", "PF": "역률",
 }
 
+MEASUREMENT_NAMES = {**CHANNEL_MEASUREMENT_NAMES, "OHM": "저항", "FREQ": "주파수"}
+
+
+def clipboard_measurement_kind(label):
+    key = re.sub(r"[\s._:\-]+", "", label.upper()).replace("직류", "DC").replace("교류", "AC")
+    if key in CHANNEL_MEASUREMENT_NAMES:
+        return key
+    if key in ("POWERFACTOR", "역률"):
+        return "PF"
+    for mode, spellings in (("DC", ("DC", "DIRECTCURRENT")), ("AC", ("AC", "ALTERNATINGCURRENT"))):
+        for suffix, names in (("V", ("VOLT", "VOLTAGE", "V", "전압")),
+                              ("I", ("CURR", "CURRENT", "AMP", "A", "전류")),
+                              ("P", ("POW", "POWER", "W", "전력"))):
+            if any(key in (form + name, name + form) for form in spellings for name in names):
+                return mode + suffix
+    return None
+
+
+def pasted_channel_hint(line):
+    for cell in line.split("\t")[:-1]:
+        label = re.fullmatch(r"\s*(CH\s*[-–]?\s*)?([1-9][0-9]?)\s*([*@]?)\s*", cell, re.I)
+        if label and (label[1] or label[3] == "@"):
+            return int(label[2]), "@" if label[3] else ""
+    return None
+
+
+def channel_name(key):
+    return f"CH{key[0]}{key[1]}" if key is not None else ""
+
 
 def _channel_frequency(step):
     parsed = SmartClipboardSequenceParser.parse_value_and_unit(step.freq_cond_raw)
@@ -31,7 +60,7 @@ def _channel_measurement_kind(step):
     return None
 
 
-def repeated_channel_blocks(steps):
+def repeated_channel_blocks(steps, *, allow_tail=False):
     """Return row indices for exact repeated blocks of measurement conditions."""
     rows = [index for index, step in enumerate(steps) if step.func_type != "BLANK"]
     keys = [
@@ -40,11 +69,13 @@ def repeated_channel_blocks(steps):
         for step in (steps[index] for index in rows)
     ]
     for size in range(2, len(keys) // 2 + 1):
-        if len(keys) % size:
+        full, tail = divmod(len(keys), size)
+        if tail and not allow_tail:
             continue
         pattern = keys[:size]
-        if len(set(pattern)) > 1 and keys == pattern * (len(keys) // size):
-            return [rows[start:start + size] for start in range(0, len(rows), size)]
+        matched = full * size
+        if len(set(pattern)) > 1 and keys[:matched] == pattern * full:
+            return [rows[start:start + size] for start in range(0, matched, size)]
     return []
 
 
@@ -56,13 +87,22 @@ def detect_channel_sections(steps):
         if kind:
             by_kind[kind].append(index)
 
-    def find_blocks(indices):
-        positions = repeated_channel_blocks([steps[i] for i in indices])
+    def find_blocks(indices, allow_tail=False):
+        positions = repeated_channel_blocks([steps[i] for i in indices], allow_tail=allow_tail)
         return [[indices[i] for i in block] for block in positions]
 
     sections = []
     for kind, indices in by_kind.items():
         name = CHANNEL_MEASUREMENT_NAMES[kind]
+        if any(steps[index].channel_hint for index in indices):
+            explicit = []
+            for index in indices:
+                if steps[index].channel_hint:
+                    explicit.append([])
+                if explicit:
+                    explicit[-1].append(index)
+            sections.append((name, explicit))
+            continue
         blocks = find_blocks(indices)
         if blocks:
             sections.append((name, blocks))
@@ -71,9 +111,11 @@ def detect_channel_sections(steps):
         for index in indices:
             frequencies.setdefault(_channel_frequency(steps[index]), []).append(index)
         if len(frequencies) < 2:
+            if kind in ("DCI", "ACI") and (blocks := find_blocks(indices, allow_tail=True)):
+                sections.append((name, blocks))
             continue
         for frequency, subset in frequencies.items():
-            blocks = find_blocks(subset)
+            blocks = find_blocks(subset, allow_tail=kind in ("DCI", "ACI"))
             if blocks:
                 label = f"{frequency:g} Hz" if isinstance(frequency, (float, int)) and frequency else frequency or "DC"
                 sections.append((f"{name} · {label}", blocks))

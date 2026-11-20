@@ -92,6 +92,7 @@ class SerialTests(unittest.TestCase):
     def connect(self, peer, **kwargs):
         backend = Mock()
         backend.Serial.return_value = peer
+        backend.tools.list_ports.comports.return_value = []
         self.addCleanup(patch.stopall)
         patch.object(f, 'serial', backend).start()
         patch.object(f, 'HAS_PYSERIAL', True).start()
@@ -100,6 +101,67 @@ class SerialTests(unittest.TestCase):
         mgr.scan_and_auto_connect('RS232', model=peer.model, serial_port='COM7',
                                  timeout_sec=.2, operation_timeout_sec=1, **kwargs)
         return mgr, backend
+
+    def test_calibrator_serial_recovers_by_usb_identity_and_confirms_standby_only(self):
+        def listed(address, serial_number):
+            return SimpleNamespace(device=address, vid=1659, pid=9123, serial_number=serial_number,
+                                   hwid="USB", description="USB Serial")
+        initial, wrong, restored = SerialPeer("5520A"), SerialPeer("5522A"), SerialPeer("5520A")
+        with patch.object(f, "serial") as serial_backend:
+            serial_backend.tools.list_ports.comports.return_value = [listed("COM7", "A")]
+            serial_backend.Serial.side_effect = (initial, wrong, restored)
+            mgr = f.Fluke5560AConnectionManager()
+            mgr.scan_and_auto_connect("RS232", model="5520A", serial_port="COM7", timeout_sec=.25)
+            self.assertEqual(initial.timeout, .2)
+            self.assertEqual(initial.write_timeout, 1)
+            with patch.object(initial, "write", side_effect=OSError("COM device removed")):
+                with self.assertRaises(OSError):
+                    mgr.send_command("OUT 1 V, 0 HZ; OPER")
+            self.assertTrue(mgr.output_unconfirmed)
+            self.assertTrue(mgr.recovery_pending)
+            serial_backend.tools.list_ports.comports.return_value = [listed("COM7", "B"), listed("COM13", "A")]
+            with self.assertRaisesRegex(ConnectionError, "식별 정보"):
+                mgr.recover_standby()
+            self.assertTrue(mgr.output_unconfirmed)
+            self.assertEqual(wrong.commands, ["*IDN?"])
+            result = mgr.recover_standby()
+            self.assertTrue(result.resource_name.startswith("COM13 /"))
+            self.assertEqual(restored.commands, ["*IDN?", "REMOTE", "*OPC?", "STBY", "*OPC?", "OPER?"])
+            self.assertFalse(mgr.output_unconfirmed)
+            self.assertIsNone(mgr.recovery_target)
+            mgr.disconnect(standby=False)
+
+    def test_552x_serial_rechecks_startup_framing_before_output(self):
+        for model in ("5520A", "5522A"):
+            with self.subTest(model=model):
+                peer = SerialPeer(model, echo=False)
+                mgr, _ = self.connect(peer)
+                peer.errors = ['801,"Serial framing error REM"'] * 5
+                mgr.send_command("OUT 1 V, 0 HZ")
+                idx = peer.commands.index("OUT 1 V, 0 HZ")
+                self.assertEqual(peer.commands[idx - 3:idx], ["*IDN?", "OPER?", "ERR?"])
+                self.assertTrue(mgr.info.connected)
+
+    def test_5520a_serial_preserves_protection_and_stops_on_repeated_live_framing(self):
+        peer = SerialPeer("5520A", echo=False)
+        mgr, _ = self.connect(peer)
+        peer.errors = ['801,"Serial framing error REM"', '1500,"Compliance"']
+        with self.assertRaisesRegex(f.InstrumentCommandError, "1500"):
+            mgr.send_command("OUT 1 V, 0 HZ; OPER")
+        self.assertFalse(peer.output_seen)
+        mgr.send_command("STBY")
+        peer.errors = ['801,"Serial framing error REM"']
+        mgr.send_command("STBY")
+        self.assertEqual(peer.commands[-3:], ["*IDN?", "OPER?", "ERR?"])
+        peer.errors = ['801,"Serial framing error REM"'] * 2
+        with self.assertRaisesRegex(f.InstrumentCommandError, "케이블"):
+            mgr.send_command("STBY")
+        self.assertTrue(mgr.info.connected)
+        self.assertFalse(peer.operating)
+        peer.errors = ['801,"Serial framing error REM"'] * 16
+        with self.assertRaisesRegex(f.InstrumentCommandError, "801"):
+            mgr.send_command("OUT 1 V, 0 HZ; OPER", check_before=True)
+        self.assertFalse(peer.output_seen)
 
     def test_5560_serial_rechecks_multiple_startup_errors_before_output(self):
         peer = SerialPeer("5560A", echo=False)
@@ -193,6 +255,7 @@ class SerialTests(unittest.TestCase):
     def test_wrong_model_is_closed_without_remote_or_output(self):
         peer = SerialPeer('5080A')
         backend = Mock(Serial=Mock(return_value=peer))
+        backend.tools.list_ports.comports.return_value = []
         with patch.object(f, 'serial', backend), patch.object(f, 'HAS_PYSERIAL', True):
             mgr = f.Fluke5560AConnectionManager()
             with self.assertRaises(ConnectionError):
@@ -532,6 +595,20 @@ class ModelCommandTests(unittest.TestCase):
             command,_=f.CalibratorCommandBuilder(model).build_resistance_cmd(value=110000,unit='OHM',zcomp='WIRE4')
             self.assertIn('ZCOMP NONE',command)
 
+    def test_uncompensated_resistance_confirms_zero_and_ten_megohms_on_supported_models(self):
+        for model in f.MODEL_PROFILES:
+            with self.subTest(model=model):
+                manager = f.Fluke5560AConnectionManager()
+                manager.profile = f.MODEL_PROFILES[model]
+                builder = f.CalibratorCommandBuilder(model)
+                for value, actual in ((0, .016 if model == "5080A" else 0),
+                                      (10_000_000, 10_007_200 if model == "5080A" else 10_000_000)):
+                    command, _ = builder.build_resistance_cmd(value=value, unit="OHM", zcomp="NONE")
+                    with (patch.object(manager, "send_command") as send,
+                          patch.object(manager, "query", side_effect=(f"{actual},OHM,0E+00,0,0E+00", "NONE"))):
+                        manager.set_uncompensated_resistance_in_standby(command)
+                        send.assert_called_once_with(command, check_before=True)
+
     def test_parser_applies_coil_and_three_amp_groups_for_older_models(self):
         for model in ('5522A','5520A','5080A'):
             steps=f.SmartClipboardSequenceParser.build_sequence_steps('0.1 A\n1 A\n3 A\n5 A\n2 A',model=model)
@@ -591,7 +668,9 @@ class ModelGuiTests(unittest.TestCase):
                 peer = SerialPeer(model)
                 self.app.var_model.set(model)
                 self.app._on_model_changed()
-                with patch.object(f, 'HAS_PYSERIAL', True), patch.object(f, 'serial', Mock(Serial=Mock(return_value=peer))):
+                backend = Mock(Serial=Mock(return_value=peer))
+                backend.tools.list_ports.comports.return_value = []
+                with patch.object(f, 'HAS_PYSERIAL', True), patch.object(f, 'serial', backend):
                     self.app.conn_mgr.scan_and_auto_connect('RS232', model=model, serial_port='COM7', timeout_sec=.2)
                     for text, post in (('2 A', 'AUX'), ('120 V / 3 A', 'A20')):
                         step, = f.SmartClipboardSequenceParser.build_sequence_steps(text, model=model)

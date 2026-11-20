@@ -1,4 +1,4 @@
-        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True, *, verify_setpoint=False, dual_current=False):
+        def _send_and_log(self, cmd, auto_oper=False, on_done=None, on_error=None, stop_sequence=True, *, verify_setpoint=False, dual_current=False, uncompensated_resistance=False, before_output=None):
             if not self._ensure_connected_or_sim():
                 return False
             self.conn_mgr.operation_timeout = self._get_operation_timeout()
@@ -7,6 +7,9 @@
             model = self.conn_mgr.profile.model
             parts = [part.strip().upper() for part in cmd.split(";")]
             requests_output = auto_oper or "OPER" in parts
+            changes_output = requests_output or any(part.startswith("OUT ") for part in parts)
+            if changes_output and self.conn_mgr.output_unconfirmed:
+                raise ConnectionError("본체의 STBY를 확인하거나 기준기 연결을 복구한 뒤 다시 시도하세요.")
             requested_post = None
             if model != "5560A" and "OPER" not in parts and not self.conn_mgr.info.interface_type.startswith("SIMULATION"):
                 requested_post = next((part.split(maxsplit=1)[1] for part in reversed(parts)
@@ -15,15 +18,29 @@
             self.is_operating = None
             self._refresh_oper_badge()
             def operation():
+                prior_state = self.conn_mgr.check_output_state() if changes_output else None
+                def ensure_standby():
+                    nonlocal prior_state
+                    if self.conn_mgr.cancel_event.is_set():
+                        raise OperationCancelled("출력 전 확인을 중지했습니다.")
+                    if prior_state != "0":
+                        self.conn_mgr.send_command("STBY")
+                        prior_state = self.conn_mgr.check_output_state()
+                        if prior_state != "0":
+                            raise InstrumentProtocolError(f"{model} STBY를 확인하지 못했습니다. 본체 출력 상태를 확인하세요.")
+
+                if before_output is not None:
+                    before_output(ensure_standby)
                 changing_active_post = (requested_post is not None
-                                        and self.conn_mgr.query("OPER?") == "1"
+                                          and prior_state == "1"
                                         and self.conn_mgr.query("CUR_POST?").upper() != requested_post)
-                if changing_active_post or (dual_current and self.conn_mgr.query("OPER?") != "0"):
-                    self.conn_mgr.send_command("STBY")
-                    if self.conn_mgr.query("OPER?").strip() != "0":
-                        raise InstrumentProtocolError(f"{model} STBY를 확인하지 못했습니다. 본체 출력 상태를 확인하세요.")
-                if verify_setpoint or dual_current or requested_post is not None:
-                    self.conn_mgr.send_command(cmd, check_before=True)
+                if changing_active_post or dual_current or uncompensated_resistance:
+                    ensure_standby()
+                if verify_setpoint or dual_current or requested_post is not None or uncompensated_resistance:
+                    if uncompensated_resistance:
+                        self.conn_mgr.set_uncompensated_resistance_in_standby(cmd)
+                    else:
+                        self.conn_mgr.send_command(cmd, check_before=True)
                     if dual_current and not self.conn_mgr.info.interface_type.startswith("SIMULATION"):
                         self.conn_mgr.profile.verify_dual_current_readback(cmd, self.conn_mgr.query("OUT?"))
                     if requested_post is not None:
@@ -37,10 +54,9 @@
                                 f"{model} 전류 단자 불일치 · 설정 {requested_post}, 본체 {actual_post}. "
                                 "STBY 확인 완료, 연결 유지.")
                     if auto_oper:
-                        self.conn_mgr.send_command("OPER", check_before=model != "5560A")
+                        self.conn_mgr.send_command("OPER", check_before=model != "5560A" or uncompensated_resistance)
                 else:
-                    check_before = requests_output or any(part.startswith("OUT ") for part in parts)
-                    self.conn_mgr.send_command(full_cmd, check_before=check_before)
+                    self.conn_mgr.send_command(full_cmd, check_before=changes_output)
                 state = self.conn_mgr.query("OPER?").strip()
                 if state not in ("0", "1"):
                     self.conn_mgr.disconnect(standby=False)
@@ -132,13 +148,35 @@
                             step.status = "✓ 완료"
                             self.excel_grid._update_single_row_visual(r_i, step, is_active=False)
                     self.progress_var.set(100)
-                    self.var_active_row_banner.set(f"{self._current_group_label()} 완료 — STBY 확인 완료. 케이블 변경 후 다른 그룹을 선택하세요.")
+                    channel = self.seq_steps[plan[-1]].channel_key
+                    if channel:
+                        self.var_active_row_banner.set(f"{channel_name(channel)} 완료 · STBY 확인 완료. 결선 변경 후 다음 채널 행을 선택하고 시작하세요.")
+                    else:
+                        self.var_active_row_banner.set(f"{self._current_group_label()} 완료 — STBY 확인 완료. 케이블 변경 후 다른 그룹을 선택하세요.")
                     self.lbl_active_row_banner.configure(bg="#DCFCE7", fg="#166534")
                 self._send_and_log("STBY", on_done=finished)
                 return
 
             idx = plan[position]
-            linked = self._seq_dut_run and self.seq_steps[idx].func_type in self._DUT_SEQUENCE_QUANTITIES
+            if position and self._uses_34465_current_groups() and self._seq_dut_run:
+                previous_group = self._34465_wiring_group(self.seq_steps[plan[position - 1]])
+                next_group = self._34465_wiring_group(self.seq_steps[idx])
+                if previous_group != next_group:
+                    self._on_seq_stop_auto(silent=True)
+                    self.seq_paused_idx = idx
+
+                    def wiring_stop_done(operating):
+                        if operating:
+                            self.var_active_row_banner.set("기준기 STBY 미확인 · 본체에서 출력 상태를 확인하세요.")
+                            return
+                        self.var_active_row_banner.set(
+                            f"#{idx + 1}행 {next_group} 결선 대기 · STBY 확인 완료. 결선을 바꾸고 재개하세요.")
+                        self.lbl_active_row_banner.configure(bg="#FED7AA", fg="#9A3412")
+                        self._log(self.var_active_row_banner.get())
+
+                    self._send_and_log("STBY", on_done=wiring_stop_done)
+                    return
+            linked = self._seq_dut_run and self._sequence_dut_quantity(self.seq_steps[idx]) is not None
             next_position = position + 1
 
             def completed():
@@ -158,7 +196,9 @@
                 self.seq_after_id = self.after(0 if linked else dwell_ms,
                     lambda: self._run_next_auto_step(next_position, dwell_ms))
 
-            if not self._execute_sequence_step(idx, on_complete=completed, dwell_ms=dwell_ms):
+            zero_resistance = position == 0 or self.seq_steps[plan[position - 1]].func_type != "OHM"
+            if not self._execute_sequence_step(idx, on_complete=completed, dwell_ms=dwell_ms,
+                                               zero_resistance=zero_resistance):
                 if self._seq_dut_run and self.conn_mgr.info.connected:
                     self._on_stby_clicked()
                 else:
@@ -187,6 +227,9 @@
                 self.is_operating = None
                 self._refresh_oper_badge()
                 self._log("[중지 요청] 현재 대기를 중단하고 STBY 전송을 시도합니다. 본체에서 출력 차단을 확인하세요.")
+                return
+            if not self.conn_mgr.info.connected and self.conn_mgr.recovery_target is not None:
+                self._start_calibrator_recovery()
                 return
             try:
                 self._send_and_log("STBY")

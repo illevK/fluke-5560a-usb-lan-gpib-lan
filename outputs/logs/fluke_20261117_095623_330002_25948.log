@@ -1,0 +1,17 @@
+[2026-11-17T09:56:23.331] [LAN 연결 시도] 127.0.0.1:54127
+[2026-11-17T09:56:23.340] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T09:56:23.341] RX << -410,"Interrupted query" | ERR? | 0.001s
+[2026-11-17T09:56:23.342] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T09:56:23.344] RX << 0 | OPER? | 0.001s
+[2026-11-17T09:56:23.345] [첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: -410,"Interrupted query"
+[2026-11-17T09:56:23.346] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T09:56:23.347] RX << +8012,"Zero adjustment is required every 14 days" | ERR? | 0.001s
+[2026-11-17T09:56:23.348] [영점 조정 필요] +8012,"Zero adjustment is required every 14 days" · 5560A 본체에서 Zero Adjustment를 실행하세요.
+[2026-11-17T09:56:23.349] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T09:56:23.350] RX << 0 | OPER? | 0.001s
+[2026-11-17T09:56:23.351] [첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: +8012,"Zero adjustment is required every 14 days"
+[2026-11-17T09:56:23.352] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T09:56:23.355] RX << 4100,"Compliance voltage exceeded" | ERR? | 0.003s
+[2026-11-17T09:56:23.357] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T09:56:23.359] RX << 0 | OPER? | 0.002s
+[2026-11-17T09:56:23.360] 5560A 오류 (출력 전 대기 중이던 오류): 4100,"Compliance voltage exceeded". STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다.

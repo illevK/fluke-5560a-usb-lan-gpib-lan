@@ -42,6 +42,28 @@ class ClipboardTableTests(unittest.TestCase):
         self.addCleanup(self.app._on_close)
         self.grid = self.app.excel_grid
 
+    def test_measurement_aliases_in_headers_and_rows_keep_conflicting_points_blocked(self):
+        data = ("DC VOLT\n1 V\nDC전압\t2 V\n직류전압 3 V\n"
+                "AC VOLTAGE\n50 Hz\t4 V\n5 V\n"
+                "직류전류\t-1 mA\nAC CURR 60 Hz 2 mA\n"
+                "DC POWER 120 V / 1 A 120 W\n교류전력\t120 V / 1 A\t60 Hz\t120 W\n"
+                "역률\t120 V / 1 A\t60 Hz\t0.5 Lead\n"
+                "DC전류\t1 W\nDC 전압\t60 Hz\t1 V")
+        app = self.app
+        app._handle_excel_paste_at_cell(data, 0, 2, replace_all=True)
+        types = ["DCV", "DCV", "DCV", "ACV", "ERROR", "DCI", "ACI",
+                 "DCP", "ACP", "PF", "ERROR", "ERROR"]
+        self.assertEqual([row.func_type for row in app.seq_steps], types)
+        self.assertEqual([row.func_type for row in f.SmartClipboardSequenceParser.build_sequence_steps(data)], types)
+        self.assertEqual(app.seq_steps[7].freq_cond_raw, "DC")
+        self.assertTrue(all(not app.seq_steps[i].scpi_cmd for i in (4, 10, 11)))
+        app._recalculate_all_grid_steps()
+        self.assertEqual([row.func_type for row in app.seq_steps], types)
+        row = app.seq_steps[4]
+        app._handle_excel_cell_edited(4, row.vi_cond_raw, "60 Hz", row.pf_cond_raw, row.nominal_raw)
+        self.assertEqual(app.seq_steps[4].func_type, "ACV")
+        self.assertTrue(app.seq_steps[4].scpi_cmd)
+
     def test_empty_sheet_keeps_two_tabs_and_accepts_first_paste(self):
         app = self.app
         self.assertEqual([app.notebook.tab(tab, 'text') for tab in app.notebook.tabs()], ['측정표', 'DUT 연결'])
@@ -91,7 +113,7 @@ class ClipboardTableTests(unittest.TestCase):
         for i, row in enumerate(rows):
             hz = 50 if i < 6 else 60
             volts = 120 if i // 3 % 2 == 0 else 240
-            pf = '1 LEAD' if i % 3 == 0 else '0.5 LAG'
+            pf = ('1 LEAD', '0.5 LEAD', '0.5 LAG')[i % 3]
             self.assertEqual((row.func_type, row.nominal_raw), ('PF', pf))
             self.assertEqual(row.scpi_cmd, f'OUT {volts} V, 1 A, {hz} HZ; DPF {pf.replace(" ", ", ")}')
         self.assertNotIn('분해능', [spec[0] for spec in self.grid.COL_SPECS])

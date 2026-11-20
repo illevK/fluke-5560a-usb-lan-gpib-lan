@@ -1,0 +1,6 @@
+[2026-11-17T09:21:00.385] 통신 기록 자동 저장: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\outputs\logs\fluke_20261117_092059_791158_17352.log
+[2026-11-17T09:21:00.448] 실행 Python: C:\Users\HCT-2714\Documents\Codex\2026-10-29\fluke-5560a-usb-lan-gpib-lan\work\packaging_venv\Scripts\python.exe | PyVISA=True | pyserial=True
+[2026-11-17T09:21:00.509] 시스템 준비 완료 (현재 내 PC IP: 감지 안 됨). 장비의 현재 IP와 실제 랜카드를 선택한 뒤 [LAN 진단]으로 확인하세요.
+[2026-11-17T09:21:00.799] [DUT connect] 검색 때 확인한 장비와 다릅니다. 다시 자동 검색하세요.
+[2026-11-17T09:21:01.138] [DUT 연결] YOKOGAWA,WT310E,WT310E_LAN,F1.01
+[2026-11-17T09:21:01.152] [DUT 연결 설정] 100 ms

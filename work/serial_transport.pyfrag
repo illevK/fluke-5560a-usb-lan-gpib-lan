@@ -9,14 +9,53 @@ except ImportError as exc:
     PYSERIAL_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
+def _serial_usb_key(port):
+    serial_number = getattr(port, "serial_number", None)
+    vid, pid = getattr(port, "vid", None), getattr(port, "pid", None)
+    if vid is None or pid is None:
+        return ""
+    location = getattr(port, "location", None)
+    if serial_number:
+        return f"{vid:04x}:{pid:04x}:serial:{serial_number}".casefold()
+    return f"{vid:04x}:{pid:04x}:location:{location}".casefold() if location else ""
+
+
+def _serial_key_for_address(address):
+    if HAS_PYSERIAL:
+        try:
+            for port in serial.tools.list_ports.comports():
+                if port.device.upper() == address.upper():
+                    return _serial_usb_key(port)
+        except OSError:
+            pass
+    return ""
+
+
+def _wait_for_serial_address(address, usb_key, cancel, wait_seconds=3.0):
+    deadline = time.monotonic() + wait_seconds
+    while HAS_PYSERIAL and not cancel.is_set():
+        ports = serial.tools.list_ports.comports()
+        matches = [port.device.upper() for port in ports if
+                   (_serial_usb_key(port) == usb_key if usb_key else port.device.upper() == address.upper())]
+        if len(matches) == 1:
+            return matches[0]
+        if time.monotonic() >= deadline:
+            break
+        cancel.wait(min(.25, max(0, deadline - time.monotonic())))
+    if cancel.is_set():
+        raise InterruptedError("COM 복구가 중지되었습니다.")
+    raise ConnectionError(f"{address} USB–RS232 변환기가 Windows에 다시 표시되지 않았습니다.")
+
+
 class SerialEndpoint:
     """Adapt pyserial to the cancellable line reader; an empty read is a timeout."""
     def __init__(self, port):
         self.port = port
 
-    def settimeout(self, timeout):
-        self.port.timeout = timeout
-        self.port.write_timeout = timeout
+    def settimeout(self, _timeout):
+        # The line reader handles the overall deadline. The fixed port timeouts
+        # are configured at open so a read never reconfigures the Windows driver.
+        pass
 
     def recv(self, size):
         if not self.port.is_open:

@@ -1,0 +1,540 @@
+"""Protocols and parsing migrated from v6.10.38. Maintained as normal Python source."""
+from __future__ import annotations
+import os
+import math
+import re
+import sys
+import time
+import socket
+import tempfile
+import ipaddress
+import json
+import threading
+import queue
+import subprocess
+import datetime
+import select
+import struct
+import base64
+from contextlib import ExitStack
+from pathlib import Path
+from dataclasses import dataclass, replace
+from decimal import Decimal, DecimalException
+from typing import Optional, List, Tuple, Dict
+from ..domain.types import DMM_MODELS
+from calibration.instruments.dut import DUTProfile, DUTSession, DUTSettings, _DMM_SOCKET_PORT, _DUT_LAN_MODES, _DUT_VXI11_MODES, _dut_gpib_key
+from calibration.instruments.transport import AutoNetworkAligner, HAS_PYSERIAL, HAS_PYVISA, PYSERIAL_IMPORT_ERROR, PYVISA_IMPORT_ERROR, SharedVisaManager, dependency_import_message, serial
+
+
+@dataclass(frozen=True)
+class DUTDiscoveryCandidate:
+    settings: DUTSettings
+    profile: DUTProfile
+    identity: str
+
+
+def _dut_discovery_check_cancel(cancel):
+    if cancel.is_set():
+        raise InterruptedError("DUT 자동 검색을 중지했습니다.")
+
+
+def _dut_vxi11_port_reply(data, xid):
+    if len(data) < 28:
+        return False
+    received_xid, message_type, reply_state, _verifier_type, verifier_length = struct.unpack_from("!5I", data)
+    if (received_xid, message_type, reply_state) != (xid, 1, 0) or verifier_length > 400:
+        return False
+    offset = 20 + ((verifier_length + 3) & ~3)
+    if len(data) != offset + 8:
+        return False
+    accepted, port = struct.unpack_from("!2I", data, offset)
+    return accepted == 0 and 1 <= port <= 65535
+
+
+def _dut_discover_vxi11(cancel, adapters, diagnostics):
+    # LXI VXI-11 Discovery and Identification Extended Function §10.1.
+    # RFC 1057 Appendix A: portmapper v2 GETPORT, TCP device core v1.
+    interfaces = {}
+    for adapter in adapters:
+        if adapter.get("state") != "Up" or not adapter.get("hardware", True):
+            continue
+        for address in adapter.get("addresses") or ():
+            try:
+                interface = ipaddress.IPv4Interface(f"{address['ip']}/{address['prefix']}")
+            except (KeyError, ValueError):
+                continue
+            if (1 <= interface.network.prefixlen < 31 and not interface.ip.is_loopback
+                    and not interface.ip.is_unspecified and not interface.ip.is_multicast
+                    and interface.ip not in (interface.network.network_address, interface.network.broadcast_address)):
+                interfaces.setdefault(str(interface.ip), interface.network)
+
+    if not interfaces:
+        diagnostics.append("LAN 자동 검색에 사용할 활성 IPv4 어댑터가 없습니다.")
+        return []
+
+    xid = int.from_bytes(os.urandom(4), "big")
+    request = struct.pack("!14I", xid, 0, 2, 100000, 2, 3, 0, 0, 0, 0, 0x0607AF, 1, 6, 0)
+    hosts = set()
+    with ExitStack() as stack:
+        receivers = {}
+        for source, network in list(interfaces.items())[:8]:
+            _dut_discovery_check_cancel(cancel)
+            try:
+                sock = stack.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.settimeout(.2)
+                sock.bind((source, 0))
+                sock.sendto(request, (str(network.broadcast_address), 111))
+                receivers[sock] = network
+            except OSError as exc:
+                diagnostics.append(f"LAN 검색 요청 실패 ({source}): {exc}")
+
+        deadline = time.monotonic() + 1.2
+        while receivers and len(hosts) < 12:
+            _dut_discovery_check_cancel(cancel)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                readable, _, _ = select.select(list(receivers), [], [], min(.1, remaining))
+            except OSError as exc:
+                diagnostics.append(f"LAN 검색 수신 실패: {exc}")
+                break
+            for sock in readable:
+                try:
+                    data, (source, port) = sock.recvfrom(512)
+                except OSError:
+                    continue
+                if port != 111 or source in interfaces or not _dut_vxi11_port_reply(data, xid):
+                    continue
+                host, network = ipaddress.IPv4Address(source), receivers[sock]
+                if host in network and host not in (network.network_address, network.broadcast_address):
+                    hosts.add(source)
+    _dut_discovery_check_cancel(cancel)
+    diagnostics.append(f"같은 네트워크에서 VXI-11 응답 {len(hosts)}개를 받았습니다.")
+    return sorted(hosts, key=ipaddress.IPv4Address)
+
+
+def _dut_discovery_usb_key(resource):
+    match = re.fullmatch(r"USB\d*::(0X[0-9A-F]+|\d+)::(0X[0-9A-F]+|\d+)::([^:]+)(?:::\d+)?::INSTR", resource.upper())
+    if not match:
+        return None
+    vendor, product, serial_no = match.groups()
+    return (int(vendor, 16 if vendor.startswith("0X") else 10),
+            int(product, 16 if product.startswith("0X") else 10), serial_no)
+
+
+def _dut_discovery_ipv4(address):
+    if not isinstance(address, str):
+        return None
+    try:
+        ip = ipaddress.IPv4Address(AutoNetworkAligner.normalize_ipv4(address))
+    except ValueError:
+        return None
+    return None if ip.is_loopback or ip.is_reserved else str(ip)
+
+
+def _dut_discovery_resource_ip(resource):
+    kind, delimiter, rest = resource.upper().partition("::")
+    if delimiter and re.fullmatch(r"TCPIP\d*", kind):
+        return _dut_discovery_ipv4(rest.split("::", 1)[0])
+    return None
+
+
+def _dut_wired_source(host, adapters):
+    target = ipaddress.IPv4Address(host)
+    interfaces = []
+    for adapter in adapters:
+        if adapter.get("state") != "Up" or not adapter.get("wired") or not adapter.get("hardware", True):
+            continue
+        for address in adapter.get("addresses") or ():
+            try:
+                interfaces.append(ipaddress.IPv4Interface(f"{address['ip']}/{address['prefix']}"))
+            except (KeyError, ValueError):
+                continue
+    if any(target == item.ip for item in interfaces):
+        return ""
+    networks = (item for item in interfaces if target in item.network
+                and target not in (item.network.network_address, item.network.broadcast_address))
+    best = max(networks, key=lambda item: item.network.prefixlen, default=None)
+    return str(best.ip) if best else ""
+
+
+def _dut_serial_port_names(excluded_resource, *, usb_only=False):
+    ports = serial.tools.list_ports.comports()
+    excluded_com = excluded_resource.split(" / ", 1)[0]
+    ports = [port for port in ports if port.vid != 0x0F7E
+             and (not usb_only or port.vid is not None)
+             and not (getattr(port, "hwid", "") or "").upper().startswith(("BTHENUM", "BTHLE", "BTHMODEM"))
+             and "bluetooth" not in (getattr(port, "description", "") or "").casefold()]
+    ports.sort(key=lambda port: (port.vid is None, port.device.upper()))
+    return list(dict.fromkeys(port.device.upper() for port in ports if port.device.upper() != excluded_com))
+
+
+def _dut_serial_targets(excluded_resource, diagnostics, *, model_filter="AUTO", usb_only=False):
+    if not HAS_PYSERIAL:
+        diagnostics.append(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
+        return {}
+    try:
+        addresses = _dut_serial_port_names(excluded_resource, usb_only=usb_only)
+    except OSError as exc:
+        diagnostics.append(f"COM 포트 목록을 읽지 못했습니다: {exc}")
+        return {}
+    diagnostics.append(f"자동 검색용 COM 포트 {len(addresses)}개를 확인했습니다.")
+    # Try the PW3390 factory setting before sending at other baud rates.
+    # PPA RS232 and virtual COM settings still use a CR terminator.
+    presets = ((38400, "NONE", "CRLF", 8, "N", 1), (19200, "RTS/CTS", "CR", 8, "N", 1),
+               (19200, "NONE", "CR", 8, "N", 1), (9600, "DTR/DSR", "LF", 7, "E", 2),
+               (9600, "DTR/DSR", "LF", 8, "N", 2), (38400, "RTS/CTS", "CRLF", 8, "N", 1),
+               (19200, "NONE", "CRLF", 8, "N", 1), (19200, "RTS/CTS", "CRLF", 8, "N", 1),
+               (9600, "XON/XOFF", "LF", 8, "N", 1), (9600, "NONE", "CRLF", 8, "N", 1),
+               (9600, "RTS/CTS", "CRLF", 8, "N", 1))
+    if model_filter == "PPA":
+        presets = sorted(presets, key=lambda preset: preset[2] != "CR")
+    elif model_filter == "34401A":
+        presets = sorted(presets, key=lambda preset: preset[1] != "DTR/DSR")
+    return {(address, baud, flow, eol, parity): DUTSettings(
+                mode="SERIAL", address=address, baudrate=baud, flow=flow, eol=eol,
+                data_bits=bits, parity=parity, stop_bits=stop)
+            for baud, flow, eol, bits, parity, stop in presets for address in addresses}
+
+
+def discover_duts(cancel, *, excluded_resource="", excluded_ip="", include_usb=True, include_lan=True,
+                  include_serial=False, include_gpib=False, adapters=None, lan_ip="", saved_lan=None, direct_mask="",
+                  model_filter="AUTO", include_usb_com=False):
+    """Return recognized, closed probe sessions and discovery diagnostics.
+
+    Only try COM ports when automatic discovery found no USB, LAN, or GPIB DUT.
+
+    Direct LAN alignment applies only to the entered instrument address.
+    Literal IPv4 VISA resources avoid probing DNS aliases for the calibrator.
+    An entered LAN address is checked using the supported DUT protocols.
+    The factory PW3390 address is tried on a matching wired subnet.
+    """
+    _dut_discovery_check_cancel(cancel)
+    diagnostics, candidates = [], []
+    resources = ()
+    visa_ready = False
+    if include_usb or include_lan or include_gpib:
+        if not HAS_PYVISA:
+            diagnostics.append(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
+        else:
+            try:
+                manager = SharedVisaManager()
+                visa_ready = True
+                try:
+                    resources = manager.list_resources("?*")
+                finally:
+                    manager.close()
+            except Exception as exc:
+                diagnostics.append(f"VISA 장치 목록을 읽지 못했습니다: {exc}")
+                if not visa_ready:
+                    diagnostics.append("VISA 드라이버를 시작할 수 없습니다. NI-VISA 설치 상태를 확인하세요.")
+    if not (visa_ready or include_serial or include_usb_com or include_lan):
+        return candidates, diagnostics
+
+    _dut_discovery_check_cancel(cancel)
+    excluded_resource = excluded_resource.strip().upper()
+    excluded_usb = _dut_discovery_usb_key(excluded_resource)
+    excluded_gpib = _dut_gpib_key(excluded_resource)
+    excluded_hosts = {_dut_discovery_ipv4(excluded_ip), _dut_discovery_resource_ip(excluded_resource)}
+    entered_host = _dut_discovery_ipv4(lan_ip) if lan_ip else None
+    aligned_source = ""
+    alignment_error = ""
+    if include_lan and direct_mask and entered_host and entered_host not in excluded_hosts:
+        if adapters is None:
+            adapters = AutoNetworkAligner.list_ethernet_interfaces(refresh=True)
+        try:
+            aligned_source = align_dut_direct_lan(entered_host, direct_mask, cancel, adapters)
+        except InterruptedError:
+            raise
+        except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            alignment_error = f"DUT 직결 LAN 설정 실패 · {exc}"
+            diagnostics.append(alignment_error)
+            excluded_hosts.add(entered_host)
+
+    targets = {}
+    listed_gpib = {}
+    listed_lan = {}
+    for resource in resources:
+        resource = resource.strip()
+        upper = resource.upper()
+        if upper == excluded_resource:
+            continue
+        usb_key = _dut_discovery_usb_key(resource) if include_usb else None
+        if usb_key is not None and usb_key != excluded_usb and usb_key[0] != 0x0F7E:
+            targets.setdefault(("VISA", usb_key), DUTSettings(mode="VISA", address=resource, eol="LF"))
+        gpib_key = _dut_gpib_key(resource) if include_gpib else None
+        if gpib_key is not None and gpib_key != excluded_gpib:
+            listed_gpib.setdefault(gpib_key, DUTSettings(mode="GPIB", address=resource, eol="LF"))
+        if not include_lan:
+            continue
+        match = re.fullmatch(r"TCPIP\d*::([^:]+)(?:::([^:]+))?::(INSTR|SOCKET)", upper)
+        if not match:
+            continue
+        host, endpoint, kind = match.groups()
+        host = _dut_discovery_ipv4(host)
+        if host is None or host in excluded_hosts:
+            continue
+        if kind == "INSTR" and endpoint in (None, "INST0"):
+            settings = DUTSettings(mode="VXI11", address=host, eol="LF")
+        elif kind == "SOCKET" and endpoint == "10001":
+            settings = DUTSettings(mode="PPA_LAN", address=host)
+        elif kind == "SOCKET" and endpoint == "10002":
+            settings = DUTSettings(mode="WT5000_TCP", address=host, port=10002, eol="LF")
+        elif kind == "SOCKET" and endpoint == str(_DMM_SOCKET_PORT):
+            settings = DUTSettings(mode="DMM_TCP", address=host, port=_DMM_SOCKET_PORT, eol="LF")
+        elif kind == "SOCKET" and endpoint in ("23", "3390"):
+            settings = DUTSettings(mode="HIOKI_LAN", address=host, port=int(endpoint))
+        else:
+            continue
+        listed_lan.setdefault((settings.mode, host, settings.port), settings)
+
+    usb_count = len(targets)
+    if include_usb and visa_ready:
+        diagnostics.append(f"VISA USB-TMC 후보 {usb_count}개를 확인했습니다.")
+    lan_issues = []
+    if include_lan:
+        if adapters is None:
+            adapters = AutoNetworkAligner.list_ethernet_interfaces()
+            if AutoNetworkAligner.last_error:
+                diagnostics.append(AutoNetworkAligner.last_error)
+        preferred = {}
+        if entered_host and entered_host not in excluded_hosts:
+            source = aligned_source or _dut_wired_source(entered_host, adapters)
+            if saved_lan and _dut_discovery_ipv4(saved_lan.get("ip", "")) == entered_host:
+                try:
+                    previous = DUTSettings(mode=saved_lan["mode"], address=entered_host,
+                                           port=int(saved_lan["port"]), eol=saved_lan["eol"], source_ip=source)
+                    previous.validate()
+                except (KeyError, TypeError, ValueError):
+                    pass
+                else:
+                    if previous.mode in _DUT_LAN_MODES and (visa_ready or previous.mode not in _DUT_VXI11_MODES):
+                        preferred[(previous.mode, entered_host, previous.port)] = previous
+            from .catalog import LAN_PROBES
+            protocols = [*LAN_PROBES, ("HIOKI_LAN", 3390, "CRLF"), ("PPA_LAN", 10001, "CRLF"),
+                         ("DMM_TCP", _DMM_SOCKET_PORT, "LF"), ("HIOKI_LAN", 23, "CRLF"), ("WT5000_TCP", 10002, "LF")]
+            if visa_ready:
+                protocols.append(("VXI11", 10001, "LF"))
+            for mode, port, eol in protocols:
+                preferred.setdefault((mode, entered_host, port), DUTSettings(
+                    mode=mode, address=entered_host, port=port, eol=eol, source_ip=source))
+            diagnostics.append(f"DUT LAN 후보 {entered_host} 확인 · PC {source or 'Windows 기본 경로'}")
+        elif not lan_ip and "192.168.1.1" not in excluded_hosts:
+            source = _dut_wired_source("192.168.1.1", adapters)
+            if source:
+                preferred[("HIOKI_LAN", "192.168.1.1", 3390)] = DUTSettings(
+                    mode="HIOKI_LAN", address="192.168.1.1", port=3390, source_ip=source)
+        if visa_ready:
+            for host in _dut_discover_vxi11(cancel, adapters, diagnostics):
+                if host not in excluded_hosts:
+                    settings = DUTSettings(mode="VXI11", address=host, eol="LF")
+                    targets.setdefault(("VXI11", host, settings.port), settings)
+        for key, settings in listed_lan.items():
+            targets.setdefault(key, settings)
+        for key, settings in targets.items():
+            preferred.setdefault(key, settings)
+        targets = preferred
+    if include_gpib and visa_ready:
+        diagnostics.append(f"VISA GPIB 후보 {len(listed_gpib)}개를 확인했습니다.")
+        targets.update({("GPIB", key): settings for key, settings in listed_gpib.items()})
+    serial_targets = (_dut_serial_targets(excluded_resource, diagnostics, model_filter=model_filter,
+                                          usb_only=not include_serial)
+                      if include_serial or include_usb_com else {})
+    targets.update(serial_targets)
+
+    deadline = time.monotonic() + 8.0
+    identified_addresses = set()
+    attempts = 0
+    lan_families = {"PPA_LAN": "PPA", "WT5000_TCP": "WT", "WT_LAN": "WT",
+                    "HIOKI_LAN": "HIOKI", "DMM_TCP": "DMM"}
+    family = "DMM" if model_filter in DMM_MODELS else model_filter
+    for settings in targets.values():
+        _dut_discovery_check_cancel(cancel)
+        if settings.mode == "SERIAL" and candidates and candidates[0].settings.mode != "SERIAL":
+            diagnostics.append("USB/LAN/GPIB에서 DUT를 확인해 COM 자동 탐색을 생략했습니다.")
+            break
+        address_key = settings.address if settings.mode != "VISA" else None
+        if address_key is not None and address_key in identified_addresses:
+            continue
+        # On an entered LAN address, spend the probe budget on the requested family.
+        if family != "AUTO" and settings.mode in lan_families and family != lan_families[settings.mode]:
+            continue
+        if attempts >= 12 or time.monotonic() >= deadline:
+            diagnostics.append("자동 확인 범위에 도달했습니다. 표시되지 않은 장비는 주소를 직접 입력하세요.")
+            break
+        attempts += 1
+        probe = DUTSession()
+        probe.cancel = cancel
+        try:
+            identity = probe.connect(replace(settings, timeout=1.0))
+            if address_key is not None:
+                identified_addresses.add(address_key)
+            if not probe.profile.matches(model_filter):
+                diagnostics.append(f"{settings.address} · {probe.profile.model} 응답 (선택한 {model_filter} 검색 계속)")
+                continue
+            candidates.append(DUTDiscoveryCandidate(settings, probe.profile, identity))
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            reason = str(exc).splitlines()[0][:160] if str(exc) else type(exc).__name__
+            diagnostics.append(f"{settings.address}: {reason}")
+            if entered_host and settings.address == entered_host:
+                lan_issues.append(reason)
+        finally:
+            probe.disconnect()
+
+    _dut_discovery_check_cancel(cancel)
+    if candidates:
+        diagnostics.append(f"식별이 확인된 DUT {len(candidates)}대가 있습니다.")
+    else:
+        message = ""
+        if include_usb and visa_ready:
+            message = ("USB 계측기는 목록에 있지만 지원 DUT로 식별되지 않았습니다. 본체의 USB 원격 설정과 통신 기록을 확인하세요."
+                       if usb_count else
+                       "VISA 목록에 USB DUT가 없습니다. 케이블과 본체의 USB 원격 설정을 확인하세요.")
+        if include_lan:
+            message += (" " if message else "") + "LAN 연결이면 LAN 설정의 IP에 본체 주소를 입력하고 다시 연결하세요."
+        if include_gpib and visa_ready:
+            message += (" " if message else "") + "GPIB에서 찾지 못한 DUT는 본체 주소를 직접 입력하세요."
+        if include_serial or include_usb_com:
+            message += (" " if message else "") + (
+                "COM에서 찾지 못한 DUT는 RS232 방식을 선택해 본체 통신 설정과 맞추세요." if serial_targets else
+                "DUT용 COM 포트가 없습니다. USB–RS232 변환기 연결과 장치 관리자에서 COM 포트가 생기는지 확인하세요.")
+        if lan_issues:
+            message = f"LAN {entered_host}에서 장비 응답을 확인하지 못했습니다. {lan_issues[0]} {message}"
+        diagnostics.append(f"{alignment_error} {message}".strip())
+    return candidates, diagnostics
+
+
+def _dut_direct_lan_plan(host, mask, adapters):
+    target = ipaddress.IPv4Address(host)
+    network = ipaddress.IPv4Network(f"{target}/{mask}", strict=False)
+    if not 1 <= network.prefixlen <= 31:
+        raise ValueError("DUT에 설정된 서브넷 마스크를 입력하세요. 예 255.255.255.0")
+    if network.prefixlen <= 30 and target in (network.network_address, network.broadcast_address):
+        raise ValueError("DUT의 실제 호스트 IP와 서브넷 마스크를 확인하세요.")
+    local = {ipaddress.IPv4Address(item["ip"]) for nic in adapters for item in nic.get("addresses", ())}
+    if target in local:
+        raise ValueError("DUT IP가 PC 주소와 같습니다. 본체 IP를 확인하세요.")
+    wired = [nic for nic in adapters if nic.get("wired") and nic.get("hardware", True) and nic.get("state") == "Up"]
+    for nic in wired:
+        for item in nic.get("addresses", ()):
+            interface = ipaddress.IPv4Interface(f"{item['ip']}/{item['prefix']}")
+            if target in interface.network and interface.ip in network:
+                return str(interface.ip), None, ()
+    if len(wired) != 1:
+        raise ConnectionError("직결 DUT에 사용할 유선 랜카드를 한 개만 연결하세요. 공유망이면 직결 LAN을 해제하세요.")
+    # Stable candidates make it possible to reuse a previous /32 address.
+    if network.prefixlen == 31:
+        candidates = (str(ipaddress.IPv4Address(int(target) ^ 1)),)
+    else:
+        base = int(network.network_address)
+        local_block = int(target) & ~255
+        candidate_numbers = (local_block + 100, local_block + 101, local_block + 102,
+                             base + 1, base + 2, int(network.broadcast_address) - 1)
+        candidates = tuple(dict.fromkeys(str(ipaddress.IPv4Address(address)) for address in candidate_numbers
+            if base < address < int(network.broadcast_address) and address != int(target)))
+    return "", int(wired[0]["idx"]), candidates
+
+
+def _dut_configure_host_route(host, adapter, candidates):
+    if sys.platform != "win32":
+        raise ConnectionError("직결 LAN 자동 맞춤은 Windows에서 지원합니다.")
+    # All interpolated arguments are validated IPv4 addresses or a numeric adapter index.
+    destination = f"{ipaddress.IPv4Address(host)}/32"
+    addresses = ",".join(f"'{ipaddress.IPv4Address(address)}'" for address in candidates)
+    setup = f"""
+$ErrorActionPreference = 'Stop'
+$nicIndex = {int(adapter)}
+$destination = '{destination}'
+$candidates = @({addresses})
+$created = $null
+try {{
+    $nic = Get-NetAdapter -InterfaceIndex $nicIndex
+    if (-not $nic.HardwareInterface -or $nic.NdisPhysicalMedium -ne 14 -or $nic.Status -ne 'Up') {{ exit 3 }}
+    if ((Get-NetIPInterface -InterfaceIndex $nicIndex -AddressFamily IPv4).Dhcp -ne 'Disabled') {{ exit 4 }}
+    $routes = @(Get-NetRoute -DestinationPrefix $destination -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+    $onLink = @($routes | Where-Object {{ $_.InterfaceIndex -eq $nicIndex -and $_.NextHop -eq '0.0.0.0' }})
+    if ($routes.Count -ne $onLink.Count) {{ exit 5 }}
+    $source = $null
+    foreach ($address in $candidates) {{
+        $existing = @(Get-NetIPAddress -IPAddress $address -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+        $ownedOnLink = $existing | Where-Object {{ $_.InterfaceIndex -eq $nicIndex -and $_.PrefixLength -eq 32 -and $_.AddressState -eq 'Preferred' }}
+        if ($ownedOnLink) {{ $source = $address; break }}
+        if ($existing) {{ continue }}
+        New-NetIPAddress -InterfaceIndex $nicIndex -IPAddress $address -PrefixLength 32 -PolicyStore ActiveStore | Out-Null
+        $created = $address
+        for ($i = 0; $i -lt 30; $i++) {{
+            $state = (Get-NetIPAddress -InterfaceIndex $nicIndex -IPAddress $address -PolicyStore ActiveStore).AddressState
+            if ($state -eq 'Preferred') {{ $source = $address; break }}
+            if ($state -eq 'Duplicate') {{ break }}
+            Start-Sleep -Milliseconds 100
+        }}
+        if ($source) {{ break }}
+        Remove-NetIPAddress -InterfaceIndex $nicIndex -IPAddress $address -PolicyStore ActiveStore -Confirm:$false
+        $created = $null
+    }}
+    if (-not $source) {{ exit 6 }}
+    if (-not $onLink) {{
+        New-NetRoute -DestinationPrefix $destination -InterfaceIndex $nicIndex -NextHop 0.0.0.0 -PolicyStore ActiveStore | Out-Null
+    }}
+}} catch {{
+    if ($created) {{
+        Remove-NetIPAddress -InterfaceIndex $nicIndex -IPAddress $created -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue
+    }}
+    exit 7
+}}
+"""
+    inspect = f"""
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$route = Get-NetRoute -DestinationPrefix '{destination}' -InterfaceIndex {int(adapter)} -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.NextHop -eq '0.0.0.0' }}
+if ($route) {{
+    foreach ($address in @({addresses})) {{
+        $ip = Get-NetIPAddress -InterfaceIndex {int(adapter)} -IPAddress $address -PolicyStore ActiveStore -ErrorAction SilentlyContinue
+        if ($ip -and $ip.PrefixLength -eq 32 -and $ip.AddressState -eq 'Preferred') {{ $address; break }}
+    }}
+}}
+"""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    command = ["powershell.exe", "-NoProfile", "-NonInteractive"]
+
+    def source_address():
+        check = subprocess.run(command + ["-Command", inspect], capture_output=True, timeout=10, creationflags=flags)
+        source = check.stdout.decode("utf-8-sig", errors="replace").strip()
+        return source if check.returncode == 0 and source in candidates else ""
+
+    source = source_address()
+    if source:
+        return source
+    encoded = base64.b64encode(setup.encode("utf-16-le")).decode("ascii")
+    launch = (
+        "try { $p = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs "
+        f"-ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{encoded}') "
+        "-WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode } catch { exit 2 }"
+    )
+    try:
+        status = subprocess.run(command + ["-Command", launch], capture_output=True, timeout=55, creationflags=flags)
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("Windows 관리자 승인 또는 유선 설정 확인 시간이 초과됐습니다.") from exc
+    messages = {2: "Windows 관리자 승인을 확인하세요.", 3: "유선 연결 상태를 확인하세요.",
+                4: "이더넷에서 DHCP가 켜져 있습니다. 고정 IP가 설정된 직결 포트를 사용하세요.",
+                5: "DUT IP에 기존의 개별 경로가 있습니다.", 6: "사용할 수 있는 보조 IPv4 주소가 없습니다."}
+    if status.returncode:
+        raise ConnectionError(messages.get(status.returncode, "Windows가 DUT용 보조 IP 또는 경로 추가를 거부했습니다."))
+    source = source_address()
+    if not source:
+        raise ConnectionError("추가한 DUT 전용 유선 경로를 확인할 수 없습니다.")
+    return source
+
+
+def align_dut_direct_lan(host, mask, cancel, adapters=None):
+    _dut_discovery_check_cancel(cancel)
+    adapters = AutoNetworkAligner.list_ethernet_interfaces(refresh=True) if adapters is None else adapters
+    source, adapter, candidates = _dut_direct_lan_plan(host, mask, adapters)
+    if not source:
+        source = _dut_configure_host_route(host, adapter, candidates)
+    _dut_discovery_check_cancel(cancel)
+    return source

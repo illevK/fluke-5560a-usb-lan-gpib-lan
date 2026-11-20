@@ -1,0 +1,135 @@
+import base64
+
+
+def _dut_direct_lan_plan(host, mask, adapters):
+    target = ipaddress.IPv4Address(host)
+    network = ipaddress.IPv4Network(f"{target}/{mask}", strict=False)
+    if not 1 <= network.prefixlen <= 31:
+        raise ValueError("DUT에 설정된 서브넷 마스크를 입력하세요. 예 255.255.255.0")
+    if network.prefixlen <= 30 and target in (network.network_address, network.broadcast_address):
+        raise ValueError("DUT의 실제 호스트 IP와 서브넷 마스크를 확인하세요.")
+    local = {ipaddress.IPv4Address(item["ip"]) for nic in adapters for item in nic.get("addresses", ())}
+    if target in local:
+        raise ValueError("DUT IP가 PC 주소와 같습니다. 본체 IP를 확인하세요.")
+    wired = [nic for nic in adapters if nic.get("wired") and nic.get("hardware", True) and nic.get("state") == "Up"]
+    for nic in wired:
+        for item in nic.get("addresses", ()):
+            interface = ipaddress.IPv4Interface(f"{item['ip']}/{item['prefix']}")
+            if target in interface.network and interface.ip in network:
+                return str(interface.ip), None, ()
+    if len(wired) != 1:
+        raise ConnectionError("직결 DUT에 사용할 유선 랜카드를 한 개만 연결하세요. 공유망이면 직결 LAN을 해제하세요.")
+    # Stable candidates make it possible to reuse a previous /32 address.
+    if network.prefixlen == 31:
+        candidates = (str(ipaddress.IPv4Address(int(target) ^ 1)),)
+    else:
+        base = int(network.network_address)
+        local_block = int(target) & ~255
+        candidate_numbers = (local_block + 100, local_block + 101, local_block + 102,
+                             base + 1, base + 2, int(network.broadcast_address) - 1)
+        candidates = tuple(dict.fromkeys(str(ipaddress.IPv4Address(address)) for address in candidate_numbers
+            if base < address < int(network.broadcast_address) and address != int(target)))
+    return "", int(wired[0]["idx"]), candidates
+
+
+def _dut_configure_host_route(host, adapter, candidates):
+    if sys.platform != "win32":
+        raise ConnectionError("직결 LAN 자동 맞춤은 Windows에서 지원합니다.")
+    # All interpolated arguments are validated IPv4 addresses or a numeric adapter index.
+    destination = f"{ipaddress.IPv4Address(host)}/32"
+    addresses = ",".join(f"'{ipaddress.IPv4Address(address)}'" for address in candidates)
+    setup = f"""
+$ErrorActionPreference = 'Stop'
+$nicIndex = {int(adapter)}
+$destination = '{destination}'
+$candidates = @({addresses})
+$created = $null
+try {{
+    $nic = Get-NetAdapter -InterfaceIndex $nicIndex
+    if (-not $nic.HardwareInterface -or $nic.NdisPhysicalMedium -ne 14 -or $nic.Status -ne 'Up') {{ exit 3 }}
+    if ((Get-NetIPInterface -InterfaceIndex $nicIndex -AddressFamily IPv4).Dhcp -ne 'Disabled') {{ exit 4 }}
+    $routes = @(Get-NetRoute -DestinationPrefix $destination -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+    $onLink = @($routes | Where-Object {{ $_.InterfaceIndex -eq $nicIndex -and $_.NextHop -eq '0.0.0.0' }})
+    if ($routes.Count -ne $onLink.Count) {{ exit 5 }}
+    $source = $null
+    foreach ($address in $candidates) {{
+        $existing = @(Get-NetIPAddress -IPAddress $address -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+        $ownedOnLink = $existing | Where-Object {{ $_.InterfaceIndex -eq $nicIndex -and $_.PrefixLength -eq 32 -and $_.AddressState -eq 'Preferred' }}
+        if ($ownedOnLink) {{ $source = $address; break }}
+        if ($existing) {{ continue }}
+        New-NetIPAddress -InterfaceIndex $nicIndex -IPAddress $address -PrefixLength 32 -PolicyStore ActiveStore | Out-Null
+        $created = $address
+        for ($i = 0; $i -lt 30; $i++) {{
+            $state = (Get-NetIPAddress -InterfaceIndex $nicIndex -IPAddress $address -PolicyStore ActiveStore).AddressState
+            if ($state -eq 'Preferred') {{ $source = $address; break }}
+            if ($state -eq 'Duplicate') {{ break }}
+            Start-Sleep -Milliseconds 100
+        }}
+        if ($source) {{ break }}
+        Remove-NetIPAddress -InterfaceIndex $nicIndex -IPAddress $address -PolicyStore ActiveStore -Confirm:$false
+        $created = $null
+    }}
+    if (-not $source) {{ exit 6 }}
+    if (-not $onLink) {{
+        New-NetRoute -DestinationPrefix $destination -InterfaceIndex $nicIndex -NextHop 0.0.0.0 -PolicyStore ActiveStore | Out-Null
+    }}
+}} catch {{
+    if ($created) {{
+        Remove-NetIPAddress -InterfaceIndex $nicIndex -IPAddress $created -PolicyStore ActiveStore -Confirm:$false -ErrorAction SilentlyContinue
+    }}
+    exit 7
+}}
+"""
+    inspect = f"""
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$route = Get-NetRoute -DestinationPrefix '{destination}' -InterfaceIndex {int(adapter)} -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.NextHop -eq '0.0.0.0' }}
+if ($route) {{
+    foreach ($address in @({addresses})) {{
+        $ip = Get-NetIPAddress -InterfaceIndex {int(adapter)} -IPAddress $address -PolicyStore ActiveStore -ErrorAction SilentlyContinue
+        if ($ip -and $ip.PrefixLength -eq 32 -and $ip.AddressState -eq 'Preferred') {{ $address; break }}
+    }}
+}}
+"""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    command = ["powershell.exe", "-NoProfile", "-NonInteractive"]
+
+    def source_address():
+        check = subprocess.run(command + ["-Command", inspect], capture_output=True, timeout=10, creationflags=flags)
+        source = check.stdout.decode("utf-8-sig", errors="replace").strip()
+        return source if check.returncode == 0 and source in candidates else ""
+
+    source = source_address()
+    if source:
+        return source
+    encoded = base64.b64encode(setup.encode("utf-16-le")).decode("ascii")
+    launch = (
+        "try { $p = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -Verb RunAs "
+        f"-ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{encoded}') "
+        "-WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode } catch { exit 2 }"
+    )
+    try:
+        status = subprocess.run(command + ["-Command", launch], capture_output=True, timeout=55, creationflags=flags)
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError("Windows 관리자 승인 또는 유선 설정 확인 시간이 초과됐습니다.") from exc
+    messages = {2: "Windows 관리자 승인을 확인하세요.", 3: "유선 연결 상태를 확인하세요.",
+                4: "이더넷에서 DHCP가 켜져 있습니다. 고정 IP가 설정된 직결 포트를 사용하세요.",
+                5: "DUT IP에 기존의 개별 경로가 있습니다.", 6: "사용할 수 있는 보조 IPv4 주소가 없습니다."}
+    if status.returncode:
+        raise ConnectionError(messages.get(status.returncode, "Windows가 DUT용 보조 IP 또는 경로 추가를 거부했습니다."))
+    source = source_address()
+    if not source:
+        raise ConnectionError("추가한 DUT 전용 유선 경로를 확인할 수 없습니다.")
+    return source
+
+
+def align_dut_direct_lan(host, mask, cancel, adapters=None):
+    _dut_discovery_check_cancel(cancel)
+    adapters = AutoNetworkAligner.list_ethernet_interfaces(refresh=True) if adapters is None else adapters
+    source, adapter, candidates = _dut_direct_lan_plan(host, mask, adapters)
+    if not source:
+        source = _dut_configure_host_route(host, adapter, candidates)
+    _dut_discovery_check_cancel(cancel)
+    return source
+
+

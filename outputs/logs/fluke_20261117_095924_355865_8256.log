@@ -1,0 +1,18 @@
+[2026-11-17T09:59:24.357] [RS232 연결 시도] COM7 / 9600 / 8N1 / XON/XOFF / CRLF
+[2026-11-17T09:59:24.363] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T09:59:24.364] RX << 0,"No error" | ERR? | 0.001s
+[2026-11-17T09:59:24.365] TX COMMAND >> OUT 1 A, 60 HZ; CUR_POST AUX; OPER
+[2026-11-17T09:59:24.366] TX QUERY >> *OPC? | timeout=1
+[2026-11-17T09:59:24.367] RX << !> Compliance voltage exceeded | *OPC? | 0.001s
+[2026-11-17T09:59:24.368] [출력 상태 미확인] 기준기 응답이 끊겼습니다. 본체에서 STBY를 확인하세요.
+[2026-11-17T09:59:24.372] TX COMMAND >> STBY
+[2026-11-17T09:59:24.373] TX QUERY >> *IDN? | STBY 복구
+[2026-11-17T09:59:24.375] RX << FLUKE,5522A,TEST,1.0 | STBY 복구
+[2026-11-17T09:59:24.376] TX QUERY >> OPER? | timeout=2.9973217000369914
+[2026-11-17T09:59:24.377] RX << 0 | OPER? | 0.001s
+[2026-11-17T09:59:24.379] TX QUERY >> ERR? | timeout=2.9949509000289254
+[2026-11-17T09:59:24.380] RX << 0,"No error" | ERR? | 0.001s
+[2026-11-17T09:59:24.381] 명령 [OUT 1 A, 60 HZ; CUR_POST AUX; OPER] / 0.005초 경과 / 완료 대기 한도 1초: InstrumentReplyError: 명령 처리 완료를 확인하지 못했습니다. 장비 응답: !> Compliance voltage exceeded
+5522A 응답 0,"No error". STBY 확인 완료, 연결 유지. 다음 행은 실행하지 않습니다.
+[2026-11-17T09:59:24.382] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T09:59:24.383] RX << 0 | OPER? | 0.001s

@@ -209,7 +209,7 @@ source = source.replace('v6.0.0', 'v6.1.0')
 source = source.replace('v6.1.0', 'v6.1.1')
 from enhance_units_grid import enhance_source
 source = enhance_source(source, root)
-source = source.replace('v6.2.0', 'v6.10.26')
+source = source.replace('v6.2.0', 'v6.10.38')
 source = source.replace('''        def _handle_row_direct_start(self, r_idx: int) -> None:
             self.excel_grid.selected_row_idx = r_idx''', '''        def _handle_row_direct_start(self, r_idx: int) -> None:
             step = self.seq_steps[r_idx]
@@ -223,7 +223,7 @@ source = re.sub(r'^( +)self\.seq_steps = (?:steps|\[\])\n',
                 lambda match: match[0] + match[1] + 'self._original_row_positions = None\n', source, flags=re.M)
 source = source.replace('class Fluke5560AConnectionManager:',
     ''.join((root / 'work' / fragment).read_text(encoding='utf-8').rstrip() + '\n\n'
-            for fragment in ('dut_support.pyfrag', 'dut_discovery.pyfrag'))
+            for fragment in ('dut_support.pyfrag', 'dut_discovery.pyfrag', 'dut_direct_lan.pyfrag'))
     + 'class Fluke5560AConnectionManager:', 1)
 source = source.replace('        def _build_ui(self):', (root / 'work/dut_ui.pyfrag').read_text(encoding='utf-8') + '        def _build_ui(self):', 1)
 source = source.replace('            self._on_seq_stop_auto(silent=True)\n            try:\n                self.conn_mgr.disconnect()', '            self._on_seq_stop_auto(silent=True)\n            if not self._dut_close_ready():\n                self.after(200, self._on_close)\n                return\n            try:\n                self.conn_mgr.disconnect()', 1)
@@ -238,8 +238,22 @@ for statement in ('                rebuilt_steps.append(rebuilt)',
     source = source.replace(statement, line + statement, 1)
 source = source.replace('                self.seq_steps[start_row_idx:start_row_idx + len(new_steps)] = new_steps',
     '                for new_step, old_step in zip(new_steps, self.seq_steps[start_row_idx:start_row_idx + len(new_steps)]):\n'
-    '                    new_step.dut_channel = old_step.dut_channel\n'
+    '                    if new_step.channel_hint is None:\n'
+    '                        new_step.channel_hint = old_step.channel_hint\n'
+    '                    if new_step.channel_hint == old_step.channel_hint:\n'
+    '                        new_step.dut_channel = old_step.dut_channel\n'
+    '                        new_step.dut_channel_suffix = old_step.dut_channel_suffix\n'
     '                self.seq_steps[start_row_idx:start_row_idx + len(new_steps)] = new_steps', 1)
+source = re.sub(r'^( +)([\w.\[\]]+)\.dut_channel = st\.dut_channel$', lambda m:
+    m[0] + f'\n{m[1]}{m[2]}.dut_channel_suffix = st.dut_channel_suffix\n{m[1]}{m[2]}.channel_hint = st.channel_hint',
+    source, flags=re.M)
+source = source.replace('model=self._selected_model(), step_no=step_num,\n',
+                        'model=self._selected_model(), step_no=step_num, declared_kind=declared_kinds[offset],\n', 1)
+for index in ('target_idx + 1', 'st.step_no'):
+    source = source.replace(f'model=self._selected_model(), step_no={index},',
+                            f'model=self._selected_model(), step_no={index}, declared_kind=st.declared_kind,')
+source = re.sub(r'^( +)([\w.\[\]]+)\.channel_hint = st\.channel_hint$', r'\g<0>\n\1\2.declared_kind = st.declared_kind',
+                source, flags=re.M)
 compile(source, 'fluke_5560a_controller.py', 'exec')
 (root / 'outputs/fluke_5560a_controller.py').write_text(source, encoding='utf-8')
 print('Built outputs/fluke_5560a_controller.py')

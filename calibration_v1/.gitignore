@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+test-data/
+*-test-results.txt
+*-results.txt
+self-check*.json
+preview*.png
+empty*.png
+*.spec

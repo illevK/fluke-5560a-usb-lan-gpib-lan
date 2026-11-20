@@ -16,6 +16,9 @@
             start = tk.StringVar(dialog, value="1")
             end = tk.StringVar(dialog, value=str(len(self.seq_steps)))
             first_channel = tk.StringVar(dialog, value=str(channels[0]))
+            applied_extra = {step.dut_channel for step in self.seq_steps
+                             if step.dut_channel_suffix and step.dut_channel in channels}
+            extra_input = tk.StringVar(dialog, value=f"{next(iter(applied_extra))}@" if len(applied_extra) == 1 else "표기대로")
             mode = tk.StringVar(dialog, value="7항목 자동 감지")
             preview = tk.StringVar(dialog, value="배정할 행 범위와 첫 채널을 정한 뒤 미리보기를 누르세요.")
             plan = {}
@@ -29,6 +32,10 @@
             self._ui_label(settings, "행")
             self._ui_label(settings, "첫 채널")
             channel_input = self._ui_combo(settings, first_channel, channels, 4)
+            extra_row = ttk.Frame(body)
+            extra_row.pack(fill="x", pady=(5, 0))
+            self._ui_label(extra_row, "추가 구간 DUT 입력")
+            extra_combo = self._ui_combo(extra_row, extra_input, ("표기대로", *(f"{channel}@" for channel in channels)), 9)
             review_frame = ttk.Frame(body)
             review_frame.pack(fill="x", pady=12)
             display = tk.Text(review_frame, height=11, width=62, wrap="word", relief="flat", padx=5, pady=5)
@@ -52,6 +59,7 @@
                 preview.set("미리보기를 눌러 배정을 확인하세요.")
                 apply_button.state(["disabled"])
                 channel_input.configure(state="disabled" if mode.get() == "배정 해제" else "readonly")
+                extra_combo.configure(state="readonly" if mode.get() == "7항목 자동 감지" else "disabled")
 
             def review():
                 invalidate()
@@ -72,19 +80,38 @@
                             raise ValueError("배정할 측정 행이 없습니다.")
                         sections = [("배정 해제" if clear else "선택 범위", [rows])]
                     available = (None,) if clear else channels[channels.index(int(first_channel.get())):]
+                    extra_channel = int(extra_input.get()[:-1]) if automatic and extra_input.get().endswith("@") else None
                 except ValueError as exc:
                     preview.set(str(exc))
                     return
                 descriptions = []
+                known_orders = {}
+                for _, blocks in sections:
+                    hints = tuple(selection[block[0]].channel_hint for block in blocks)
+                    if automatic and all(hints):
+                        known_orders.setdefault(len(hints), set()).add(hints)
                 for name, blocks in sections:
-                    if len(blocks) > len(available):
-                        descriptions.append(f"{name} · 반복 {len(blocks)}개, 사용 가능한 채널 {len(available)}개 · 배정 보류")
-                        continue
+                    hints = tuple(selection[block[0]].channel_hint for block in blocks)
+                    templates = known_orders.get(len(blocks), set())
+                    if automatic and not any(hints) and len(templates) == 1:
+                        hints = next(iter(templates))
                     ranges = []
-                    for block, channel in zip(blocks, available):
+                    extra_number = 0
+                    for position, block in enumerate(blocks):
                         indices = [index + left for index in block]
-                        plan.update((index, channel) for index in indices)
-                        prefix = f"CH{channel} " if channel is not None else ""
+                        hint = hints[position] if automatic else None
+                        if (hint and hint[1]) or (hint is None and position >= len(available)):
+                            extra_number += 1
+                            channel = extra_channel if extra_channel is not None else hint[0] if hint else None
+                            suffix = "@" if extra_number == 1 else f"@{extra_number}"
+                        else:
+                            channel, suffix = hint if hint else (available[position], "")
+                        if not clear and channel not in channels:
+                            ranges.append(f"{channel_row_ranges(indices)}행 보류")
+                            continue
+                        key = (channel, suffix) if channel is not None else None
+                        plan.update((index, key) for index in indices)
+                        prefix = f"{channel_name(key)} " if key is not None else ""
                         ranges.append(f"{prefix}{channel_row_ranges(indices)}행")
                     descriptions.append(f"{name} · {' / '.join(ranges)}")
                 if automatic:
@@ -92,7 +119,7 @@
                     if rows > len(plan):
                         descriptions.append(f"자동 배정 보류 {rows - len(plan)}행")
                 recorded = sum(bool(self.seq_steps[index].measured_raw)
-                               for index, channel in plan.items() if self.seq_steps[index].dut_channel != channel)
+                               for index, key in plan.items() if self.seq_steps[index].channel_key != key)
                 if recorded:
                     descriptions.append(f"측정값이 있는 {recorded}행의 채널 배정이 바뀝니다. 기존 측정값은 유지됩니다.")
                 preview.set("\n".join(descriptions))
@@ -110,18 +137,20 @@
             apply_button = self._ui_button(actions, "적용", apply, "Primary.TButton")
             apply_button.state(["disabled"])
             self._ui_button(actions, "닫기", dialog.destroy, side="right")
-            for field in (start, end, first_channel, mode):
+            for field in (start, end, first_channel, mode, extra_input):
                 field.trace_add("write", invalidate)
             review()
             dialog.wait_visibility()
             dialog.grab_set()
 
         def _apply_channel_assignment(self, plan):
-            for index, channel in plan.items():
+            for index, key in plan.items():
+                channel, suffix = key if isinstance(key, tuple) else (key, "")
                 self.seq_steps[index].dut_channel = channel
+                self.seq_steps[index].dut_channel_suffix = suffix
             self.excel_grid.render_steps(self.seq_steps, active_idx=self.seq_current_idx)
-            channels = sorted({channel for channel in plan.values() if channel is not None})
-            summary = " · ".join(f"CH{channel}" for channel in channels) or "채널 배정 해제"
+            channels = sorted({self.seq_steps[index].channel_key for index in plan if self.seq_steps[index].channel_key})
+            summary = " · ".join(map(channel_name, channels)) or "채널 배정 해제"
             self.var_active_row_banner.set(f"{summary} · {len(plan)}행 적용")
             self._log(f"[DUT 채널 배정] {summary} · {len(plan)}행")
 

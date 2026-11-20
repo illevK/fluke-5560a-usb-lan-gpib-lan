@@ -1,0 +1,15 @@
+{
+  "version": "6.10.38",
+  "source_sha256": "40e244ad11862b8eea364cde09449ea0d8885119b684d4fcd8a96b1030938cbc",
+  "modules": [
+    "instruments.transport",
+    "domain.types",
+    "domain.clipboard",
+    "domain.units",
+    "domain.commands",
+    "domain.groups",
+    "instruments.dut",
+    "instruments.discovery",
+    "instruments.fluke"
+  ]
+}

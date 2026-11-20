@@ -1,0 +1,102 @@
+{
+  "version": "1.0.5",
+  "recorded_utc": "2026-11-20T01:22:56.374086+00:00",
+  "artifact": "C:\\Users\\HCT-2714\\Documents\\교정자동화 배포본\\교정자동화.exe",
+  "desktop": "C:\\Users\\HCT-2714\\Desktop\\교정자동화.exe",
+  "artifact_sha256": "c6de83e00fd8378379c222750651f0a387efe6c530cf699dc729783cfddd379c",
+  "release_copy_verified": true,
+  "desktop_copy_verified": true,
+  "test_count": 29,
+  "test_scope": [
+    "five calibrator models and supported ports, front-panel and PC instructions",
+    "failed AUTO search, manual port selection and explicit retry, preserving cancellation and standby recovery",
+    "verified unit and interface records, legacy routes, serial framing, LAN binding and VISA addresses",
+    "connection dialogs for DUTs and unaffected serial, USB and GPIB connection policies"
+  ],
+  "additional_checks": {
+    "failed_auto_to_5080a_lan_via_modal_dialog": "localhost simulator, retry, view past settings and disconnect",
+    "existing_5080a_route_import": "verified on an isolated copy of the previous connection cache",
+    "packaged_sources_match": true
+  },
+  "physical_device_connection_tested": false,
+  "hardware_output_tested": false,
+  "packaged_check": {
+    "version": "1.0.5",
+    "passed": true,
+    "window_title": "교정자동화 · v1.0.5",
+    "calibrator_choice": "5730A",
+    "copied_rows": [
+      "[미리보기] 0.999 V",
+      "[미리보기] 0.999 V"
+    ],
+    "calibrator_connection_guide": true,
+    "cleared_sheet_preserving_setup": true,
+    "timed_run_without_entry": true,
+    "dut_choices": [
+      "AUTO",
+      "WT",
+      "PPA",
+      "HIOKI",
+      "34401A",
+      "34461A",
+      "34465A"
+    ],
+    "calibrator_only_entries": [
+      "0.999 V",
+      "0.999 V"
+    ],
+    "empty_start_rows": 0,
+    "tk_loaded": false,
+    "simulated_only": true,
+    "state": "완료",
+    "packaged_seconds": 5.15,
+    "exe_bytes": 39195459,
+    "console": false,
+    "native_windows_plugin": true,
+    "communication_modules_bundled": true
+  },
+  "references": {
+    "5560A": "https://media.fluke.com/98e20aac-6ee7-4151-8b35-b2fb011adb6b_original%20file.pdf",
+    "5730A": "https://media.fluke.com/93510cc7-9ea1-4f36-8729-b10800c20179_original%20file.pdf",
+    "5522A": "https://media.fluke.com/841a8540-b353-4771-97ac-b10800c1f117_original%20file.pdf",
+    "5520A": "https://assets.fluke.com/manuals/5520a___omeng0600.pdf",
+    "5080A": "https://media.fluke.com/aa256607-6893-43bd-991e-b10800c1d4d6_original%20file.pdf"
+  },
+  "source_sha256": {
+    "app.py": "059c9ae65759fbc8513f812852ec7e550c6aa56e951dcc7d82dd08e481976461",
+    "build.py": "f90b234b98c51442e1cd79a09f5d8c48319227dd5a933129982e7bdd240f68ac",
+    "verify_release.py": "a9a6f58e88a98828cb0f832ff54f2797194eddf5a657aa6eb0ad45a89ce3aa92",
+    "requirements.txt": "243ae44c48bc969495859682e92e6dc7bc890a84b0af11473f2044cbb37156d7",
+    "assets\\version_info.txt": "f4fc722d3e6a457e6dfdc4554421404b4d6a18bedd87ce7864ab445bf8046fd0",
+    "THIRD_PARTY_NOTICES.md": "e99432779ff7a386a1c89b9b9838bc1f87335f99c313bf90a24caf4157dfdfea",
+    "tests\\test_calibrator_setup.py": "0be5a89e667979cb98837381e07e869f9602dae945193b9ba70c9d93eca8617e",
+    "calibration\\__init__.py": "036872a3bb28d1e9213202ea5fba02a1066af5e37c82bbcc15a9cf3cc0d70fbc",
+    "calibration\\domain\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\domain\\clipboard.py": "ff4158797b285a89b863ff0522888abddfddafef78fa0b9895af9d40f0d2eb6a",
+    "calibration\\domain\\commands.py": "0a4df9a030ac49ad184ad5e7e0fddacc4633cf9f702e3596fc4dcd7c51236fa0",
+    "calibration\\domain\\connection_guide.py": "8595a31f299254b4550c1df22bfb07584b4c2318f6c4c93bfdf37b2c20f2b484",
+    "calibration\\domain\\document.py": "170acb031edb9e34ed914d33f5f70a749832338c2cbbb0402cd807568f597148",
+    "calibration\\domain\\groups.py": "586fe8fbb726b9639da3932236091dfcbefda8313e54b39664a4982c41bdb495",
+    "calibration\\domain\\planning.py": "9d3be6e3711b1560f5b801bac845417d372470b220c0ba985c4ba8365f21ce0f",
+    "calibration\\domain\\types.py": "ece8e7d080484705a4fdd53d9a08a4b5ec8d0e05db3592d71ee41e3ca072f0a5",
+    "calibration\\domain\\units.py": "63da026613d48640b8641ee05c988baa1930e3860a7c9ce84d2dbbc60748e813",
+    "calibration\\instruments\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\instruments\\catalog.py": "8c3c03788669fbb2ff297adba29a7e90797079d689ed69116c029ac1b682a79e",
+    "calibration\\instruments\\discovery.py": "04b76061215bf4de277dcf8cf27caae7d66ce9347b0b95b4301b34bdd21658b8",
+    "calibration\\instruments\\dut.py": "4e6a6e034b68c9b5251a0f2244c8f31afbcfd3e12944420a015701889b006267",
+    "calibration\\instruments\\fluke.py": "882be4bfb4bb2ca5fcf42e295882c8d2ae358fcd2be1c6f8e7cce37bd54e5a69",
+    "calibration\\instruments\\transport.py": "51d58382dc40b9bd36c2e0e8fb92b899f403485eaa85f239dfacbfd27069c86e",
+    "calibration\\services\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\services\\connection_history.py": "83b9b48ef55e0e9654862d640787c40189e58c805507a440d9b57e2bff9e2e11",
+    "calibration\\services\\connections.py": "3ace12c26051810c6bb7f79849d4df600409e924963ff15dcbe5020b1e4b6e3b",
+    "calibration\\services\\drivers.py": "c99fe6a18b26b8d2807c5aaed272c94fde6c19c4365c7ea329eb15ca9140ec0c",
+    "calibration\\services\\engine.py": "3c16114b2e3249fad92503b4177ba10e9cf0c061b671124870fd429f09b2816f",
+    "calibration\\services\\storage.py": "ac472adb3c8c9200342131132c9fa25418de81c91147e42c5f69fd64df5b5e39",
+    "calibration\\ui\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "calibration\\ui\\dialogs.py": "355ca27fba7017217b5374647b508109c8e67c3f897629dcb204cdeb677b1804",
+    "calibration\\ui\\table.py": "0ae10c7411ef8a72473b08ee2657297f5f908cf498759a8860aa7880d0c7a929",
+    "calibration\\ui\\theme.py": "e7a38ec7d3f136f9e6c912dc038366a9c63e566ba5cc47fee5e6589c6a4b695a",
+    "calibration\\ui\\window.py": "ed9a22bd2148ada41c789a678e35d72aeb4b9c63eac703a7933ace6ee9c49d94",
+    "calibration\\ui\\worker.py": "bab9aae62f57cad24fba381c1d2c4e9452ad1b5353a5f1338fd361c94f74522f"
+  }
+}

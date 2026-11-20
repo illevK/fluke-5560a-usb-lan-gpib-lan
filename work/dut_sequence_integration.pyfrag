@@ -14,20 +14,72 @@
                     and not self.dut_session.simulated
                     and not self.conn_mgr.info.interface_type.startswith("SIMULATION"))
 
+        def _sequence_dut_quantity(self, step):
+            if step.func_type == "OHM":
+                device = self.dut_session.profile or self.dut_session.recovery_target
+                if device is not None and device.family == "DMM":
+                    return "resistance", "OHM"
+            return self._DUT_SEQUENCE_QUANTITIES.get(step.func_type)
+
+        def _sequence_dut_requires_connection(self):
+            return (self.var_seq_dut_capture.get() and not self.dut_session.connected
+                    and (self.dut_session.recovery_target is not None or self._seq_dut_resume_required)
+                    and not self.conn_mgr.info.interface_type.startswith("SIMULATION"))
+
+        def _34465_wiring_group(self, step):
+            if step.func_type in ("ACV", "DCV", "FREQ"):
+                return "전압"
+            if step.func_type in ("ACI", "DCI"):
+                return "전류"
+            return "저항" if step.func_type == "OHM" else "기타"
+
+        def _uses_34465_resistance_null(self, step):
+            if step.func_type != "OHM" or not self._uses_34465_current_groups():
+                return False
+            return self._seq_dut_run if self.seq_running else self._sequence_dut_enabled()
+
+        def _capture_34465_resistance_null(self, ensure_standby, dwell_ms):
+            manager = self.conn_mgr
+            ensure_standby()
+            self.dut_session.prepare_34465_resistance_null()
+            zero, _ = CalibratorCommandBuilder(manager.profile.model).build_resistance_cmd(
+                value=0, unit="OHM", zcomp="NONE")
+            manager.set_uncompensated_resistance_in_standby(zero)
+            manager.send_command("OPER", check_before=True)
+            if manager.check_output_state() != "1":
+                raise InstrumentReplyError("기준기 0 Ω의 OPER 상태를 확인하지 못했습니다.")
+            manager.record_event("[출력 안정화 대기] 34465A 0 Ω 널 측정 준비", notify=True)
+            if manager.cancel_event.wait(dwell_ms / 1000):
+                raise OperationCancelled("0 Ω 널 측정을 중지했습니다.")
+            reading = self.dut_session.read_34465_resistance_zero()
+            if manager.check_output_state() != "1":
+                raise InstrumentReplyError("0 Ω를 읽는 동안 기준기가 STBY로 전환됐습니다.")
+            manager.send_command("STBY")
+            if manager.check_output_state() != "0":
+                raise InstrumentProtocolError("0 Ω 읽기 후 기준기 STBY를 확인하지 못했습니다.")
+            self.dut_session.set_34465_resistance_null(reading)
+            manager.record_event(f"[34465A 저항 널 확인] {reading[1]} Ω 적용", notify=True)
+
         def _sequence_dut_failure(self, index, step, exc):
             self._on_seq_stop_auto(silent=True)
             self.seq_paused_idx = index
             self._seq_dut_resume_required = True
-            step.status = "⚠ DUT 기록 실패"
+            if self.conn_mgr.output_unconfirmed:
+                step.status = "⚠ 기준기 통신 오류"
+                exc = f"기준기 출력 상태 미확인 · 본체에서 STBY 확인 · {exc}"
+            else:
+                step.status = "⚠ DUT 기록 실패"
             if index < len(self.seq_steps) and self.seq_steps[index] is step:
                 self.excel_grid._update_single_row_visual(index, step, is_active=False)
             self.var_active_row_banner.set(f"#{step.step_no}행 DUT 기록 중단 · {exc}")
             self.lbl_active_row_banner.configure(bg="#FECACA", fg="#991B1B")
             self._log(f"[#{step.step_no}행 DUT 기록 중단] {exc}")
+            if self.dut_session.last_io_failure:
+                self.var_dut_status.set(self.dut_session.last_io_failure)
             if self.conn_mgr.info.connected and self.is_operating is not False:
                 self._on_stby_clicked()
 
-        def _execute_sequence_step(self, index, on_complete=None, *, dwell_ms=None):
+        def _execute_sequence_step(self, index, on_complete=None, *, dwell_ms=None, zero_resistance=True):
             if self._seq_dut_pending is not None or not (0 <= index < len(self.seq_steps)):
                 return False
             step = self.seq_steps[index]
@@ -35,6 +87,10 @@
                 self.var_active_row_banner.set(f"#{step.step_no}행 실행 제외 · {step.actual_out_desc}")
                 return False
             try:
+                amps = self._34465_row_current(step)
+                if amps is not None and amps > _DMM_34465_MAX_CURRENT:
+                    self.var_active_row_banner.set(f"#{step.step_no}행 실행 제외 · 34465A 입력 한도 10 A 초과")
+                    return False
                 if not self._step_in_current_group(step):
                     self._log(f"[#{index + 1}행 제외] 현재 그룹: {self._current_group_label()}")
                     return False
@@ -53,30 +109,40 @@
                 return False
             self.seq_current_idx = self.seq_paused_idx = index
 
-            quantity = self._DUT_SEQUENCE_QUANTITIES.get(step.func_type)
+            quantity = self._sequence_dut_quantity(step)
+            if quantity is not None and self._sequence_dut_requires_connection():
+                self._sequence_dut_failure(index, step, "DUT를 다시 연결한 뒤 같은 행부터 재개하세요.")
+                return False
             linked = quantity is not None and (
                 self._seq_dut_run if self.seq_running else self._sequence_dut_enabled()
             )
+            terminal = None if amps is None else 3 if self._dut_current_group == SequenceCurrentFilter.DUT_3A else 10
+            resistance_null = self._uses_34465_resistance_null(step)
+            check_dut = linked or terminal is not None
             token = None
-            if linked:
+            if check_dut:
                 try:
                     if not self.dut_session.connected or self.dut_session.simulated:
                         raise ConnectionError("DUT 연결을 확인하고 같은 행부터 재개하세요.")
-                    if not self.dut_session.supports_fresh_capture:
+                    if linked and not self.dut_session.supports_fresh_capture:
                         raise ValueError("이 DUT는 자동 기록을 지원하지 않습니다. 직접 측정하려면 DUT 자동 기록을 끄세요.")
                     if self._dut_busy:
                         raise RuntimeError("진행 중인 DUT 조회가 끝난 뒤 다시 시작하세요.")
-                    channel = self._dut_channel_for_step(step)
-                    if dwell_ms is None:
-                        dwell = float(self.var_seq_dwell_sec.get())
-                        if not .2 <= dwell <= 86_400:
-                            raise ValueError("유지시간은 0.2~86400초 사이여야 합니다.")
-                        dwell_ms = int(dwell * 1000)
+                    if linked:
+                        if resistance_null and not self.var_seq_auto_oper.get():
+                            raise ValueError("34465A 0 Ω 널을 잡으려면 ‘자동 출력’을 켜세요.")
+                        channel = self._dut_channel_for_step(step)
+                        if dwell_ms is None:
+                            dwell = float(self.var_seq_dwell_sec.get())
+                            if not .2 <= dwell <= 86_400:
+                                raise ValueError("유지시간은 0.2~86400초 사이여야 합니다.")
+                            dwell_ms = int(dwell * 1000)
                 except (ValueError, ConnectionError, RuntimeError, OverflowError) as exc:
                     self._sequence_dut_failure(index, step, exc)
                     return False
                 identity = self.dut_session.identity
                 calibrator = self.conn_mgr.info
+                self.dut_session.cancel.clear()
                 token = object()
                 self._seq_dut_pending = token
                 self._dut_sync_controls()
@@ -84,8 +150,9 @@
             step.status = "… 출력 안정화 대기"
             self.excel_grid._update_single_row_visual(index, step, is_active=True)
             self.excel_grid.scroll_to_row(index)
-            active_channel = channel if linked else step.dut_channel
-            row_label = f"#{step.step_no}행" + (f" · CH{active_channel}" if active_channel is not None else "")
+            assigned_label = channel_name(step.channel_key)
+            channel_label = assigned_label or (f"CH{channel}" if linked else "")
+            row_label = f"#{step.step_no}행" + (f" · {channel_label}" if channel_label else "")
             self.var_active_row_banner.set(f"{row_label} 완료 응답 대기: {command}")
             self.lbl_active_row_banner.configure(bg="#FEF3C7", fg="#92400E")
             self._log(f"[#{step.step_no}행 시작] 조건=({step.vi_cond_raw}, {step.freq_cond_raw}, PF={step.pf_cond_raw}) | 명령={command}")
@@ -104,7 +171,7 @@
                 if (same_step() and step.status == self._SEQUENCE_STOPPED_STATUS
                         and (isinstance(exc, OperationCancelled) or isinstance(getattr(exc, "__cause__", None), OperationCancelled))):
                     return
-                if linked:
+                if check_dut:
                     if current_capture():
                         self._sequence_dut_failure(index, step, exc)
                     return
@@ -160,8 +227,8 @@
                     self.excel_grid._update_single_row_visual(index, step, is_active=True)
                     publish_progress()
                     result = SIUnits.format_measurement(raw, step.nominal_raw)
-                    self.var_active_row_banner.set(f"#{step.step_no}행 DUT 자동 기록 · CH{channel} · {result}")
-                    self._log(f"[#{step.step_no}행 DUT 자동 기록] CH{channel} {result}")
+                    self.var_active_row_banner.set(f"#{step.step_no}행 DUT 자동 기록 · {channel_label} · {result}")
+                    self._log(f"[#{step.step_no}행 DUT 자동 기록] {channel_label} {result}")
                     self._seq_dut_pending = None
                     self._seq_dut_resume_required = False
                     self._dut_sync_controls()
@@ -169,7 +236,7 @@
                         on_complete()
 
                 if not self._start_io(f"#{step.step_no}행 DUT 수신 후 OPER 상태 확인…",
-                                      lambda: self.conn_mgr.query("OPER?").strip(), record,
+                                      self.conn_mgr.check_output_state, record,
                                       on_error=failed, stop_sequence=False):
                     failed("교정기 출력 상태 확인을 시작할 수 없습니다.")
 
@@ -183,15 +250,21 @@
                     return
                 step.status = "… DUT 새 측정값 대기"
                 self.excel_grid._update_single_row_visual(index, step, is_active=True)
-                self.var_active_row_banner.set(f"#{step.step_no}행 DUT 새 측정값 대기 · CH{channel}")
+                self.var_active_row_banner.set(f"#{step.step_no}행 DUT 새 측정값 대기 · {channel_label}")
                 include_dc = step.func_type in ("DCV", "DCI", "DCP")
-                if not self._dut_start("sequence_read", (channel, include_dc, record_after_oper_check)):
+                arguments = (channel, include_dc, record_after_oper_check)
+                if self.dut_session.profile.family == "DMM":
+                    checks = {"dmm_terminal": terminal, "expected_dmm_function": step.func_type}
+                    if resistance_null:
+                        checks["resistance_null"] = True
+                    arguments += (checks,)
+                if not self._dut_start("sequence_read", arguments):
                     failed("DUT 조회를 시작할 수 없습니다.")
 
             def done(state):
                 if same_step() and step.status in (self._SEQUENCE_HOLD_STATUS, self._SEQUENCE_STOPPED_STATUS):
                     return
-                if linked and not current_capture():
+                if check_dut and not current_capture():
                     return
                 if not same_step():
                     self.seq_running = False
@@ -212,16 +285,45 @@
                 if linked:
                     self.seq_after_id = self.after(dwell_ms, capture_after_dwell)
                 else:
+                    if check_dut:
+                        self._seq_dut_pending = None
+                        self._dut_sync_controls()
                     publish_progress()
                     if on_complete:
                         on_complete()
 
+            def check_before_output(ensure_standby):
+                try:
+                    self.dut_session.check_connection()
+                    if resistance_null:
+                        if zero_resistance:
+                            self._capture_34465_resistance_null(ensure_standby, dwell_ms)
+                        else:
+                            function = self.dut_session.verify_dmm_function("OHM")
+                            self.dut_session.verify_34465_resistance_null(function)
+                    elif self.dut_session.profile.family == "DMM":
+                        self.dut_session.verify_dmm_function(step.func_type, ensure_standby=ensure_standby)
+                    if terminal is not None:
+                        self.dut_session.verify_34465_current_terminal(
+                            step.func_type, terminal, ensure_standby=ensure_standby)
+                except InterruptedError as exc:
+                    raise OperationCancelled(str(exc)) from exc
+                except Exception as exc:
+                    detail = self.dut_session.last_io_failure or str(exc)
+                    raise ConnectionError(f"출력 전 DUT 확인 실패 · {detail}") from exc
+                if self.conn_mgr.cancel_event.is_set():
+                    raise OperationCancelled("출력 전 확인을 중지했습니다.")
+
             try:
+                options = {}
+                if check_dut:
+                    options["before_output"] = check_before_output
                 started = self._send_and_log(command, auto_oper=self.var_seq_auto_oper.get(), dual_current=dual_current,
+                                             uncompensated_resistance=resistance_null,
                                              on_done=done, on_error=failed, stop_sequence=False,
                                              verify_setpoint=(step.func_type == "ACV"
-                                                              and self.conn_mgr.profile.model == "5560A"))
-                if linked and not started:
+                                                              and self.conn_mgr.profile.model == "5560A"), **options)
+                if check_dut and not started:
                     failed("교정기 출력 요청을 시작할 수 없습니다.")
                 return started
             except Exception as exc:

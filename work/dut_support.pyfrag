@@ -6,6 +6,31 @@ DUT_METRICS = (
     ("apparent", "피상전력", "VA"), ("reactive", "무효전력", "var"),
     ("frequency", "주파수", "Hz"),
 )
+DUT_DMM_METRICS = tuple(row for row in DUT_METRICS if row[0] in ("voltage", "current", "frequency")) + (
+    ("resistance", "저항", "Ω"),
+)
+_DMM_FUNCTIONS = {
+    "VOLT:DC": ("DCV", "dc_voltage"), "VOLT:AC": ("ACV", "voltage"),
+    "CURR:DC": ("DCI", "dc_current"), "CURR:AC": ("ACI", "current"),
+    "RES": ("OHM", "resistance"), "FRES": ("OHM", "resistance"),
+    "FREQ": ("FREQ", "frequency"),
+}
+_DMM_34465_AUTO_FUNCTIONS = {kind: function for function, (kind, _) in _DMM_FUNCTIONS.items()
+                             if kind in ("DCV", "ACV", "DCI", "ACI")}
+_DMM_OTHER_FUNCTIONS = {"CAP", "CONT", "DIOD", "PER", "TEMP", "VOLT:RAT", "VOLT:DC:RAT"}
+_DUT_LAN_MODES = ("WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN", "DMM_TCP", "VXI11")
+_DUT_VXI11_MODES = ("WT_LAN", "VXI11")
+_DMM_SOCKET_PORT = 5025
+_DMM_34465_MAX_CURRENT = 10
+_DUT_IDLE_CHECK_SECONDS = 30.0
+
+
+class DUTDataNotReadyError(TimeoutError):
+    """The status query replied, but the DUT has not produced a new sample."""
+
+
+class DUTConfigurationError(ValueError):
+    """A valid reply shows a setting the operator needs to change."""
 
 
 @dataclass(frozen=True)
@@ -23,7 +48,13 @@ def identify_dut(identity):
         raise ValueError(f"DUT 식별 응답을 확인할 수 없습니다: {identity[:160]}")
     maker = re.sub(r"[^A-Z0-9]", "", parts[0])
     model = re.sub(r"[\s-]", "", parts[1])
+    if model in ("34401A", "34465A") and maker in (
+            "HEWLETTPACKARD", "HP", "AGILENT", "AGILENTTECHNOLOGIES", "KEYSIGHT", "KEYSIGHTTECHNOLOGIES"):
+        return DUTProfile("DMM", model, 1)
     if maker in ("NEWTONS4TH", "NEWTONS4THLTD", "N4L"):
+        # The PPA25xx/26xx identification string includes the KinetiQ name.
+        if re.fullmatch(r"PPA(?:25|26)\d{2}KINETIQ", model):
+            model = model.removesuffix("KINETIQ")
         number = re.sub(r"(?:LC|HC|TE|HF)$", "", model.removeprefix("PPA"))
         # These families document the same POWER/RMS and POWER/WATTS records.
         if re.fullmatch(r"(?:5\d{2}|(?:15|25|26|35|45|55)\d{2})[A-Z]?", number):
@@ -123,9 +154,10 @@ class DUTSettings:
     stop_bits: int = 1
     flow: str = "NONE"
     source_ip: str = ""
+    model_hint: str = ""
 
     def validate(self):
-        if self.mode not in ("VISA", "GPIB", "WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN", "SERIAL", "DEMO"):
+        if self.mode not in (*_DUT_LAN_MODES, "VISA", "GPIB", "SERIAL", "DEMO"):
             raise ValueError("DUT 연결 방식을 선택하세요.")
         if not math.isfinite(self.timeout) or not 1 <= self.timeout <= 60:
             raise ValueError("DUT 응답 대기는 1~60초로 입력하세요.")
@@ -135,23 +167,33 @@ class DUTSettings:
             return
         if not self.address.strip() or any(c in self.address for c in '\r\n\x00'):
             raise ValueError("DUT 주소 또는 COM/VISA 리소스를 입력하세요.")
-        if self.mode in ("WT_LAN", "WT5000_TCP", "PPA_LAN", "HIOKI_LAN"):
+        if self.mode in _DUT_LAN_MODES:
             AutoNetworkAligner.normalize_ipv4(self.address)
         if self.mode == "HIOKI_LAN" and self.port not in (23, 3390):
             raise ValueError("Hioki 포트는 PW3390은 3390, PW6001은 23을 입력하세요.")
-        if self.mode == "PPA_LAN" and not 1 <= self.port <= 65535:
-            raise ValueError("PPA 본체의 TCP 포트 번호를 입력하세요 (1~65535).")
+        if self.mode in ("PPA_LAN", "DMM_TCP") and not 1 <= self.port <= 65535:
+            raise ValueError("장비의 TCP 포트 번호를 입력하세요 (1~65535).")
         if self.mode == "GPIB" and _dut_gpib_key(self.address) is None:
             raise ValueError("GPIB 주소는 0~30 사이 번호 또는 GPIB0::4::INSTR 형식으로 입력하세요.")
         if self.mode == "SERIAL":
             if not re.fullmatch(r"COM[1-9]\d*", self.address, re.I):
                 raise ValueError("COM 포트 형식으로 입력하세요. 예: COM5")
-            if self.baudrate not in (1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200):
+            if self.baudrate not in (300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200):
                 raise ValueError("RS232 통신 속도를 확인하세요.")
-            if self.data_bits not in (7, 8) or self.parity not in ("N", "E", "O") or self.stop_bits not in (1, 2) or self.flow not in ("NONE", "RTS/CTS", "XON/XOFF"):
+            if self.data_bits not in (7, 8) or self.parity not in ("N", "E", "O") or self.stop_bits not in (1, 2) or self.flow not in ("NONE", "RTS/CTS", "XON/XOFF", "DTR/DSR"):
                 raise ValueError("RS232 통신 설정을 확인하세요.")
         if self.mode == "VISA" and not re.fullmatch(r"(?:USB|GPIB|TCPIP)\d*::[^\r\n]+::(?:INSTR|SOCKET)", self.address, re.I):
             raise ValueError("USB/GPIB/TCPIP VISA 리소스를 선택하세요. COM 포트는 RS232 방식을 사용하세요.")
+
+
+@dataclass(frozen=True)
+class DUTRecoveryTarget:
+    settings: DUTSettings
+    identity: str
+    family: str
+    model: str
+    usb_serial_key: str
+    input_channels: tuple
 
 
 class DUTTransport:
@@ -161,32 +203,35 @@ class DUTTransport:
         self.resource = self.manager = self.sock = self.serial_port = None
         self.buffer = bytearray()
         self._gpib_remote = False
+        self._dmm_serial_remote = False
+        self.last_command = ""
         self.eol = "\n" if settings.mode == "WT5000_TCP" else {"LF": "\n", "CRLF": "\r\n", "CR": "\r"}[settings.eol]
 
     def _check_cancel(self):
         if self.cancel.is_set():
             raise InterruptedError("DUT 조회를 중지했습니다.")
 
-    def open(self):
+    def open(self, connect_timeout=None):
         s = self.settings
+        limit = s.timeout if connect_timeout is None else connect_timeout
         self._check_cancel()
         try:
-            if s.mode in ("VISA", "GPIB", "WT_LAN"):
+            if s.mode in (*_DUT_VXI11_MODES, "VISA", "GPIB"):
                 if not HAS_PYVISA:
                     raise RuntimeError(dependency_import_message("pyvisa", "PyVISA", PYVISA_IMPORT_ERROR))
                 self.manager = SharedVisaManager()
-                address = f"TCPIP0::{s.address}::inst0::INSTR" if s.mode == "WT_LAN" else s.address
-                self.resource = self.manager.open_resource(address, open_timeout=int(s.timeout * 1000))
+                address = f"TCPIP0::{s.address}::inst0::INSTR" if s.mode in _DUT_VXI11_MODES else s.address
+                self.resource = self.manager.open_resource(address, open_timeout=int(limit * 1000))
                 self.resource.timeout = int(s.timeout * 1000)
                 self.resource.write_termination = self.eol
                 # WT and PPA both signal GPIB EOI, while their reply terminators differ.
                 self.resource.read_termination = None if s.mode == "GPIB" else self.eol[-1]
                 self.resource.encoding = "ascii"
-            elif s.mode in ("PPA_LAN", "WT5000_TCP", "HIOKI_LAN"):
+            elif s.mode in ("PPA_LAN", "WT5000_TCP", "HIOKI_LAN", "DMM_TCP"):
                 port = 10002 if s.mode == "WT5000_TCP" else s.port
                 source = (s.source_ip, 0) if s.source_ip else None
                 try:
-                    self.sock = socket.create_connection((s.address, port), timeout=s.timeout, source_address=source)
+                    self.sock = socket.create_connection((s.address, port), timeout=limit, source_address=source)
                 except TimeoutError as exc:
                     if s.mode == "HIOKI_LAN":
                         raise TimeoutError(f"Hioki TCP {s.address}:{port} 연결 시간 초과. 본체 SYSTEM → Interface에서 IP를 확인하고, "
@@ -201,7 +246,7 @@ class DUTTransport:
                     raise RuntimeError(dependency_import_message("pyserial", "pyserial", PYSERIAL_IMPORT_ERROR))
                 self.serial_port = serial.Serial(s.address, baudrate=s.baudrate, bytesize=s.data_bits,
                     parity=s.parity, stopbits=s.stop_bits, timeout=.2, write_timeout=s.timeout,
-                    rtscts=s.flow == "RTS/CTS", xonxoff=s.flow == "XON/XOFF")
+                    rtscts=s.flow == "RTS/CTS", xonxoff=s.flow == "XON/XOFF", dsrdtr=s.flow == "DTR/DSR")
             else:
                 raise ValueError("지원하지 않는 실제 연결 방식입니다.")
             self._check_cancel()
@@ -209,16 +254,17 @@ class DUTTransport:
             self.close()
             raise
 
-    def write(self, command):
+    def write(self, command, *, timeout=None):
         self._check_cancel()
         if '\n' in command or '\r' in command:
             raise ValueError("DUT 명령은 한 줄이어야 합니다.")
+        self.last_command = command
         if self.resource is not None:
             self.resource.write(command)
         else:
             data = (command + self.eol).encode('ascii')
             if self.sock is not None:
-                self.sock.settimeout(self.settings.timeout)
+                self.sock.settimeout(self.settings.timeout if timeout is None else timeout)
                 self.sock.sendall(data)
             elif self.serial_port is not None:
                 if self.serial_port.write(data) != len(data):
@@ -226,15 +272,24 @@ class DUTTransport:
             else:
                 raise ConnectionError("DUT가 연결되지 않았습니다.")
 
-    def query(self, command):
-        self.write(command)
+    def query(self, command, *, timeout=None):
+        limit = self.settings.timeout if timeout is None else timeout
         if self.resource is not None:
-            reply = self.resource.read()
+            previous = self.resource.timeout
+            try:
+                if timeout is not None:
+                    self.resource.timeout = max(1, int(limit * 1000))
+                self.write(command)
+                reply = self.resource.read()
+            finally:
+                if timeout is not None:
+                    self.resource.timeout = previous
             self._check_cancel()
             if len(reply) > 65536:
                 raise ValueError("DUT 응답이 너무 큽니다.")
             return reply.strip()
-        deadline = time.monotonic() + self.settings.timeout
+        self.write(command, timeout=timeout)
+        deadline = time.monotonic() + limit
         while True:
             self._check_cancel()
             for index, byte in enumerate(self.buffer):
@@ -268,7 +323,18 @@ class DUTTransport:
         self.resource.control_ren(ren.asrt_address)
         self._gpib_remote = True
 
+    def enable_dmm_serial_remote(self):
+        if not self._dmm_serial_remote:
+            self.write("SYST:REM")
+            self._dmm_serial_remote = True
+
     def close(self):
+        if self._dmm_serial_remote:
+            try:
+                self.serial_port.write(("SYST:LOC" + self.eol).encode("ascii"))
+            except OSError:
+                pass
+            self._dmm_serial_remote = False
         if self._gpib_remote:
             try:
                 # Address only this DUT so another instrument on the bus can stay remote.
@@ -293,10 +359,69 @@ class DUTSession:
         self.transport_factory = transport_factory
         self.cancel = threading.Event()
         self.transport = self.profile = self.sample = None
+        self._resistance_null_reference = None
         self.identity = ""
         self.simulated = False
         self.input_channels = ()
         self.settings = None
+        self.recovery_target = None
+        self.recovery_pending = False
+        self._usb_serial_key = ""
+        self.last_io_failure = ""
+
+    def _failed_io(self, exc):
+        settings = self.settings
+        if settings is None:
+            self.disconnect()
+            return
+        command = getattr(self.transport, "last_command", "") or "측정 조회"
+        endpoint = f"{settings.mode} {settings.address}"
+        if settings.mode in _DUT_LAN_MODES and settings.mode not in _DUT_VXI11_MODES:
+            endpoint += f":{settings.port}"
+        category = ("응답 시간 초과" if isinstance(exc, TimeoutError) or getattr(exc, "error_code", None) == -1073807339
+                    else "통신 끊김" if isinstance(exc, OSError) or getattr(exc, "error_code", None) is not None
+                    else "응답/측정 설정 오류")
+        target = DUTRecoveryTarget(settings, self.identity, self.profile.family, self.profile.model,
+                                   self._usb_serial_key, self.input_channels)
+        self.disconnect()
+        self.last_io_failure = f"DUT {category} · {endpoint} · {command} · {exc}"
+        self.recovery_target = target
+        self.recovery_pending = category != "응답/측정 설정 오류"
+
+    def check_connection(self):
+        if not self.connected or self.transport is None or self.settings is None:
+            raise ConnectionError("DUT를 연결한 뒤 같은 행부터 재개하세요.")
+        try:
+            identity = self.transport.query("*IDN?", timeout=min(2.0, self.settings.timeout))
+            if identity != self.identity:
+                raise ValueError("DUT 식별 응답이 기존에 연결한 장비와 다릅니다.")
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            self._failed_io(exc)
+            raise
+
+    def recover_connection(self):
+        saved = self.recovery_target
+        if saved is None or self.connected:
+            raise ConnectionError("복구할 DUT 연결이 없습니다.")
+        self.recovery_pending = False
+        settings = saved.settings
+        try:
+            if settings.mode == "SERIAL":
+                port = _wait_for_serial_address(settings.address, saved.usb_serial_key, self.cancel)
+                settings = replace(settings, address=port, model_hint="")
+            identity = self.connect(settings, expected_identity=saved.identity, connect_timeout=2.0)
+            if settings.mode == "GPIB":
+                self.transport.enable_gpib_remote()
+            elif settings.mode == "SERIAL" and self.profile.family == "DMM":
+                self.transport.enable_dmm_serial_remote()
+            self.input_channels = saved.input_channels
+            return identity
+        except Exception:
+            self.disconnect()
+            self.recovery_target = saved
+            raise
 
     @property
     def connected(self):
@@ -304,7 +429,7 @@ class DUTSession:
 
     @property
     def supports_fresh_capture(self):
-        return self.connected and self.profile.family in ("WT", "PPA", "HIOKI") and not self.profile.ppa_common_only
+        return self.connected and self.profile.family in ("WT", "PPA", "HIOKI", "DMM") and not self.profile.ppa_common_only
 
     @property
     def available_channels(self):
@@ -351,9 +476,11 @@ class DUTSession:
 
     def _apply_hioki_defaults(self):
         t, model = self.transport, self.profile.model
-        answer = self._wt_reply_value(t.query(":RS232:ANSWER?")).replace(";", ",").split(",", 1)[0].strip()
-        if answer != "OFF":
-            raise ValueError(f"{model} 통신 설정의 실행 확인 응답을 OFF로 설정하세요 (현재 {answer}).")
+        answer = self._wt_reply_value(t.query(":RS232:ANSWER?"))
+        if re.fullmatch(r"ON(?:[;,]\s*000)?", answer):
+            answer = self._wt_reply_value(t.query(":RS232:ANSWER OFF;:RS232:ANSWER?"))
+        if not re.fullmatch(r"OFF(?:[;,]\s*000)?", answer):
+            raise ValueError(f"{model} 실행 확인 응답을 OFF로 설정하지 못했습니다 (현재 {answer}).")
         self._set_wt_default(":HEADER", "OFF")
 
         channels = tuple(range(1, self.profile.channels + 1))
@@ -374,11 +501,13 @@ class DUTSession:
             rate = "50 ms 갱신"
 
         for channel in channels:
+            self._set_wt_default(f":VOLTAGE{channel}:MEAN", "OFF")
+            self._set_wt_default(f":CURRENT{channel}:MEAN", "OFF")
             self._set_wt_default(f":VOLTAGE{channel}:AUTO", "ON")
             self._set_wt_default(f":CURRENT{channel}:AUTO", "ON")
             self._set_wt_default(f":SOURCE{channel}", f"U{channel}")
         self.input_channels = channels
-        return f"1P2W 독립 {len(channels)}CH · {rate} · 채널별 전압 동기 · V/I 자동 범위"
+        return f"1P2W 독립 {len(channels)}CH · {rate} · 채널별 전압 동기 · U/I 정류 RMS · V/I 자동 범위"
 
     def _read_hioki_fields(self, channel, metrics, include_dc, fresh):
         items = ("Urms", "Irms", "P", "S", "Q", "PF", "FREQ")
@@ -400,6 +529,12 @@ class DUTSession:
         t, profile = self.transport, self.profile
         if self.settings is not None and self.settings.mode == "GPIB":
             t.enable_gpib_remote()
+        if profile.family == "DMM":
+            if self.settings.mode == "SERIAL":
+                t.enable_dmm_serial_remote()
+            if profile.model == "34465A":
+                return "측정표 시작 시 AC/DC 전압·전류 자동 선택 · 본체에서 결선과 범위를 확인하세요."
+            return "멀티미터 본체에서 측정 기능과 범위를 설정하세요."
         if profile.family == "HIOKI":
             return self._apply_hioki_defaults()
         if profile.family == "PPA":
@@ -464,7 +599,7 @@ class DUTSession:
             return f"{defaults} · 본체 표시 확인 실패 ({exc})"
         return f"{defaults} · 본체 전압/전류/전력/역률"
 
-    def connect(self, settings):
+    def connect(self, settings, *, expected_identity="", connect_timeout=None):
         settings.validate()
         self.disconnect()
         if self.cancel.is_set():
@@ -474,11 +609,33 @@ class DUTSession:
             self.identity = "가상 DUT · 실제 측정값 아님"
             self.simulated = True
             return self.identity
+        serial_34401 = settings.mode == "SERIAL" and settings.model_hint == "34401A"
         try:
             self.transport = self.transport_factory(settings, self.cancel)
-            self.transport.open()
-            self.identity = self.transport.query("*IDN?")
+            if connect_timeout is None:
+                self.transport.open()
+                identify = lambda: self.transport.query("*IDN?")
+            else:
+                self.transport.open(connect_timeout)
+                identify = lambda: self.transport.query("*IDN?", timeout=connect_timeout)
+            if serial_34401:
+                self.transport.enable_dmm_serial_remote()
+            try:
+                self.identity = identify()
+            except TimeoutError:
+                if settings.mode != "SERIAL" or expected_identity:
+                    raise
+                # Reopen to clear the host buffers before retrying the same identification.
+                self.transport.close()
+                self.transport.open()
+                if serial_34401:
+                    self.transport.enable_dmm_serial_remote()
+                self.identity = identify()
+            if expected_identity and self.identity != expected_identity:
+                raise ValueError("재연결한 DUT의 식별 정보가 기존 장비와 다릅니다.")
             self.profile = identify_dut(self.identity)
+            if settings.model_hint and self.profile.model != settings.model_hint:
+                raise ValueError(f"선택한 DUT {settings.model_hint}와 장비 응답이 다릅니다.")
             if settings.mode in ("PPA_LAN", "WT_LAN") and self.profile.family != settings.mode.split('_')[0]:
                 raise ValueError("선택한 LAN 방식과 DUT 제조사가 다릅니다.")
             if settings.mode == "HIOKI_LAN":
@@ -487,10 +644,13 @@ class DUTSession:
                     raise ValueError(f"선택한 LAN 포트 {settings.port}은 {expected_model}용입니다.")
             if settings.mode == "WT5000_TCP" and self.profile.model != "WT5000":
                 raise ValueError("이 TCP 연결은 WT5000용입니다. 본체 Remote Control의 Command Type을 WT5000으로 확인하세요.")
+            if settings.mode == "DMM_TCP" and self.profile.model != "34465A":
+                raise ValueError("이 LAN 소켓은 34465A용입니다. 34401A는 RS232 또는 GPIB를 선택하세요.")
             if self.profile.ppa_common_only:
                 dut_number_fields(self.transport.query("POWER,PHASE1,RMS?"), 5)
                 dut_number_fields(self.transport.query("POWER,PHASE1,WATTS?"), 11)
             self.settings = settings
+            self._usb_serial_key = _serial_key_for_address(settings.address) if settings.mode == "SERIAL" else ""
             return self.identity
         except Exception:
             self.disconnect()
@@ -502,7 +662,7 @@ class DUTSession:
             if self.cancel.is_set():
                 raise InterruptedError("DUT 조회를 중지했습니다.")
             if time.monotonic() >= deadline:
-                raise TimeoutError(timeout_message)
+                raise DUTDataNotReadyError(timeout_message)
             reply = self.transport.query(command).strip()
             if not re.fullmatch(r"\+?[0-9]{1,10}", reply):
                 raise ValueError(f"DUT 데이터 갱신 상태를 확인할 수 없습니다: {reply[:80]}")
@@ -563,7 +723,128 @@ class DUTSession:
             raise ValueError("PPA 입력 범위 상태를 확인할 수 없습니다.")
         return reply[2].strip() == "OVER"
 
-    def read(self, channel=1, include_dc=False, fresh=False):
+    def _dmm_function(self):
+        raw = self.transport.query("FUNC?").strip().strip('"').upper()
+        function = ":".join(word[:4] if word.startswith(("VOLT", "CURR", "FRES", "FREQ"))
+                            else "RES" if word.startswith("RES") else word
+                            for word in raw.split(":"))
+        # Truevolt omits the optional :DC suffix from FUNC? replies.
+        if function in ("VOLT", "CURR"):
+            function += ":DC"
+        if function not in _DMM_FUNCTIONS and function not in _DMM_OTHER_FUNCTIONS:
+            raise ValueError(f"{self.profile.model}에서 측정 기능 응답을 확인할 수 없습니다. 응답 {raw!r}")
+        return function
+
+    def verify_dmm_function(self, step_function, *, ensure_standby=None):
+        if step_function not in {row[0] for row in _DMM_FUNCTIONS.values()}:
+            raise DUTConfigurationError(f"{self.profile.model}으로 이 행의 측정 항목을 읽을 수 없습니다.")
+        function = self._dmm_function()
+        target = _DMM_34465_AUTO_FUNCTIONS.get(step_function)
+        if self.profile.model == "34465A" and target and function != target and ensure_standby is not None:
+            ensure_standby()
+            self.transport.write(f'FUNC "{target}"')
+            function = self._dmm_function()
+        actual = _DMM_FUNCTIONS.get(function, (None,))[0]
+        if actual != step_function:
+            raise DUTConfigurationError(f"{self.profile.model} 측정 기능 불일치 · 측정표 {MEASUREMENT_NAMES[step_function]}, "
+                                        f"본체 {MEASUREMENT_NAMES.get(actual, function)}. 본체 측정 기능을 확인하세요.")
+        return function
+
+    def verify_34465_current_terminal(self, step_function, terminal, *, ensure_standby=None):
+        mode = {"ACI": "AC", "DCI": "DC"}[step_function]
+        if terminal == _DMM_34465_MAX_CURRENT:
+            side = self.transport.query("ROUT:TERM?").strip().upper()
+            if side == "REAR":
+                raise DUTConfigurationError("34465A 10 A 단자는 전면용입니다. STBY에서 본체를 Front로 맞추세요.")
+            if side not in ("FRON", "FRONT"):
+                raise ValueError(f"34465A 전면/후면 설정을 읽지 못했습니다. 응답 {side!r}")
+
+        command = f"SENS:CURR:{mode}:TERM"
+        raw = self.transport.query(f"{command}?").strip()
+        if ensure_standby is not None and raw in ("+3", "3", "+10", "10") and int(raw) != terminal:
+            ensure_standby()
+            self.transport.write(f"{command} {terminal}")
+            raw = self.transport.query(f"{command}?").strip()
+        if not re.fullmatch(r"\+?(?:3|10)", raw):
+            raise ValueError(f"34465A {mode} 전류 단자 설정을 읽지 못했습니다. 응답 {raw!r}")
+        if int(raw) != terminal:
+            raise DUTConfigurationError(f"34465A {mode} 전류 단자 불일치 · 측정표 {terminal} A, 본체 {int(raw)} A. "
+                                        "STBY에서 34465A의 Terminals 설정을 확인하세요.")
+
+    def prepare_34465_resistance_null(self):
+        self._resistance_null_reference = None
+        if self._dmm_function() != "RES":
+            self.transport.write('FUNC "RES"')
+            if self._dmm_function() != "RES":
+                raise DUTConfigurationError("34465A를 2선식 저항 모드로 전환하지 못했습니다.")
+        self.transport.write("RES:RANG:AUTO ON")
+        if self.transport.query("RES:RANG:AUTO?").strip() != "1":
+            raise DUTConfigurationError("34465A 저항 자동 범위를 확인하지 못했습니다.")
+        self.transport.write("RES:NULL:STAT OFF")
+        if self.transport.query("RES:NULL:STAT?").strip() != "0":
+            raise DUTConfigurationError("34465A의 이전 저항 널 설정을 끄지 못했습니다.")
+
+    def read_34465_resistance_zero(self):
+        if self._dmm_function() != "RES" or self.transport.query("RES:NULL:STAT?").strip() != "0":
+            raise DUTConfigurationError("0 Ω를 읽기 전에 34465A 저항 모드 또는 널 설정이 변경됐습니다.")
+        value, raw = self._read_dmm_value()
+        if value is None:
+            raise DUTConfigurationError("0 Ω 측정값이 유효하지 않습니다. 저항 결선과 DUT 범위를 확인하세요.")
+        return value, raw
+
+    def set_34465_resistance_null(self, reading):
+        value, raw = reading
+        self.transport.write("RES:NULL:STAT ON")
+        self.transport.write(f"RES:NULL:VAL {raw}")
+        self._resistance_null_reference = value
+        self.verify_34465_resistance_null("RES")
+
+    def verify_34465_resistance_null(self, function):
+        if function != "RES" or self._resistance_null_reference is None:
+            raise DUTConfigurationError("34465A 2선식 저항 널이 준비되지 않았습니다. 저항 구간을 재개하세요.")
+        t = self.transport
+        if t.query("RES:NULL:STAT?").strip() != "1" or t.query("RES:NULL:VAL:AUTO?").strip() != "0":
+            raise DUTConfigurationError("34465A의 고정 저항 널 설정이 바뀌었습니다. 저항 구간을 재개하세요.")
+        (actual, _), = dut_number_fields(t.query("RES:NULL:VAL?"), 1)
+        if actual is None or not math.isclose(actual, self._resistance_null_reference, rel_tol=1e-8, abs_tol=1e-10):
+            raise DUTConfigurationError("34465A 저항 널값이 0 Ω에서 읽은 값과 다릅니다. 저항 구간을 재개하세요.")
+
+    def _read_dmm_value(self):
+        for command in ("TRIG:SOUR IMM", "TRIG:COUN 1", "SAMP:COUN 1"):
+            self.transport.write(command)
+        reading, = dut_number_fields(self.transport.query("READ?"), 1)
+        return reading
+
+    def _read_dmm(self, terminal, expected_function, resistance_null):
+        function = (self._dmm_function() if expected_function is None
+                    else self.verify_dmm_function(expected_function))
+        if function not in _DMM_FUNCTIONS:
+            raise DUTConfigurationError(f"{self.profile.model}에서 전압·전류·저항·주파수 중 하나를 선택하세요. 현재 기능 {function}")
+        if terminal is not None:
+            step_function = _DMM_FUNCTIONS[function][0]
+            if step_function not in ("ACI", "DCI"):
+                raise ValueError("34465A의 현재 측정 기능이 전류가 아닙니다.")
+            self.verify_34465_current_terminal(step_function, terminal)
+        if resistance_null:
+            self.verify_34465_resistance_null(function)
+        reading = self._read_dmm_value()
+        key = _DMM_FUNCTIONS[function][1]
+        fields = {key: reading}
+        if key.startswith("dc_"):
+            fields[key.removeprefix("dc_")] = reading
+        return fields, function
+
+    def _ppa_rms_fields(self, channel):
+        reply = self.transport.query(f"POWER,PHASE{channel},RMS?")
+        if self.profile.model.startswith(("PPA25", "PPA26")) and reply.count(",") == 12:
+            # KinetiQ firmware can return all three phases even for a PHASEn query.
+            fields = dut_number_fields(reply, 13)
+            offset = 1 + 4 * (channel - 1)
+            return [fields[0], *fields[offset:offset + 4]]
+        return dut_number_fields(reply, 5)
+
+    def read(self, channel=1, include_dc=False, fresh=False, *, dmm_terminal=None,
+             expected_dmm_function=None, resistance_null=False):
         self.sample = None
         if not self.connected:
             raise ConnectionError("DUT를 먼저 연결하세요.")
@@ -587,23 +868,32 @@ class DUTSession:
             elif self.profile.family == "HIOKI":
                 fields = self._read_hioki_fields(channel, metrics, include_dc, fresh)
                 note = "Hioki 새 데이터 갱신 확인 · 본체 배율 적용값" if fresh else "Hioki RMS·전력·역률 조회"
+            elif self.profile.family == "DMM":
+                fields, function = self._read_dmm(dmm_terminal, expected_dmm_function, resistance_null)
+                vi_modes = ("DC" if function == "VOLT:DC" else "RMS", "DC" if function == "CURR:DC" else "RMS")
+                note = f"{self.profile.model} · {function} · 단일 측정"
             elif self.profile.family == "PPA":
                 # A POWER result read clears DAV bit 0. Discard the current
                 # result and the next update so neither can predate the dwell.
                 # This avoids *TRG, which restarts ranging and smoothing.
+                kinetiq = self.profile.model.startswith(("PPA25", "PPA26"))
+                wait_message = "PPA 새 측정값 대기 시간 초과: 본체 측정 상태·갱신 주기와 DUT 응답 대기 시간을 확인하세요."
                 if include_dc and fresh:
                     coupling = self.transport.query(f"COUPLI,PHASE{channel}?").strip()
                     if coupling not in ("0", "2"):
                         raise ValueError("PPA의 DC 측정에는 해당 입력의 커플링을 AC+DC 또는 DC로 설정하세요.")
-                rms_command = f"POWER,PHASE{channel},RMS?"
+                if kinetiq:
+                    # POWER? can hold the instrument's command queue while waiting for unread data.
+                    self._wait_data_flag("DAV?", 3, wait_message)
                 if fresh:
-                    dut_numbers(self.transport.query(rms_command), 5)
+                    self._ppa_rms_fields(channel)
                     for index in range(2):
-                        self._wait_data_flag("DAV?", 3,
-                            "PPA 새 측정값 대기 시간 초과: 본체 측정 상태·갱신 주기와 DUT 응답 대기 시간을 확인하세요.")
+                        self._wait_data_flag("DAV?", 3, wait_message)
                         if index == 0:
-                            dut_numbers(self.transport.query(rms_command), 5)
-                rms = dut_number_fields(self.transport.query(rms_command), 5)
+                            self._ppa_rms_fields(channel)
+                rms = self._ppa_rms_fields(channel)
+                if kinetiq:
+                    self._wait_data_flag("DAV?", 3, wait_message)
                 power = dut_number_fields(self.transport.query(f"POWER,PHASE{channel},WATTS?"), 11)
                 fields = dict(zip(metrics,
                     (rms[1], rms[3], power[1], power[3], power[5], power[7], power[0])))
@@ -681,7 +971,7 @@ class DUTSession:
                         else "WT 통신 출력 7항목 · 주파수는 전압 기준 · 본체 배율 적용값")
             if self.cancel.is_set():
                 raise InterruptedError("DUT 조회를 중지했습니다.")
-            pf, _ = fields["pf"]
+            pf, _ = fields.get("pf", (None, ""))
             if pf is not None and abs(pf) > 1.000001:
                 fields["pf"] = (None, "")
             values = {key: value for key, (value, _) in fields.items()}
@@ -689,18 +979,28 @@ class DUTSession:
             self.sample = DUTSample(self.identity, channel, datetime.datetime.now().isoformat(timespec='seconds'),
                                     values, note, self.simulated, vi_modes, raw_values)
             return self.sample
-        except Exception:
-            # A late response cannot become the next query's result.
+        except (DUTDataNotReadyError, DUTConfigurationError):
+            raise
+        except InterruptedError:
             self.disconnect()
+            raise
+        except Exception as exc:
+            # A late response cannot become the next query's result.
+            self._failed_io(exc)
             raise
 
     def disconnect(self):
         if self.transport is not None:
             self.transport.close()
         self.transport = self.profile = self.sample = None
+        self._resistance_null_reference = None
         self.identity = ""
         self.simulated = False
         self.input_channels = ()
         self.settings = None
+        self.recovery_target = None
+        self.recovery_pending = False
+        self._usb_serial_key = ""
+        self.last_io_failure = ""
 
 

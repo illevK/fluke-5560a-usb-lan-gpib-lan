@@ -1,0 +1,84 @@
+"""Protocols and parsing migrated from v6.10.38. Maintained as normal Python source."""
+from __future__ import annotations
+import os
+import math
+import re
+import sys
+import time
+import socket
+import tempfile
+import ipaddress
+import json
+import threading
+import queue
+import subprocess
+import datetime
+import select
+import struct
+import base64
+from contextlib import ExitStack
+from pathlib import Path
+from dataclasses import dataclass, replace
+from decimal import Decimal, DecimalException
+from typing import Optional, List, Tuple, Dict
+from calibration.domain.commands import MODEL_PROFILES
+
+
+class SequenceCurrentFilter:
+    """Classify the current actually encoded in OUT, after coil conversion."""
+    JOB = "작업 기준: 3 A 이상"
+    POSTS = "선택 모델의 실제 단자 기준"
+    ALL_OUTPUTS = "전체 출력"
+    SINGLE_OUTPUT = "싱글 출력"
+    DUAL_OUTPUT = "듀얼 출력"
+    OUTPUT_GROUPS = (ALL_OUTPUTS, SINGLE_OUTPUT, DUAL_OUTPUT)
+    CURRENT_ONLY = {"DCI", "ACI"}
+    DUAL_FUNCTIONS = {"DCP", "ACP", "PF"}
+    CURRENT_FUNCTIONS = CURRENT_ONLY | DUAL_FUNCTIONS
+    DUT_34465_10A_START = 3.0
+    DUT_3A = "3 A 단자 · 3 A 미만"
+    DUT_10A = "10 A 단자 · 3 A 이상"
+    DUT_10A_ALL = "10 A 단자 · 전체 전류"
+    DUT_34465_GROUPS = (DUT_3A, DUT_10A, DUT_10A_ALL)
+    CURRENT_TOKEN = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)\s*(UA|MA|A)\s*$", re.I)
+
+    @classmethod
+    def actual_current(cls, step):
+        if step.func_type not in cls.CURRENT_FUNCTIONS:
+            return None
+        values = []
+        for part in step.scpi_cmd.split(";"):
+            match = re.match(r"^\s*OUT\s+(.+)$", part, re.I)
+            if not match:
+                continue
+            for argument in match[1].split(","):
+                current = cls.CURRENT_TOKEN.fullmatch(argument.strip())
+                if current:
+                    value = float(current[1]) * {"UA": 1e-6, "MA": 1e-3, "A": 1}[current[2].upper()]
+                    if not math.isfinite(value):
+                        raise ValueError(f"#{step.step_no}행의 출력 전류가 유효하지 않습니다.")
+                    values.append(abs(value))
+        if len(values) != 1:
+            raise ValueError(f"#{step.step_no}행의 실제 출력 전류를 판별할 수 없습니다: {step.scpi_cmd}")
+        return values[0]
+
+    @classmethod
+    def includes(cls, step, high_only=False, basis=JOB, model="5560A"):
+        if basis not in (cls.JOB, cls.POSTS):
+            raise ValueError("전류 그룹 기준을 확인하세요.")
+        current = cls.actual_current(step)
+        if current is None:
+            # Voltage/resistance run once in the normal group, never in high-only.
+            return not high_only
+        high = current >= 3.0 if basis == cls.JOB else MODEL_PROFILES[model].high_current(current)
+        return high == high_only
+
+    @classmethod
+    def label(cls, high_only, basis, model="5560A"):
+        if basis == cls.JOB:
+            return "3 A 이상 전류·전력만" if high_only else "3 A 미만 전류·전력 + 전압·저항"
+        if model == "5560A":
+            return "3.1 A 초과 전류·전력만" if high_only else "3.1 A 이하 전류·전력 + 전압·저항"
+        if model == "5730A":
+            return "본체 고전류 단자 없음" if high_only else "본체 전류 ≤2.2 A + 전압·저항"
+        return "3 A 이상 전류·전력만 (20A)" if high_only else "3 A 미만 전류·전력 + 전압·저항 (AUX)"

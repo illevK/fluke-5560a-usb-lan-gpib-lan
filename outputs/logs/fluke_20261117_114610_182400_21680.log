@@ -1,0 +1,41 @@
+[2026-11-17T11:46:10.183] [RS232 연결 시도] COM7 / 9600 / 8N1 / XON/XOFF / CRLF
+[2026-11-17T11:46:10.189] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T11:46:10.189] RX << 801,"Serial framing error REM" | ERR? | 0.001s
+[2026-11-17T11:46:10.190] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T11:46:10.191] RX << 0 | OPER? | 0.001s
+[2026-11-17T11:46:10.192] [첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: 801,"Serial framing error REM"
+[2026-11-17T11:46:10.193] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T11:46:10.196] RX << 801,"Serial framing error REM" | ERR? | 0.003s
+[2026-11-17T11:46:10.197] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T11:46:10.198] RX << 0 | OPER? | 0.001s
+[2026-11-17T11:46:10.198] [첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: 801,"Serial framing error REM"
+[2026-11-17T11:46:10.199] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T11:46:10.200] RX << 801,"Serial framing error REM" | ERR? | 0.001s
+[2026-11-17T11:46:10.200] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T11:46:10.201] RX << 0 | OPER? | 0.001s
+[2026-11-17T11:46:10.202] [첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: 801,"Serial framing error REM"
+[2026-11-17T11:46:10.202] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T11:46:10.203] RX << 801,"Serial framing error REM" | ERR? | 0.001s
+[2026-11-17T11:46:10.204] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T11:46:10.205] RX << 0 | OPER? | 0.001s
+[2026-11-17T11:46:10.205] [첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: 801,"Serial framing error REM"
+[2026-11-17T11:46:10.206] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T11:46:10.207] RX << 801,"Serial framing error REM" | ERR? | 0.001s
+[2026-11-17T11:46:10.209] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T11:46:10.210] RX << 0 | OPER? | 0.001s
+[2026-11-17T11:46:10.211] [첫 명령 확인] STBY에서 장비 오류 목록을 다시 확인합니다: 801,"Serial framing error REM"
+[2026-11-17T11:46:10.212] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T11:46:10.213] RX << 0,"No error" | ERR? | 0.001s
+[2026-11-17T11:46:10.214] TX QUERY >> *IDN? | timeout=조회 설정
+[2026-11-17T11:46:10.215] RX << FLUKE,5522A,TEST,1.0 | *IDN? | 0.001s
+[2026-11-17T11:46:10.216] TX QUERY >> OPER? | timeout=조회 설정
+[2026-11-17T11:46:10.218] RX << 0 | OPER? | 0.001s
+[2026-11-17T11:46:10.219] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T11:46:10.220] RX << 0,"No error" | ERR? | 0.001s
+[2026-11-17T11:46:10.220] [RS232 복구 확인] 동일 장비 · STBY · 오류 없음
+[2026-11-17T11:46:10.221] TX COMMAND >> OUT 1 V, 0 HZ
+[2026-11-17T11:46:10.222] TX QUERY >> *OPC? | timeout=1
+[2026-11-17T11:46:10.223] RX << 1 | *OPC? | 0.001s
+[2026-11-17T11:46:10.226] TX QUERY >> ERR? | timeout=조회 설정
+[2026-11-17T11:46:10.228] RX << 0,"No error" | ERR? | 0.003s
+[2026-11-17T11:46:10.229] [명령 완료] OUT 1 V, 0 HZ | 0.040s

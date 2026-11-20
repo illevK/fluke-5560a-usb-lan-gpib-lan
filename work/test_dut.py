@@ -54,6 +54,93 @@ class FakeInstrument:
 
 
 class DUTProtocolTests(unittest.TestCase):
+    def test_keysight_dmm_reads_only_active_function_and_retains_raw_value(self):
+        for identity in ("HEWLETT-PACKARD,34401A,0,1.0", "Agilent Technologies,34401A,0,1.0",
+                         "Keysight Technologies,34465A,MY123,A.03"):
+            with self.subTest(identity=identity):
+                instrument = FakeInstrument(identity, replies={"FUNC?": '"VOLT:DC"', "READ?": "+1.23456789E+02"})
+                session, _ = self.make_session(instrument)
+                session.verify_dmm_function("DCV")
+                with self.assertRaisesRegex(ValueError, "불일치"):
+                    session.verify_dmm_function("ACI")
+                self.assertNotIn("READ?", instrument.commands)
+                sample = session.read(1, fresh=True)
+                self.assertEqual(sample.values["dc_voltage"], 123.456789)
+                self.assertEqual(sample.raw_values["dc_voltage"], "+1.23456789E+02")
+                self.assertNotIn("current", sample.values)
+                self.assertEqual(instrument.commands[-4:], ["TRIG:SOUR IMM", "TRIG:COUN 1", "SAMP:COUN 1", "READ?"])
+                instrument.replies.update({"FUNC?": '"FRES"', "READ?": "9.90000000E+37"})
+                session.verify_dmm_function("OHM")
+                self.assertIsNone(session.read(1).values["resistance"])
+                session.disconnect()
+
+    def test_34465_short_dc_function_replies_and_current_terminals(self):
+        identity = "Keysight Technologies,34465A,MY123,A.03"
+        instrument = FakeInstrument(identity, replies={"FUNC?": '"VOLT"', "READ?": "0.9998"})
+        session, _ = self.make_session(instrument)
+        self.assertEqual(session.read(1, fresh=True, expected_dmm_function="DCV").values["dc_voltage"], .9998)
+        with self.assertRaisesRegex(ValueError, "측정표 AC 전압, 본체 DC 전압"):
+            session.read(1, fresh=True, expected_dmm_function="ACV")
+        self.assertEqual(instrument.commands.count("READ?"), 1)
+
+        instrument.replies.update({"FUNC?": '"CURR"', "SENS:CURR:DC:TERM?": "+3"})
+        session.verify_dmm_function("DCI")
+        session.verify_34465_current_terminal("DCI", 3)
+        instrument.replies["ROUT:TERM?"] = "FRON"
+        with self.assertRaisesRegex(ValueError, "본체 3 A"):
+            session.verify_34465_current_terminal("DCI", 10)
+        instrument.replies["ROUT:TERM?"] = "REAR"
+        standby = Mock()
+        with self.assertRaisesRegex(ValueError, "전면용"):
+            session.verify_34465_current_terminal("DCI", 10, ensure_standby=standby)
+        standby.assert_not_called()
+        self.assertNotIn("SENS:CURR:DC:TERM 10", instrument.commands)
+
+        instrument.replies.update({"FUNC?": '"CURR:AC"', "SENS:CURR:AC:TERM?": "+10", "ROUT:TERM?": "REAR"})
+        with self.assertRaisesRegex(ValueError, "전면용"):
+            session.read(1, fresh=True, dmm_terminal=10, expected_dmm_function="ACI")
+        self.assertEqual(instrument.commands.count("READ?"), 1)
+        instrument.replies["ROUT:TERM?"] = "FRON"
+        self.assertEqual(session.read(1, fresh=True, dmm_terminal=10, expected_dmm_function="ACI").values["current"], .9998)
+
+    def test_34401a_serial_uses_dtr_dsr_and_enters_and_releases_remote(self):
+        port = Mock()
+        reply = b"HEWLETT-PACKARD,34401A,0,1.0\r\n"
+        port.in_waiting = len(reply)
+        port.read.return_value = reply
+        port.write.side_effect = len
+        settings = f.DUTSettings(mode="SERIAL", address="COM8", baudrate=9600, data_bits=7,
+                                 parity="E", stop_bits=2, flow="DTR/DSR", eol="LF", model_hint="34401A")
+        with patch.object(f.serial, "Serial", return_value=port) as open_serial:
+            session = f.DUTSession()
+            session.connect(settings)
+            session.apply_measurement_defaults()
+            session.disconnect()
+        self.assertEqual([call.args[0] for call in port.write.call_args_list], [b"SYST:REM\n", b"*IDN?\n", b"SYST:LOC\n"])
+        self.assertEqual({k: open_serial.call_args.kwargs[k] for k in ("bytesize", "parity", "stopbits", "dsrdtr")},
+                         {"bytesize": 7, "parity": "E", "stopbits": 2, "dsrdtr": True})
+
+    def test_dmm_visa_usb_gpib_and_vxi11_use_the_same_measurement_protocol(self):
+        for mode, address, resource_name, model in (
+                ("VISA", "USB0::0x2A8D::0x0101::MY123::INSTR", "USB0::0x2A8D::0x0101::MY123::INSTR", "34465A"),
+                ("GPIB", "GPIB0::22::INSTR", "GPIB0::22::INSTR", "34401A"),
+                ("VXI11", "192.0.2.41", "TCPIP0::192.0.2.41::inst0::INSTR", "34465A")):
+            with self.subTest(mode=mode):
+                resource = Mock()
+                resource.read.side_effect = (f"Keysight Technologies,{model},TEST,1.00", '"VOLT:AC"', "+1.234E+00")
+                manager = Mock()
+                manager.open_resource.return_value = resource
+                with patch.object(f, "SharedVisaManager", return_value=manager):
+                    session = f.DUTSession()
+                    try:
+                        session.connect(f.DUTSettings(mode=mode, address=address, eol="LF"))
+                        session.apply_measurement_defaults()
+                        self.assertEqual(session.read().values["voltage"], 1.234)
+                        self.assertEqual(resource.write.call_args.args, ("READ?",))
+                    finally:
+                        session.disconnect()
+                manager.open_resource.assert_called_once_with(resource_name, open_timeout=10000)
+
     def test_app_close_stops_calibrator_sequence_before_waiting_for_dut(self):
         order = []
         app = SimpleNamespace(_io_busy=False, _sequence_dut_reserved=lambda: False,
@@ -176,6 +263,31 @@ class DUTProtocolTests(unittest.TestCase):
         self.assertIn('순차', sample.note)
         self.assertEqual(instrument.commands, ['*IDN?', 'POWER,PHASE1,RMS?', 'POWER,PHASE1,WATTS?'])
 
+    def test_kinetiq_serial_identification_and_channel_three_reading(self):
+        for model in ('PPA2530', 'PPA2630'):
+            with self.subTest(model=model):
+                instrument = FakeInstrument(f'NEWTONS4TH,{model} KinetiQ,01234,1.00', replies={
+                    'CONFIG,13?': '3', 'CONFIG,28?': '0', 'CONFIG,29?': '0',
+                    'CONFIG,40?': '0', 'COUPLI,PHASE1?': '0',
+                    'COUPLI,PHASE3?': '0', 'DAV?': '11',
+                    'POWER,PHASE3,RMS?': '60,120,12,1,.1,240,24,2,.2,480,48,3,.3',
+                    'STATUS,CH5?': '1,1V,OK', 'STATUS,CH6?': '1,1A,OK',
+                })
+                session = f.DUTSession(lambda *_: instrument)
+                instrument.settings = f.DUTSettings(mode='SERIAL', address='COM3', baudrate=19200, eol='CR')
+                session.connect(instrument.settings)
+                self.assertEqual((session.profile.model, session.available_channels), (model, (1, 2, 3)))
+                self.assertTrue(session.supports_fresh_capture)
+                self.assertIn('FAST', session.apply_measurement_defaults())
+                instrument.commands.clear()
+                data = session.read(3, include_dc=True, fresh=True).values
+                self.assertEqual(tuple(data[key] for key in ('voltage', 'dc_voltage', 'current', 'dc_current', 'power')),
+                                 (480, 48, 3, .3, 60))
+                self.assertEqual(instrument.commands, ['COUPLI,PHASE3?'] +
+                                 ['DAV?', 'POWER,PHASE3,RMS?'] * 3 +
+                                 ['DAV?', 'POWER,PHASE3,WATTS?', 'STATUS,CH5?', 'STATUS,CH6?'])
+                session.disconnect()
+
     def test_new_ppa_model_must_verify_common_records_before_connecting(self):
         identity = 'NEWTONS4TH,PPA9999,123,1'
         session, instrument = self.make_session(FakeInstrument(identity))
@@ -202,6 +314,44 @@ class DUTProtocolTests(unittest.TestCase):
         with self.assertRaises(TimeoutError): session.read()
         self.assertFalse(session.connected)
         self.assertIsNone(session.sample)
+
+    def test_data_not_ready_retains_connected_dut_and_can_read_later(self):
+        instrument = FakeInstrument("NEWTONS4TH,PPA2530 KinetiQ,TEST,1.0", replies={"DAV?": "10"})
+        instrument.settings = SimpleNamespace(timeout=.02)
+        session, _ = self.make_session(instrument)
+        with self.assertRaises(f.DUTDataNotReadyError):
+            session.read()
+        self.assertTrue(session.connected)
+        self.assertFalse(instrument.closed)
+        self.assertIsNone(session.recovery_target)
+        self.assertFalse(any(command.startswith("POWER") for command in instrument.commands))
+        instrument.replies["DAV?"] = "11"
+        self.assertEqual(session.read().values["voltage"], 120)
+
+    def test_dut_recovery_rejects_different_unit_and_uses_a_new_socket(self):
+        identity = b"NEWTONS4TH,PPA2530 KinetiQ,TEST,1.0\r\n"
+        stale, wrong, restored = Mock(), Mock(), Mock()
+        stale.recv.side_effect = [identity, ConnectionResetError("reset")]
+        wrong.recv.return_value = identity.replace(b"TEST", b"OTHER")
+        restored.recv.return_value = identity
+        settings = f.DUTSettings(mode="PPA_LAN", address="192.0.2.6", source_ip="192.0.2.7")
+        with patch.object(f.socket, "create_connection", side_effect=(stale, wrong, restored)):
+            session = f.DUTSession()
+            session.connect(settings)
+            with self.assertRaises(ConnectionResetError):
+                session.check_connection()
+            stale.close.assert_called_once()
+            self.assertTrue(session.recovery_pending)
+            self.assertIn("*IDN?", session.last_io_failure)
+            self.assertIn("통신 끊김", session.last_io_failure)
+            with self.assertRaisesRegex(ValueError, "식별 정보"):
+                session.recover_connection()
+            self.assertFalse(session.connected)
+            wrong.sendall.assert_called_once_with(b"*IDN?\r\n")
+            self.assertEqual(session.recover_connection(), identity.decode().strip())
+            self.assertEqual(session.settings, settings)
+            restored.sendall.assert_called_once_with(b"*IDN?\r\n")
+            session.disconnect()
 
     def test_invalid_values_and_record_length(self):
         self.assertEqual(f.dut_numbers('NAN,INF,-INF,9.91E37,1', 5), [None, None, None, None, 1])
@@ -276,6 +426,8 @@ class DUTProtocolTests(unittest.TestCase):
                 for channel in range(1, channels + 1):
                     profile_replies.update({
                         f":WIRING{channel}?": "1P2W",
+                        f":VOLTAGE{channel}:MEAN?": "OFF",
+                        f":CURRENT{channel}:MEAN?": "OFF",
                         f":VOLTAGE{channel}:AUTO?": "ON",
                         f":CURRENT{channel}:AUTO?": "ON",
                         f":SOURCE{channel}?": f"U{channel}",
@@ -286,11 +438,12 @@ class DUTProtocolTests(unittest.TestCase):
                 })
                 session, _ = self.make_session(instrument)
                 self.assertTrue(session.supports_fresh_capture)
-                self.assertIn("50 ms", session.apply_measurement_defaults())
+                self.assertIn("U/I 정류 RMS", session.apply_measurement_defaults())
                 self.assertNotIn(":MODE TYPE1", instrument.commands)
                 self.assertEqual(session.input_channels, tuple(range(1, channels + 1)))
                 for channel in session.input_channels:
-                    for command in (f":VOLTAGE{channel}:AUTO ON", f":CURRENT{channel}:AUTO ON", f":SOURCE{channel} U{channel}"):
+                    for command in (f":VOLTAGE{channel}:MEAN OFF", f":CURRENT{channel}:MEAN OFF",
+                                    f":VOLTAGE{channel}:AUTO ON", f":CURRENT{channel}:AUTO ON", f":SOURCE{channel} U{channel}"):
                         self.assertIn(command, instrument.commands)
                 self.assertEqual(":RATE 50MS" in instrument.commands, variant.startswith("PW6001"))
                 value = session.read(2, include_dc=True, fresh=True)
@@ -303,10 +456,12 @@ class DUTProtocolTests(unittest.TestCase):
     def test_hioki_switches_grouped_wiring_before_setting_all_channels(self):
         for variant, grouped_mode in (("PW3390-01", "TYPE8"), ("PW6001-04", "TYPE5")):
             with self.subTest(model=variant):
-                replies = {":RS232:ANSWER?": "OFF", ":HEADER?": "OFF", ":MODE?": grouped_mode,
+                replies = {":RS232:ANSWER?": ":RS232C:ANSWER ON;000", ":RS232:ANSWER OFF;:RS232:ANSWER?": "OFF",
+                           ":HEADER?": "OFF", ":MODE?": grouped_mode,
                            ":RATE?": "50ms", ":HOLD?": "PEAK"}
                 for channel in range(1, 5):
                     replies.update({f":WIRING{channel}?": "1P2W",
+                                    f":VOLTAGE{channel}:MEAN?": "OFF", f":CURRENT{channel}:MEAN?": "OFF",
                                     f":VOLTAGE{channel}:AUTO?": "ON", f":CURRENT{channel}:AUTO?": "ON",
                                     f":SOURCE{channel}?": f"U{channel}"})
                 instrument = FakeInstrument(f"HIOKI,{variant},123,V1.00", replies=replies)
@@ -320,6 +475,7 @@ class DUTProtocolTests(unittest.TestCase):
                 with patch.object(instrument, "write", side_effect=switch_wiring):
                     session, _ = self.make_session(instrument)
                     self.assertIn("1P2W 독립 4CH", session.apply_measurement_defaults())
+                self.assertIn(":RS232:ANSWER OFF;:RS232:ANSWER?", instrument.commands)
                 changed = instrument.commands.index(":MODE TYPE1")
                 self.assertEqual(instrument.commands[changed + 1], ":MODE?")
                 for channel in range(1, 5):
@@ -344,6 +500,16 @@ class DUTProtocolTests(unittest.TestCase):
                     session.apply_measurement_defaults()
                 self.assertFalse(any(":AUTO" in command or ":SOURCE" in command for command in instrument.commands))
                 self.assertEqual(session.input_channels, ())
+
+    def test_hioki_rejects_unconfirmed_current_rectifier_setting(self):
+        instrument = FakeInstrument("HIOKI,PW3390-02,TEST,V1.00", replies={
+            ":RS232:ANSWER?": "OFF", ":HEADER?": "OFF", ":MODE?": "TYPE1",
+            ":VOLTAGE1:MEAN?": "OFF", ":CURRENT1:MEAN?": "ON",
+        })
+        session, _ = self.make_session(instrument)
+        with self.assertRaisesRegex(ValueError, "CURRENT1:MEAN OFF"):
+            session.apply_measurement_defaults()
+        self.assertFalse(session.input_channels)
 
     def test_hioki_lan_checks_model_against_the_selected_port(self):
         for port, variant in ((3390, "PW3390-03"), (23, "PW6001-14")):
@@ -486,7 +652,7 @@ class DUTProtocolTests(unittest.TestCase):
                             session.connect(settings)
                         self.assertFalse(session.connected)
                         self.assertIsNone(session.transport)
-                connect.assert_called_once_with(('192.0.2.41', 10002), timeout=10.0)
+                connect.assert_called_once_with(('192.0.2.41', 10002), timeout=10.0, source_address=None)
                 sock.sendall.assert_called_once_with(b'*IDN?\n')
                 sock.close.assert_called_once()
 
@@ -565,6 +731,27 @@ class DUTGuiTests(unittest.TestCase):
         self.app.var_dut_mode.set('미리보기 · 가상 DUT')
         self.app._dut_connect()
         self.pump(lambda: not self.app._dut_busy)
+
+    def test_idle_lan_health_check_waits_for_standby_and_never_reads_samples(self):
+        app = self.app
+        session = app.dut_session
+        session.identity = "NEWTONS4TH,PPA2530 KinetiQ,TEST,1.0"
+        session.profile = f.identify_dut(session.identity)
+        session.settings = f.DUTSettings(mode="PPA_LAN", address="192.0.2.6")
+        app.conn_mgr.info = f.ConnectionInfo(True, "test", "test", "FLUKE,5560A,TEST,1.0")
+        app.is_operating = True
+        app._dut_health_due = 0
+        try:
+            with (patch.object(session, "check_connection") as health, patch.object(session, "read") as read):
+                app.update()
+                self.assertFalse(app._dut_recovery_allowed())
+                health.assert_not_called()
+                app.is_operating = False
+                self.pump(lambda: health.called and not app._dut_busy)
+                health.assert_called_once_with()
+                read.assert_not_called()
+        finally:
+            app.conn_mgr.info = f.ConnectionInfo()
 
     def test_dut_cannot_open_the_connected_calibrator_endpoint(self):
         app = self.app
